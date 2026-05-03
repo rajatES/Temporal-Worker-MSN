@@ -1,0 +1,315 @@
+// ── Input ────────────────────────────────────────────────────────────────────
+
+export interface FormInput {
+  writerName: string;
+  title: string;
+  category: string;
+  slideCount: number;
+  slidesPerEntityRaw: string;      // "1 (Standard)" | "2 (Deep Dive - 2 slides per item)"
+  sourcesRaw: string;              // newline-separated URLs
+  mustIncludeRaw: string;
+  userContext: string;
+  writingStyle: string;
+}
+
+// ── Intermediate data objects ─────────────────────────────────────────────────
+
+export interface TemporalCtx {
+  today: string;
+  currentYear: number;
+  currentMonth: number;
+  currentSeason: string;
+  lastSeason: string;
+  seasonFormat: string;
+  dateAnchor: string;
+  seasonAnchor: string;
+}
+
+export interface FormatConfig {
+  slidesPerEntity: number;
+  entityCount: number;
+  isMultiSlideFormat: boolean;
+  continuationStyle: string;
+}
+
+export interface TitleAnalysis {
+  promisedCount: number;
+  isRanking: boolean;
+  isListicle: boolean;
+  isTimeBased: boolean;
+  emotionalPromise: string | null;
+  mainAngle: string;
+  secondaryAngle: string | null;
+  requiresCorrelation: boolean;
+}
+
+export interface SourceAnalysis {
+  status: string;
+  recommendation: string;
+  alignmentScore: number;
+  estimatedItems?: number;
+  factTypeChecks?: Record<string, boolean>;
+  scrapedContent: string;
+  sourceCount?: number;
+  primaryLength?: number;
+  secondaryLength?: number;
+}
+
+export interface AtomizedFact {
+  itemNumber: number;
+  itemName: string;
+  facts: Array<{ type: string; value: string; isExactQuote?: boolean }>;
+  rawContent: string;
+}
+
+// ── Accumulated pipeline data ─────────────────────────────────────────────────
+// Each stage spreads the previous object and adds new fields, just like n8n.
+
+export interface PreparedData {
+  title: string;
+  category: string;
+  slideCount: number;
+  writerName: string;
+  userContext: string;
+  writingStyle: string;
+  userPrimaryUrl: string;
+  userSecondaryUrls: string[];
+  hasValidUserSource: boolean;
+  isUserUrlRestricted: boolean;
+  restrictedDomains: string[];
+  mustIncludeItems: string[];
+  hasMustInclude: boolean;
+  temporalContext: TemporalCtx;
+  formatConfig: FormatConfig;
+  titleAnalysis: TitleAnalysis;
+  sourceCount: number;
+  timestamp: string;
+  isSports: boolean;
+}
+
+export interface SourcedData extends PreparedData {
+  sourceAnalysis: SourceAnalysis;
+  preferredDomains?: string[];
+}
+
+export interface AtomizedData extends SourcedData {
+  atomizedFacts: AtomizedFact[];
+  factOnlyRepresentation: string;
+  sourceSignatures: string[];
+  atomizationStats: { itemsProcessed: number; totalFacts: number };
+}
+
+export interface ResearchedData extends AtomizedData {
+  perplexityAnswer: string;
+  perplexityCitations: string[];
+  perplexityWordCount: number;
+  needsRetry: boolean;
+  retryReason: string | null;
+  hadSoftRefusal: boolean;
+}
+
+export interface MergedData extends ResearchedData {
+  combinedFactRepresentation: string;
+  primarySourceUrl: string;
+  citations: string[];
+  sourceList: string;
+  researchWordCount: number;
+  researchOk: boolean;
+}
+
+export interface PromptData extends MergedData {
+  claudeSystemPrompt: string;
+  claudeUserPrompt: string;
+}
+
+export interface GeneratedData extends PromptData {
+  articleText: string;
+  originalArticleText: string;
+  generatedBy: string;
+  claudeFailed: boolean;
+  failureReason: string | null;
+}
+
+export interface Slide {
+  slideNum: number;
+  title: string;
+  body: string;
+  wordCount: number;
+}
+
+export interface StructuralValidation {
+  status: string;
+  errors: string[];
+  warnings: string[];
+  autoFixes: string[];
+  slideCount: number;
+  metaLength: number;
+}
+
+export interface PlagiarismCheck {
+  score: number;
+  matches: string[];
+  status: string;
+}
+
+export interface ValidatedData extends GeneratedData {
+  structuralValidation: StructuralValidation;
+  plagiarismCheck: PlagiarismCheck;
+  slides: Slide[];
+}
+
+export interface ClaimItem {
+  type: string;
+  claim: string;
+  context: string;
+}
+
+export interface ClaimedData extends ValidatedData {
+  claimsToVerify: ClaimItem[];
+}
+
+export interface VerificationResult {
+  claimIndex: number;
+  claim: string;
+  status: string;
+  finding: string;
+  source: string;
+}
+
+export interface VerifiedData extends ClaimedData {
+  perplexityVerification: {
+    results: VerificationResult[];
+    citations: string[];
+    stats: { verified: number; incorrect: number; unverifiable: number; total: number };
+    score: number;
+  };
+}
+
+export interface SourceEntry {
+  index: number;
+  url: string;
+  factsVerified: string;
+  verifiedBy: string;
+}
+
+export interface AuditedData extends VerifiedData {
+  grokAudit: {
+    status: string;
+    factVerification: string;
+    ruleCompliance: string;
+    summary: string;
+    stats: {
+      factsVerified: string;
+      violations: number;
+      corrections: string;
+      flags: string;
+    };
+  };
+  grokSources: SourceEntry[];
+  combinedSourceList: SourceEntry[];
+  combinedSourceListText: string;
+  rewriteApplied: boolean;
+}
+
+export interface FinalOutput {
+  title: string;
+  category: string;
+  slideCount: number;
+  writerName: string;
+  articleText: string;
+  originalArticleText: string;
+  auditReport: string;
+  qualityScore: number;
+  researchScore: number;
+  verificationScore: number;
+  structuralScore: number;
+  originalityScore: number;
+  primarySourceUrl: string;
+  combinedSourceListText: string;
+  summaryComment: string;
+  validationStatus: string;
+  factsVerified: string;
+  grokFactsVerified: string;
+  flagsForReview: string;
+  generatedBy: string;
+  generatedAt: string;
+}
+
+export interface SlideshowSlide {
+  title: string;
+  description: string;
+  imageSearch: string;
+}
+
+export interface WorkflowResult {
+  // Matches the shape handleAIGenerate() expects
+  title: string;
+  description: string;
+  keywords: string;
+  slides: SlideshowSlide[];
+  author: string;
+  // Quality summary for the UI
+  qualityScore: number;
+  summaryComment: string;
+  flagsForReview: string;
+  generatedBy: string;
+}
+
+// ── Progress tracking ─────────────────────────────────────────────────────────
+
+export type StageStatus = 'pending' | 'active' | 'complete' | 'warning' | 'error' | 'awaiting_human';
+
+export interface Stage {
+  id: string;
+  label: string;
+  status: StageStatus;
+  detail?: string;
+}
+
+export const STAGE_DEFS: Array<{ id: string; label: string }> = [
+  { id: 'parsing',           label: 'Parsing input' },
+  { id: 'scraping_source',   label: 'Scraping source' },
+  { id: 'analyzing',         label: 'Analyzing alignment' },
+  { id: 'atomizing',         label: 'Extracting facts' },
+  { id: 'researching',       label: 'Researching' },
+  { id: 'scraping_citations',label: 'Scraping citations' },
+  { id: 'building_prompt',   label: 'Building prompt' },
+  { id: 'generating',        label: 'Generating article' },
+  { id: 'validating',        label: 'Validating structure' },
+  { id: 'verifying',         label: 'Verifying facts' },
+  { id: 'auditing',          label: 'Auditing with Grok' },
+  { id: 'creating_docs',     label: 'Assembling output' },
+  { id: 'complete',          label: 'Done' },
+];
+
+// ── Human-in-the-loop ─────────────────────────────────────────────────────────
+
+export interface HumanReviewOption {
+  label: string;
+  value: string;
+  requiresInput?: boolean;   // if true, UI shows a textarea
+  inputPlaceholder?: string;
+}
+
+export interface HumanReviewRequest {
+  id: string;
+  type: 'poor_source' | 'thin_research' | 'validation_errors' | 'fact_errors' | 'low_quality';
+  message: string;
+  details: string[];
+  options: HumanReviewOption[];
+}
+
+export interface HumanDecision {
+  requestId: string;
+  choice: string;
+  additionalInput?: string;
+}
+
+export interface WorkflowProgress {
+  stages: Stage[];
+  currentStageId: string;
+  humanReviewRequest: HumanReviewRequest | null;
+  isComplete: boolean;
+  result?: WorkflowResult;
+  error?: string;
+}
