@@ -392,21 +392,88 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   }
 
   // ── Build slides for the slideshow form ───────────────────────────────────────
-  const STOP = new Set(['a','an','the','and','or','but','in','on','at','to','for',
-    'of','with','by','from','is','was','are','were','has','had','have','his','her',
-    'their','its','this','that','he','she','they','it','who','which','also','as',
-    'be','been','being','into','up','out','over','after','before','when','than',
-    'not','no','so','if','would','could','should','two','three','four','five']);
+  const STOP_WORDS = new Set([
+    'a','an','the','and','or','but','in','on','at','to','for','of','with','by','from',
+    'is','was','are','were','has','had','have','his','her','their','its','this','that',
+    'he','she','they','it','who','which','also','as','be','been','being','into','up',
+    'out','over','after','before','when','than','not','no','so','if','would','could',
+    'should','two','three','four','five','despite','during','while','through',
+    'against','between','among','across','around','behind','below','above','under',
+  ]);
+  const SPORT_LABELS: Record<string, string> = {
+    nfl: 'NFL', nba: 'NBA', mlb: 'MLB', nhl: 'NHL', nascar: 'NASCAR',
+    'f1': 'F1', 'formula 1': 'F1', golf: 'Golf', pga: 'Golf',
+    ufc: 'UFC', mma: 'MMA', tennis: 'Tennis', atp: 'Tennis', wta: 'Tennis',
+    wnba: 'WNBA', ncaa: 'NCAA', cfb: 'CFB', boxing: 'Boxing',
+  };
 
-  function buildImageSearch(title: string, body: string): string {
-    const cleanTitle = title.replace(/^\d+\.\s*/, '').replace(/[:'"]/g, '').replace(/\s+/g, ' ').trim();
-    const titleWords = new Set(cleanTitle.toLowerCase().split(/\s+/));
-    const descKeywords = body.split(/\s+/)
-      .map(w => w.replace(/[^a-zA-Z0-9]/g, ''))
-      .filter(w => w.length > 2 && !STOP.has(w.toLowerCase()) && !titleWords.has(w.toLowerCase()))
-      .slice(0, 6)
-      .join(' ');
-    return `${cleanTitle} ${descKeywords}`.replace(/\s+/g, ' ').trim();
+  function extractProperNouns(text: string): string[] {
+    const tokens = text.replace(/\*\*/g, '').split(/\s+/);
+    const nouns: string[] = [];
+    let i = 0;
+    while (i < tokens.length) {
+      const raw = tokens[i];
+      const clean = raw.replace(/[^a-zA-Z0-9]/g, '');
+      if (!clean || clean.length < 2 || STOP_WORDS.has(clean.toLowerCase())) { i++; continue; }
+      if (/^[A-Z]/.test(raw)) {
+        const parts = [clean];
+        let j = i + 1;
+        while (j < i + 4 && j < tokens.length) {
+          const nr = tokens[j], nc = nr.replace(/[^a-zA-Z0-9]/g, '');
+          if (/^[A-Z]/.test(nr) && nc.length > 1 && !STOP_WORDS.has(nc.toLowerCase())) {
+            parts.push(nc); j++;
+          } else break;
+        }
+        nouns.push(parts.join(' '));
+        i = j;
+      } else { i++; }
+    }
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const noun of nouns) {
+      const key = noun.toLowerCase();
+      if (seen.has(key)) continue;
+      if (unique.some(u => u.toLowerCase().includes(key))) continue;
+      unique.push(noun);
+      seen.add(key);
+    }
+    return unique;
+  }
+
+  function buildImageSearch(title: string, body: string, category: string): string {
+    const descNouns = extractProperNouns(body || '');
+    let candidates: string[] = [...descNouns];
+
+    if (candidates.length < 2) {
+      const titleNouns = extractProperNouns((title || '').replace(/^\d+\.\s*/, ''))
+        .map(n => n.split(' ').slice(0, 2).join(' '));
+      for (const n of titleNouns) {
+        if (!n.includes(' ')) continue;
+        if (!candidates.some(d => d.toLowerCase().includes(n.toLowerCase()) || n.toLowerCase().includes(d.toLowerCase()))) {
+          candidates.push(n);
+        }
+      }
+      if (candidates.length === 0) {
+        const fallback = (title || '').replace(/^\d+\.\s*/, '').replace(/[^a-zA-Z0-9\s]/g, '').trim().split(/\s+/).slice(0, 2).join(' ');
+        if (fallback) candidates.push(fallback);
+      }
+    }
+
+    const seen = new Set<string>();
+    const terms: string[] = [];
+    for (const t of candidates) {
+      const k = t.toLowerCase();
+      if (seen.has(k)) continue;
+      if (terms.some(u => u.toLowerCase().includes(k) || k.includes(u.toLowerCase()))) continue;
+      terms.push(t);
+      seen.add(k);
+    }
+    const catKey = (category || '').toLowerCase().replace('sports - ', '').trim();
+    const sport = SPORT_LABELS[catKey] || '';
+    if (sport && !terms.some(t => t.toLowerCase().includes(sport.toLowerCase()))) {
+      terms.push(sport);
+    }
+    return terms.slice(0, 5).join(' ').replace(/\s+/g, ' ').trim();
   }
 
   // Re-parse from the final articleText (Grok may have rewritten it, and Grok
@@ -436,7 +503,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     .map(s => ({
       title:       s.title,
       description: s.body,
-      imageSearch: buildImageSearch(s.title, s.body),
+      imageSearch: buildImageSearch(s.title, s.body, auditedData.category),
     }));
 
   complete('creating_docs', `${contentSlides.length} slides · score ${final.qualityScore}/100`);
