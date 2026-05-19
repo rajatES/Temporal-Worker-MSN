@@ -1,5 +1,6 @@
-import { Client, Connection } from '@temporalio/client';
+import { Client } from '@temporalio/client';
 import * as dotenv from 'dotenv';
+import { makeClientConnection, temporalNamespace } from './connection';
 
 dotenv.config();
 
@@ -64,8 +65,8 @@ async function main() {
     process.exit(1);
   }
 
-  const connection = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS || 'localhost:7233' });
-  const client     = new Client({ connection, namespace: process.env.TEMPORAL_NAMESPACE || 'default' });
+  const connection = await makeClientConnection();
+  const client     = new Client({ connection, namespace: temporalNamespace() });
 
   // Resolve runId → workflowId
   let workflowId: string | undefined;

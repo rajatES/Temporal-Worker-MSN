@@ -1,10 +1,11 @@
-import { Client, Connection } from '@temporalio/client';
+import { Client } from '@temporalio/client';
 import * as dotenv from 'dotenv';
+import { makeClientConnection, temporalNamespace } from './connection';
 dotenv.config();
 
 async function main() {
-  const conn = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS || 'localhost:7233' });
-  const client = new Client({ connection: conn, namespace: 'default' });
+  const conn = await makeClientConnection();
+  const client = new Client({ connection: conn, namespace: temporalNamespace() });
 
   console.log('Recent workflows:\n');
   let count = 0;

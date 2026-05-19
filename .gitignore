@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+tsconfig.tsbuildinfo
+
+# Environment & secrets
+.env
+.env.local
+.env.production
+*.pem
+*.p12
+
+# Google service account keys (never commit these)
+*-service-account*.json
+*service-account*.json
+alien-array-*.json
+
+# n8n reference workflow (not needed in deployment)
+VX Live.json
+
+# Claude Code local settings
+.claude/
+
+# Debug / scratch files
+check-mcp.ts
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*

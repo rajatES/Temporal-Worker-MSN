@@ -53,6 +53,7 @@ export interface SourceAnalysis {
   sourceCount?: number;
   primaryLength?: number;
   secondaryLength?: number;
+  researchMode?: string;
 }
 
 export interface AtomizedFact {
@@ -99,6 +100,13 @@ export interface AtomizedData extends SourcedData {
   atomizationStats: { itemsProcessed: number; totalFacts: number };
 }
 
+export interface RelatedEsArticle {
+  title: string;
+  url: string;
+  sport: string;
+  pageviews: number;
+}
+
 export interface ResearchedData extends AtomizedData {
   perplexityAnswer: string;
   perplexityCitations: string[];
@@ -106,6 +114,7 @@ export interface ResearchedData extends AtomizedData {
   needsRetry: boolean;
   retryReason: string | null;
   hadSoftRefusal: boolean;
+  relatedEsArticles: RelatedEsArticle[];
 }
 
 export interface MergedData extends ResearchedData {
@@ -115,6 +124,10 @@ export interface MergedData extends ResearchedData {
   sourceList: string;
   researchWordCount: number;
   researchOk: boolean;
+  hasUserSource: boolean;
+  hasUserContext: boolean;
+  sourceQuality: string;
+  alignmentScore: number;
 }
 
 export interface PromptData extends MergedData {
@@ -152,9 +165,18 @@ export interface PlagiarismCheck {
   status: string;
 }
 
+export interface FactProvenance {
+  rate: number;
+  verified: number;
+  unverified: number;
+  total: number;
+  unverifiedExamples: string[];
+}
+
 export interface ValidatedData extends GeneratedData {
   structuralValidation: StructuralValidation;
   plagiarismCheck: PlagiarismCheck;
+  factProvenance: FactProvenance;
   slides: Slide[];
 }
 
@@ -195,11 +217,10 @@ export interface SourceEntry {
 export interface AuditedData extends VerifiedData {
   grokAudit: {
     status: string;
-    factVerification: string;
-    ruleCompliance: string;
+    rawResponse: string;
     summary: string;
     stats: {
-      factsVerified: string;
+      rulesPassed: string;
       violations: number;
       corrections: string;
       flags: string;
@@ -229,7 +250,7 @@ export interface FinalOutput {
   summaryComment: string;
   validationStatus: string;
   factsVerified: string;
-  grokFactsVerified: string;
+  grokRulesPassed: string;
   flagsForReview: string;
   generatedBy: string;
   generatedAt: string;

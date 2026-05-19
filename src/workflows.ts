@@ -35,7 +35,6 @@ const {
   generateWithGrok,
   validateStructure,
   extractClaims,
-  perplexityVerifyClaims,
   processVerification,
   grokAuditAndVerify,
   extractAuditResults,
@@ -50,8 +49,11 @@ const {
   },
 });
 
-const { grokAuditAndVerify: grokAuditLong, generateWithGrok: grokLong } =
-  proxyActivities<typeof activities>({
+const {
+  grokAuditAndVerify: grokAuditLong,
+  generateWithGrok: grokLong,
+  grokFactCheck: grokFactCheckLong,
+} = proxyActivities<typeof activities>({
     startToCloseTimeout: '8 minutes',
     retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2, maximumInterval: '60s' },
   });
@@ -146,14 +148,26 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   let sourcedData;
 
   if (preparedData.hasValidUserSource) {
-    const primaryMarkdown = await firecrawlScrape(preparedData.userPrimaryUrl);
-
-    if (preparedData.userSecondaryUrls.length > 0) {
-      const secondaryMarkdown = await firecrawlScrape(preparedData.userSecondaryUrls[0], false);
-      sourcedData = await analyzeSourceAlignment(preparedData, primaryMarkdown, secondaryMarkdown);
-    } else {
-      sourcedData = await analyzeSourceAlignment(preparedData, primaryMarkdown, '');
+    let primaryMarkdown = '';
+    try {
+      primaryMarkdown = await firecrawlScrape(preparedData.userPrimaryUrl);
+    } catch {
+      warn('scraping_source', 'Primary source scrape failed — continuing without it');
     }
+
+    let secondaryMarkdown = '';
+    let thirdMarkdown = '';
+    if (preparedData.userSecondaryUrls.length > 0) {
+      try {
+        secondaryMarkdown = await firecrawlScrape(preparedData.userSecondaryUrls[0], false);
+      } catch { /* skip on failure */ }
+    }
+    if (preparedData.userSecondaryUrls.length > 1) {
+      try {
+        thirdMarkdown = await firecrawlScrape(preparedData.userSecondaryUrls[1], false);
+      } catch { /* skip on failure */ }
+    }
+    sourcedData = await analyzeSourceAlignment(preparedData, primaryMarkdown, secondaryMarkdown, thirdMarkdown);
   } else {
     sourcedData = await buildResearchStrategy(preparedData);
   }
@@ -206,16 +220,29 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     !atomizedData.hasValidUserSource ||
     atomizedData.titleAnalysis.requiresCorrelation;
 
-  const perplexityRaw = needsDeep
-    ? await perplexityDeepResearch(atomizedData)
-    : await perplexityStandardResearch(atomizedData);
+  const emptyPerplexity = { choices: [{ message: { content: '' } }], citations: [] };
+  let perplexityRaw;
+  try {
+    perplexityRaw = needsDeep
+      ? await perplexityDeepResearch(atomizedData)
+      : await perplexityStandardResearch(atomizedData);
+  } catch {
+    warn('researching', 'Perplexity research failed — continuing with source material only');
+    perplexityRaw = emptyPerplexity;
+  }
 
   // ── Stage 5: Retry validation ────────────────────────────────────────────────
   const researchedData = await validateRetry(atomizedData, perplexityRaw);
 
   let mergedData;
   if (researchedData.needsRetry) {
-    const retryRaw = await perplexityRetryResearch(atomizedData);
+    let retryRaw;
+    try {
+      retryRaw = await perplexityRetryResearch(atomizedData);
+    } catch {
+      warn('researching', 'Perplexity retry failed — continuing without retry data');
+      retryRaw = emptyPerplexity;
+    }
     mergedData = await mergeResearch(researchedData, retryRaw);
   } else {
     mergedData = await mergeResearch(researchedData);
@@ -271,8 +298,10 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   const cite1Url = pickCitation(mergedData.citations, mergedData.primarySourceUrl, []);
   const cite2Url = pickCitation(mergedData.citations, mergedData.primarySourceUrl, [cite1Url]);
 
-  const cite1Markdown = await firecrawlScrape(cite1Url);
-  const cite2Markdown = await firecrawlScrape(cite2Url);
+  let cite1Markdown = '';
+  let cite2Markdown = '';
+  try { cite1Markdown = await firecrawlScrape(cite1Url); } catch { /* skip on failure */ }
+  try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip on failure */ }
   complete('scraping_citations', `${cite1Url.split('/')[2]} + ${cite2Url.split('/')[2]}`);
 
   // ── Stage 7: Build Claude prompt ─────────────────────────────────────────────
@@ -282,23 +311,44 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
   // ── Stage 8: Article generation ──────────────────────────────────────────────
   activate('generating', 'Calling Claude…');
-  const claudeRaw     = await generateWithClaude(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
-  const claudeChecked = await checkClaudeResponse(claudeRaw, promptData);
-
   let generatedData;
-  if (claudeChecked.claudeFailed) {
-    activate('generating', 'Claude failed — falling back to Grok…');
-    const grokText = await grokLong(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
-    generatedData = {
-      ...promptData,
-      articleText:         grokText,
-      originalArticleText: grokText,
-      generatedBy:         'Grok (Fallback)',
-      claudeFailed:        true,
-      failureReason:       claudeChecked.failureReason,
-    };
-  } else {
-    generatedData = claudeChecked;
+  try {
+    const claudeRaw     = await generateWithClaude(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
+    const claudeChecked = await checkClaudeResponse(claudeRaw, promptData);
+
+    if (claudeChecked.claudeFailed) {
+      activate('generating', 'Claude failed — falling back to Grok…');
+      try {
+        const grokText = await grokLong(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
+        generatedData = {
+          ...promptData,
+          articleText:         grokText,
+          originalArticleText: grokText,
+          generatedBy:         'Grok (Fallback)',
+          claudeFailed:        true,
+          failureReason:       claudeChecked.failureReason,
+        };
+      } catch {
+        throw new Error('Both Claude and Grok generation failed — cannot produce article');
+      }
+    } else {
+      generatedData = claudeChecked;
+    }
+  } catch (err) {
+    activate('generating', 'Claude API error — falling back to Grok…');
+    try {
+      const grokText = await grokLong(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
+      generatedData = {
+        ...promptData,
+        articleText:         grokText,
+        originalArticleText: grokText,
+        generatedBy:         'Grok (Fallback)',
+        claudeFailed:        true,
+        failureReason:       String(err),
+      };
+    } catch {
+      throw new Error('Both Claude and Grok generation failed — cannot produce article');
+    }
   }
   complete('generating', `Generated by ${generatedData.generatedBy}`);
 
@@ -327,11 +377,26 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     // Note: 'regenerate' would loop back; for now we continue and flag
   }
 
-  // ── Stage 10: Claim extraction + Perplexity verification ─────────────────────
+  // ── Stage 10: Claim extraction + Grok fact-check ─────────────────────────────
   activate('verifying');
-  const claimedData  = await extractClaims(validatedData);
-  const verifyRaw    = await perplexityVerifyClaims(claimedData);
-  const verifiedData = await processVerification(claimedData, verifyRaw);
+  const claimedData = await extractClaims(validatedData);
+
+  let verifiedData;
+  try {
+    const verifyRaw = await grokFactCheckLong(claimedData);
+    verifiedData = await processVerification(claimedData, verifyRaw);
+  } catch {
+    warn('verifying', 'Grok fact-check failed — skipping verification');
+    verifiedData = {
+      ...claimedData,
+      perplexityVerification: {
+        results: [],
+        citations: [],
+        stats: { verified: 0, incorrect: 0, unverifiable: 0, total: 0 },
+        score: 0,
+      },
+    };
+  }
 
   const factErrors = verifiedData.perplexityVerification.stats.incorrect;
   complete('verifying', `${verifiedData.perplexityVerification.stats.verified} verified · ${factErrors} incorrect`);
@@ -358,10 +423,28 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   }
 
   // ── Stage 11: Grok audit ──────────────────────────────────────────────────────
-  activate('auditing', 'Running Grok fact-check…');
-  const grokAuditText = await grokAuditLong(verifiedData);
-  const auditedData   = await extractAuditResults(verifiedData, grokAuditText);
-  complete('auditing', `Violations: ${auditedData.grokAudit.stats.violations} · Rewrite: ${auditedData.rewriteApplied}`);
+  activate('auditing', 'Running Grok rules audit…');
+  let auditedData;
+  try {
+    const grokAuditText = await grokAuditLong(verifiedData);
+    auditedData = await extractAuditResults(verifiedData, grokAuditText);
+  } catch {
+    warn('auditing', 'Grok audit failed — skipping rules audit');
+    auditedData = {
+      ...verifiedData,
+      grokAudit: {
+        status: 'skipped',
+        rawResponse: '',
+        summary: 'Grok audit skipped due to API failure',
+        stats: { rulesPassed: 'N/A', violations: 0, corrections: '0', flags: 'Audit skipped' },
+      },
+      grokSources: [],
+      combinedSourceList: [],
+      combinedSourceListText: '',
+      rewriteApplied: false,
+    };
+  }
+  complete('auditing', `Rules: ${auditedData.grokAudit.stats.rulesPassed} · Violations: ${auditedData.grokAudit.stats.violations} · Rewrite: ${auditedData.rewriteApplied}`);
 
   // ── Stage 12: Final assembly ──────────────────────────────────────────────────
   activate('creating_docs', 'Assembling output…');

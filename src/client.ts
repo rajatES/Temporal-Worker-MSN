@@ -1,13 +1,14 @@
-import { Client, Connection } from '@temporalio/client';
+import { Client } from '@temporalio/client';
 import { msnArticleGeneratorWorkflow } from './workflows';
 import type { FormInput } from './types';
 import * as dotenv from 'dotenv';
+import { makeClientConnection, temporalNamespace } from './connection';
 
 dotenv.config();
 
 async function triggerWorkflow(input: FormInput): Promise<void> {
-  const connection = await Connection.connect({ address: 'localhost:7233' });
-  const client     = new Client({ connection });
+  const connection = await makeClientConnection();
+  const client     = new Client({ connection, namespace: temporalNamespace() });
 
   const handle = await client.workflow.start(msnArticleGeneratorWorkflow, {
     taskQueue:  'msn-article-generator',
@@ -16,7 +17,7 @@ async function triggerWorkflow(input: FormInput): Promise<void> {
   });
 
   console.log(`Workflow started: ${handle.workflowId}`);
-  console.log(`Temporal UI: http://localhost:8233/namespaces/default/workflows/${handle.workflowId}`);
+  console.log(`Temporal Cloud UI: https://cloud.temporal.io/namespaces/${temporalNamespace()}/workflows/${handle.workflowId}`);
 
   const result = await handle.result();
   console.log('\n=== WORKFLOW COMPLETE ===');
