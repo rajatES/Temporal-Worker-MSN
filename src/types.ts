@@ -1,5 +1,7 @@
 // ── Input ────────────────────────────────────────────────────────────────────
 
+export type ArticleMode = 'objective' | 'subjective';
+
 export interface FormInput {
   writerName: string;
   title: string;
@@ -10,6 +12,10 @@ export interface FormInput {
   mustIncludeRaw: string;
   userContext: string;
   writingStyle: string;
+  // Mode + subjective-only fields (optional for back-compat)
+  mode?: ArticleMode;              // defaults to 'objective'
+  articleType?: string;            // subjective: Quotes / Opinion & Rankings / etc.
+  toneDial?: string;               // subjective: Celebratory / Nostalgic / etc.
 }
 
 // ── Intermediate data objects ─────────────────────────────────────────────────
@@ -232,6 +238,77 @@ export interface AuditedData extends VerifiedData {
   rewriteApplied: boolean;
 }
 
+// ── Subjective pipeline data types ────────────────────────────────────────────
+
+export interface SubjectivePreparedData {
+  title: string;
+  category: string;
+  articleType: string;
+  toneDial: string;
+  slideCount: number;
+  writerName: string;
+  writingStyle: string;
+  userContext: string;
+  userPrimaryUrl: string;
+  userSecondaryUrls: string[];           // up to 4 additional URLs (5 total)
+  shouldScrapePrimary: boolean;
+  hasUserUrl: boolean;
+  isPrimaryRestricted: boolean;
+  mustIncludeItems: string[];
+  hasMustInclude: boolean;
+  primaryQuery: string;
+  builtInRestricted: string[];
+  timestamp: string;
+}
+
+export interface SubjectiveResearchedData extends SubjectivePreparedData {
+  perplexityAnswer: string;
+  citations: string[];
+  primaryScraped: string;
+  additionalScraped: string[];           // markdown for each userSecondaryUrls entry
+}
+
+export interface SubjectiveMergedData extends SubjectiveResearchedData {
+  finalContext: string;
+  sourceList: string;
+  allCitationsCount: number;
+  primarySourceUrl: string;
+  sourceQuality: 'COMPREHENSIVE' | 'PARTIAL' | 'MINIMAL';
+  contextWordCount: number;
+  scraped1Ok: boolean;
+  scraped2Ok: boolean;
+  hasScrapedSource: boolean;
+  hasUserContextFlag: boolean;
+  researchOk: boolean;
+}
+
+export interface SubjectivePromptData extends SubjectiveMergedData {
+  claudeSystemPrompt: string;
+  claudeUserPrompt: string;
+}
+
+export interface SubjectiveGeneratedData extends SubjectivePromptData {
+  articleText: string;
+  originalArticleText: string;
+  generatedBy: string;
+  claudeFailed: boolean;
+  failureReason: string | null;
+}
+
+export interface SubjectiveValidatedData extends SubjectiveGeneratedData {
+  validationStatus: 'PASSED' | 'WARNINGS' | 'FAILED';
+  errors: string[];
+  warnings: string[];
+  slideResults: Array<{ slide: number; words: number }>;
+}
+
+export interface SubjectiveAuditedData extends SubjectiveValidatedData {
+  auditReport: string;
+  summaryComment: string;
+  auditedArticle: string;
+  wasAudited: boolean;
+}
+
 export interface FinalOutput {
   title: string;
   category: string;
@@ -265,6 +342,8 @@ export interface SlideshowSlide {
 export interface WorkflowResult {
   // Matches the shape handleAIGenerate() expects
   title: string;
+  metaDescription: string;
+  introSlide: { title: string; body: string } | null;
   description: string;
   keywords: string;
   slides: SlideshowSlide[];
@@ -299,6 +378,20 @@ export const STAGE_DEFS: Array<{ id: string; label: string }> = [
   { id: 'validating',        label: 'Validating structure' },
   { id: 'verifying',         label: 'Verifying facts' },
   { id: 'auditing',          label: 'Auditing with Grok' },
+  { id: 'creating_docs',     label: 'Assembling output' },
+  { id: 'complete',          label: 'Done' },
+];
+
+// Subjective pipeline is shorter — no fact atomization, no fact verification,
+// no citation scraping. Reuses the same IDs the UI's ProgressTracker knows.
+export const STAGE_DEFS_SUBJECTIVE: Array<{ id: string; label: string }> = [
+  { id: 'parsing',           label: 'Parsing input' },
+  { id: 'scraping_source',   label: 'Scraping source' },
+  { id: 'researching',       label: 'Researching context' },
+  { id: 'building_prompt',   label: 'Merging context' },
+  { id: 'generating',        label: 'Generating article' },
+  { id: 'validating',        label: 'Validating structure' },
+  { id: 'auditing',          label: 'Style audit (Grok)' },
   { id: 'creating_docs',     label: 'Assembling output' },
   { id: 'complete',          label: 'Done' },
 ];

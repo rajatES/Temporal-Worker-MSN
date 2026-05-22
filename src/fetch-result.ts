@@ -21,9 +21,12 @@ function parseSlides(articleText: string, category: string) {
   }
   if (cur !== null) slides.push({ slideNum: cur, title, body: body.trim() });
   const intro   = slides.find(s => s.slideNum === 1);
-  const content = slides.filter(s => s.slideNum > 1).map(s => ({
-    title: s.title, description: s.body, imageSearch: `${s.title} ${category}`,
-  }));
+  const content = slides
+    .filter(s => s.slideNum > 1)
+    .sort((a, b) => a.slideNum - b.slideNum)
+    .map(s => ({
+      title: s.title, description: s.body, imageSearch: `${s.title} ${category}`,
+    }));
   return { intro, content };
 }
 

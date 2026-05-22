@@ -14,7 +14,7 @@ import type {
   HumanReviewRequest,
   HumanDecision,
 } from './types';
-import { STAGE_DEFS } from './types';
+import { STAGE_DEFS, STAGE_DEFS_SUBJECTIVE } from './types';
 
 // ── Activity proxies ──────────────────────────────────────────────────────────
 
@@ -39,6 +39,18 @@ const {
   grokAuditAndVerify,
   extractAuditResults,
   finalAssembly,
+  // Subjective pipeline
+  prepareInputSubjective,
+  perplexitySubjectiveContext,
+  mergeSubjectiveContext,
+  buildSubjectivePrompt,
+  generateSubjectiveWithClaude,
+  checkSubjectiveClaudeResponse,
+  generateSubjectiveWithGrok,
+  validateSubjective,
+  grokSubjectiveStyleAudit,
+  extractSubjectiveAudit,
+  finalAssemblySubjective,
 } = proxyActivities<typeof activities>({
   startToCloseTimeout: '3 minutes',
   retry: {
@@ -63,13 +75,171 @@ const {
 export const getProgressQuery = defineQuery<WorkflowProgress>('getProgress');
 export const humanDecisionSignal = defineSignal<[HumanDecision]>('humanDecision');
 
+// ── Shared post-processing helpers (used by both modes) ──────────────────────
+
+const STOP_WORDS = new Set([
+  'a','an','the','and','or','but','in','on','at','to','for','of','with','by','from',
+  'is','was','are','were','has','had','have','his','her','their','its','this','that',
+  'he','she','they','it','who','which','also','as','be','been','being','into','up',
+  'out','over','after','before','when','than','not','no','so','if','would','could',
+  'should','two','three','four','five','despite','during','while','through',
+  'against','between','among','across','around','behind','below','above','under',
+]);
+const SPORT_LABELS: Record<string, string> = {
+  nfl: 'NFL', nba: 'NBA', mlb: 'MLB', nhl: 'NHL', nascar: 'NASCAR',
+  'f1': 'F1', 'formula 1': 'F1', golf: 'Golf', pga: 'Golf',
+  ufc: 'UFC', mma: 'MMA', tennis: 'Tennis', atp: 'Tennis', wta: 'Tennis',
+  wnba: 'WNBA', ncaa: 'NCAA', cfb: 'CFB', boxing: 'Boxing',
+};
+
+function extractProperNouns(text: string): string[] {
+  const tokens = text.replace(/\*\*/g, '').split(/\s+/);
+  const nouns: string[] = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const raw = tokens[i];
+    const clean = raw.replace(/[^a-zA-Z0-9]/g, '');
+    if (!clean || clean.length < 2 || STOP_WORDS.has(clean.toLowerCase())) { i++; continue; }
+    if (/^[A-Z]/.test(raw)) {
+      const parts = [clean];
+      let j = i + 1;
+      while (j < i + 4 && j < tokens.length) {
+        const nr = tokens[j], nc = nr.replace(/[^a-zA-Z0-9]/g, '');
+        if (/^[A-Z]/.test(nr) && nc.length > 1 && !STOP_WORDS.has(nc.toLowerCase())) {
+          parts.push(nc); j++;
+        } else break;
+      }
+      nouns.push(parts.join(' '));
+      i = j;
+    } else { i++; }
+  }
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const noun of nouns) {
+    const key = noun.toLowerCase();
+    if (seen.has(key)) continue;
+    if (unique.some(u => u.toLowerCase().includes(key))) continue;
+    unique.push(noun);
+    seen.add(key);
+  }
+  return unique;
+}
+
+function buildImageSearch(title: string, body: string, category: string): string {
+  const descNouns = extractProperNouns(body || '');
+  let candidates: string[] = [...descNouns];
+
+  if (candidates.length < 2) {
+    const titleNouns = extractProperNouns((title || '').replace(/^\d+\.\s*/, ''))
+      .map(n => n.split(' ').slice(0, 2).join(' '));
+    for (const n of titleNouns) {
+      if (!n.includes(' ')) continue;
+      if (!candidates.some(d => d.toLowerCase().includes(n.toLowerCase()) || n.toLowerCase().includes(d.toLowerCase()))) {
+        candidates.push(n);
+      }
+    }
+    if (candidates.length === 0) {
+      const fallback = (title || '').replace(/^\d+\.\s*/, '').replace(/[^a-zA-Z0-9\s]/g, '').trim().split(/\s+/).slice(0, 2).join(' ');
+      if (fallback) candidates.push(fallback);
+    }
+  }
+
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const t of candidates) {
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    if (terms.some(u => u.toLowerCase().includes(k) || k.includes(u.toLowerCase()))) continue;
+    terms.push(t);
+    seen.add(k);
+  }
+  const catKey = (category || '').toLowerCase().replace('sports - ', '').trim();
+  const sport = SPORT_LABELS[catKey] || '';
+  if (sport && !terms.some(t => t.toLowerCase().includes(sport.toLowerCase()))) {
+    terms.push(sport);
+  }
+  return terms.slice(0, 5).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+type ParsedSlide = { slideNum: number; title: string; body: string };
+
+// Parse slides from Claude/Grok output. Resilient to:
+//  - Markdown wrapping: **SLIDE N**, ## SLIDE N, ### SLIDE N
+//  - Inline title:    "SLIDE 5 The Title On Same Line"
+//  - Trailing colon:  "SLIDE 5:"
+//  - Missing SOURCES section (just stop at end of text)
+//  - Empty body (slide is still emitted so the count is accurate)
+function parseSlides(text: string): ParsedSlide[] {
+  const result: ParsedSlide[] = [];
+  let num: number | null = null;
+  let ttl = '';
+  let bdy = '';
+  const flush = () => {
+    if (num !== null) result.push({ slideNum: num, title: ttl.trim(), body: bdy.trim() });
+  };
+  for (const rawLine of text.split('\n')) {
+    // Strip markdown wrappers (**, leading #, trailing colon) so the matcher
+    // works on Claude's clean output AND Grok's rewrap variations.
+    const t = rawLine.trim().replace(/\*\*/g, '').replace(/^#+\s*/, '').trim();
+    const m = t.match(/^SLIDE\s*(\d+)\s*:?\s*(.*)$/i);
+    if (m) {
+      flush();
+      num = parseInt(m[1], 10);
+      ttl = m[2].trim();             // captures inline title if present
+      bdy = '';
+      continue;
+    }
+    if (num === null) continue;
+    if (!t) continue;
+    if (t.startsWith('SOURCES')) break;       // end of article body
+    if (t.startsWith('META:')) continue;       // META lines never belong to a slide
+    if (!ttl) ttl = t;
+    else bdy += (bdy ? ' ' : '') + t;
+  }
+  flush();
+  return result;
+}
+
+function buildWorkflowResult(articleText: string, final: { title: string; category: string; writerName: string; qualityScore: number; summaryComment: string; flagsForReview: string; generatedBy: string }): WorkflowResult {
+  const parsedSlides  = parseSlides(articleText);
+  const introSlide    = parsedSlides.find(s => s.slideNum === 1);
+  const contentSlides = parsedSlides
+    .filter(s => s.slideNum > 1)
+    .sort((a, b) => a.slideNum - b.slideNum)
+    .map(s => ({
+      title:       s.title,
+      description: s.body,
+      imageSearch: buildImageSearch(s.title, s.body, final.category),
+    }));
+
+  const metaMatch = articleText.match(/META:\s*([^\n]+)/i);
+  const metaDescription = metaMatch ? metaMatch[1].replace(/\*\*/g, '').trim() : '';
+
+  return {
+    title:         final.title,
+    metaDescription,
+    introSlide:    introSlide ? { title: introSlide.title, body: introSlide.body } : null,
+    description:   metaDescription || introSlide?.body || '',
+    keywords:      final.category,
+    slides:        contentSlides,
+    author:        final.writerName,
+    qualityScore:  final.qualityScore,
+    summaryComment: final.summaryComment,
+    flagsForReview: final.flagsForReview,
+    generatedBy:   final.generatedBy,
+  };
+}
+
 // ── Main workflow ─────────────────────────────────────────────────────────────
 
 export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<WorkflowResult> {
 
+  const mode = input.mode === 'subjective' ? 'subjective' : 'objective';
+  const stageDefs = mode === 'subjective' ? STAGE_DEFS_SUBJECTIVE : STAGE_DEFS;
+
   // ── Stage state ──────────────────────────────────────────────────────────────
-  const stages: Stage[] = STAGE_DEFS.map(s => ({ ...s, status: 'pending' as const }));
-  let currentStageId = STAGE_DEFS[0].id;
+  const stages: Stage[] = stageDefs.map(s => ({ ...s, status: 'pending' as const }));
+  let currentStageId = stageDefs[0].id;
   let humanReviewRequest: HumanReviewRequest | null = null;
   let humanDecisionReceived: HumanDecision | null = null;
   let workflowResult: WorkflowResult | undefined;
@@ -138,6 +308,121 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     humanDecisionReceived = decision;
   });
 
+  // ════════════════════════════════════════════════════════════════════════════
+  // SUBJECTIVE MODE — voice-driven, no fact verification, no human pauses.
+  // Mirrors n8n "VX Subjective" workflow.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  if (mode === 'subjective') {
+    // Stage 1: parse
+    activate('parsing');
+    const prepared = await prepareInputSubjective(input);
+    complete('parsing', `${prepared.slideCount} slides · ${prepared.category} · ${prepared.articleType}`);
+
+    // Stage 2: scrape user URLs (up to 5: primary + 4 extras)
+    activate('scraping_source');
+    let primaryMarkdown = '';
+    if (prepared.shouldScrapePrimary) {
+      try { primaryMarkdown = await firecrawlScrape(prepared.userPrimaryUrl); }
+      catch { warn('scraping_source', 'Primary scrape failed — continuing without it'); }
+    }
+    const additionalMarkdowns: string[] = [];
+    for (const url of prepared.userSecondaryUrls) {
+      try {
+        const md = await firecrawlScrape(url);
+        additionalMarkdowns.push(md ?? '');
+      } catch {
+        additionalMarkdowns.push('');
+      }
+    }
+    const totalScraped = primaryMarkdown.length + additionalMarkdowns.reduce((s, m) => s + m.length, 0);
+    complete('scraping_source', totalScraped > 0 ? `${totalScraped} chars across ${1 + additionalMarkdowns.filter(Boolean).length} source(s)` : 'no source scraped');
+
+    // Stage 3: Perplexity context research
+    activate('researching');
+    const perplexityResp = await perplexitySubjectiveContext(prepared);
+    complete('researching', `${perplexityResp.citations?.length ?? 0} citations`);
+
+    // Stage 4: merge tiers
+    activate('building_prompt');
+    const merged = await mergeSubjectiveContext(prepared, primaryMarkdown, additionalMarkdowns, perplexityResp);
+    const prompted = await buildSubjectivePrompt(merged);
+    complete('building_prompt', `source quality: ${merged.sourceQuality}`);
+
+    // Stage 5: generate (Claude → Grok fallback)
+    activate('generating', 'Calling Claude…');
+    let generated;
+    try {
+      const claudeRaw = await generateSubjectiveWithClaude(prompted.claudeSystemPrompt, prompted.claudeUserPrompt);
+      const checked   = await checkSubjectiveClaudeResponse(claudeRaw, prompted);
+
+      if (checked.claudeFailed) {
+        activate('generating', 'Claude failed — falling back to Grok…');
+        try {
+          const grokText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, prompted.claudeUserPrompt);
+          generated = {
+            ...prompted,
+            articleText:         grokText,
+            originalArticleText: grokText,
+            generatedBy:         'Grok (Fallback)',
+            claudeFailed:        true,
+            failureReason:       checked.failureReason,
+          };
+        } catch {
+          throw new Error('Both Claude and Grok generation failed — cannot produce subjective article');
+        }
+      } else {
+        generated = checked;
+      }
+    } catch (err) {
+      activate('generating', 'Claude API error — falling back to Grok…');
+      try {
+        const grokText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, prompted.claudeUserPrompt);
+        generated = {
+          ...prompted,
+          articleText:         grokText,
+          originalArticleText: grokText,
+          generatedBy:         'Grok (Fallback)',
+          claudeFailed:        true,
+          failureReason:       String(err),
+        };
+      } catch {
+        throw new Error('Both Claude and Grok generation failed — cannot produce subjective article');
+      }
+    }
+    complete('generating', `Generated by ${generated.generatedBy}`);
+
+    // Stage 6: validate structure
+    activate('validating');
+    const validated = await validateSubjective(generated);
+    complete('validating', `${validated.slideResults.length} slides · ${validated.errors.length} errors · ${validated.warnings.length} warnings`);
+
+    // Stage 7: Grok style audit
+    activate('auditing', 'Running Grok style audit…');
+    let audited;
+    try {
+      const grokAuditText = await grokSubjectiveStyleAudit(validated);
+      audited = await extractSubjectiveAudit(validated, grokAuditText);
+    } catch {
+      warn('auditing', 'Grok audit failed — using original article');
+      audited = await extractSubjectiveAudit(validated, '');
+    }
+    complete('auditing', audited.wasAudited ? 'Audited' : 'Skipped');
+
+    // Stage 8: final assembly
+    activate('creating_docs', 'Assembling output…');
+    const final = await finalAssemblySubjective(audited);
+
+    workflowResult = buildWorkflowResult(audited.articleText, final);
+    complete('creating_docs', `${workflowResult.slides.length} slides · score ${final.qualityScore}/100`);
+    complete('complete');
+    return workflowResult;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // OBJECTIVE MODE (default) — full fact-verified pipeline with human pauses.
+  // ════════════════════════════════════════════════════════════════════════════
+
   // ── Stage 1: Parse & analyze ─────────────────────────────────────────────────
   activate('parsing');
   const preparedData = await prepareInputAndAnalyze(input);
@@ -155,19 +440,19 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
       warn('scraping_source', 'Primary source scrape failed — continuing without it');
     }
 
-    let secondaryMarkdown = '';
-    let thirdMarkdown = '';
-    if (preparedData.userSecondaryUrls.length > 0) {
+    // Scrape every remaining URL (up to 4) — secondaries use onlyMainContent=false
+    // to capture broader context (matches n8n behaviour for non-primary sources).
+    const additionalMarkdowns: string[] = [];
+    for (const url of preparedData.userSecondaryUrls) {
       try {
-        secondaryMarkdown = await firecrawlScrape(preparedData.userSecondaryUrls[0], false);
-      } catch { /* skip on failure */ }
+        const md = await firecrawlScrape(url, false);
+        if (md) additionalMarkdowns.push(md);
+        else additionalMarkdowns.push('');
+      } catch {
+        additionalMarkdowns.push('');
+      }
     }
-    if (preparedData.userSecondaryUrls.length > 1) {
-      try {
-        thirdMarkdown = await firecrawlScrape(preparedData.userSecondaryUrls[1], false);
-      } catch { /* skip on failure */ }
-    }
-    sourcedData = await analyzeSourceAlignment(preparedData, primaryMarkdown, secondaryMarkdown, thirdMarkdown);
+    sourcedData = await analyzeSourceAlignment(preparedData, primaryMarkdown, additionalMarkdowns);
   } else {
     sourcedData = await buildResearchStrategy(preparedData);
   }
@@ -474,135 +759,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     }
   }
 
-  // ── Build slides for the slideshow form ───────────────────────────────────────
-  const STOP_WORDS = new Set([
-    'a','an','the','and','or','but','in','on','at','to','for','of','with','by','from',
-    'is','was','are','were','has','had','have','his','her','their','its','this','that',
-    'he','she','they','it','who','which','also','as','be','been','being','into','up',
-    'out','over','after','before','when','than','not','no','so','if','would','could',
-    'should','two','three','four','five','despite','during','while','through',
-    'against','between','among','across','around','behind','below','above','under',
-  ]);
-  const SPORT_LABELS: Record<string, string> = {
-    nfl: 'NFL', nba: 'NBA', mlb: 'MLB', nhl: 'NHL', nascar: 'NASCAR',
-    'f1': 'F1', 'formula 1': 'F1', golf: 'Golf', pga: 'Golf',
-    ufc: 'UFC', mma: 'MMA', tennis: 'Tennis', atp: 'Tennis', wta: 'Tennis',
-    wnba: 'WNBA', ncaa: 'NCAA', cfb: 'CFB', boxing: 'Boxing',
-  };
-
-  function extractProperNouns(text: string): string[] {
-    const tokens = text.replace(/\*\*/g, '').split(/\s+/);
-    const nouns: string[] = [];
-    let i = 0;
-    while (i < tokens.length) {
-      const raw = tokens[i];
-      const clean = raw.replace(/[^a-zA-Z0-9]/g, '');
-      if (!clean || clean.length < 2 || STOP_WORDS.has(clean.toLowerCase())) { i++; continue; }
-      if (/^[A-Z]/.test(raw)) {
-        const parts = [clean];
-        let j = i + 1;
-        while (j < i + 4 && j < tokens.length) {
-          const nr = tokens[j], nc = nr.replace(/[^a-zA-Z0-9]/g, '');
-          if (/^[A-Z]/.test(nr) && nc.length > 1 && !STOP_WORDS.has(nc.toLowerCase())) {
-            parts.push(nc); j++;
-          } else break;
-        }
-        nouns.push(parts.join(' '));
-        i = j;
-      } else { i++; }
-    }
-    const unique: string[] = [];
-    const seen = new Set<string>();
-    for (const noun of nouns) {
-      const key = noun.toLowerCase();
-      if (seen.has(key)) continue;
-      if (unique.some(u => u.toLowerCase().includes(key))) continue;
-      unique.push(noun);
-      seen.add(key);
-    }
-    return unique;
-  }
-
-  function buildImageSearch(title: string, body: string, category: string): string {
-    const descNouns = extractProperNouns(body || '');
-    let candidates: string[] = [...descNouns];
-
-    if (candidates.length < 2) {
-      const titleNouns = extractProperNouns((title || '').replace(/^\d+\.\s*/, ''))
-        .map(n => n.split(' ').slice(0, 2).join(' '));
-      for (const n of titleNouns) {
-        if (!n.includes(' ')) continue;
-        if (!candidates.some(d => d.toLowerCase().includes(n.toLowerCase()) || n.toLowerCase().includes(d.toLowerCase()))) {
-          candidates.push(n);
-        }
-      }
-      if (candidates.length === 0) {
-        const fallback = (title || '').replace(/^\d+\.\s*/, '').replace(/[^a-zA-Z0-9\s]/g, '').trim().split(/\s+/).slice(0, 2).join(' ');
-        if (fallback) candidates.push(fallback);
-      }
-    }
-
-    const seen = new Set<string>();
-    const terms: string[] = [];
-    for (const t of candidates) {
-      const k = t.toLowerCase();
-      if (seen.has(k)) continue;
-      if (terms.some(u => u.toLowerCase().includes(k) || k.includes(u.toLowerCase()))) continue;
-      terms.push(t);
-      seen.add(k);
-    }
-    const catKey = (category || '').toLowerCase().replace('sports - ', '').trim();
-    const sport = SPORT_LABELS[catKey] || '';
-    if (sport && !terms.some(t => t.toLowerCase().includes(sport.toLowerCase()))) {
-      terms.push(sport);
-    }
-    return terms.slice(0, 5).join(' ').replace(/\s+/g, ' ').trim();
-  }
-
-  // Re-parse from the final articleText (Grok may have rewritten it, and Grok
-  // uses **SLIDE N** markdown format which the pre-audit parse misses).
-  type ParsedSlide = { slideNum: number; title: string; body: string };
-  function parseSlides(text: string): ParsedSlide[] {
-    const result: ParsedSlide[] = [];
-    let num: number | null = null, ttl = '', bdy = '';
-    const flush = () => { if (num !== null) result.push({ slideNum: num, title: ttl.trim(), body: bdy.trim() }); };
-    for (const line of text.split('\n')) {
-      const t = line.trim().replace(/\*\*/g, '').trim();
-      const m = t.match(/^SLIDE\s*(\d+)/i);
-      if (m) { flush(); num = parseInt(m[1]); ttl = ''; bdy = ''; }
-      else if (num !== null) {
-        if (!ttl && t && !t.startsWith('META:')) ttl = t;
-        else if (ttl && t && !t.startsWith('SOURCES')) bdy += (bdy ? ' ' : '') + t;
-      }
-    }
-    flush();
-    return result;
-  }
-
-  const parsedSlides  = parseSlides(auditedData.articleText);
-  const introSlide    = parsedSlides.find(s => s.slideNum === 1);
-  const contentSlides = parsedSlides
-    .filter(s => s.slideNum > 1)
-    .map(s => ({
-      title:       s.title,
-      description: s.body,
-      imageSearch: buildImageSearch(s.title, s.body, auditedData.category),
-    }));
-
-  complete('creating_docs', `${contentSlides.length} slides · score ${final.qualityScore}/100`);
+  workflowResult = buildWorkflowResult(auditedData.articleText, final);
+  complete('creating_docs', `${workflowResult.slides.length} slides · score ${final.qualityScore}/100`);
   complete('complete');
-
-  workflowResult = {
-    title:         final.title,
-    description:   introSlide?.body ?? '',
-    keywords:      final.category,
-    slides:        contentSlides,
-    author:        final.writerName,
-    qualityScore:  final.qualityScore,
-    summaryComment: final.summaryComment,
-    flagsForReview: final.flagsForReview,
-    generatedBy:   final.generatedBy,
-  };
-
   return workflowResult;
 }
