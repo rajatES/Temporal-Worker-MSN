@@ -715,6 +715,126 @@ export async function validateRetry(data: AtomizedData, perplexityResp: Perplexi
 
 // ── 8. mergeResearch (n8n: "Merge Research") ─────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Light Perplexity Sanitization
+// Strips numbers from sentences that mention a Tier 1A/1B entity when those
+// numbers DO NOT match a known Tier 1A/1B fact. Numbers in general-context
+// sentences are left alone. Also strips direct quotes >30 chars and source URLs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function lightSanitizePerplexity(
+  text: string,
+  atomizedFacts: AtomizedFact[],
+  userContextContent: string,
+): { sanitized: string; stats: { originalLength: number; sanitizedLength: number; statPlaceholders: number; quotesRemoved: number; entitiesTracked: number } } {
+  if (!text) return { sanitized: '', stats: { originalLength: 0, sanitizedLength: 0, statPlaceholders: 0, quotesRemoved: 0, entitiesTracked: 0 } };
+
+  // Build entity → known-numbers map from atomized facts
+  const entityNumberMap: Record<string, Set<string>> = {};
+  const allEntityNames: string[] = [];
+
+  (atomizedFacts || []).forEach(item => {
+    if (item.itemName === 'USER_CONTEXT_DATA') return;
+    const name = (item.itemName || '').trim();
+    if (!name || name === `Item ${item.itemNumber}`) return;
+
+    const knownNumbers = new Set<string>();
+    (item.facts || []).forEach(f => {
+      if (!f.value) return;
+      const nums = String(f.value).match(/\d+(?:,\d{3})*(?:\.\d+)?/g) || [];
+      nums.forEach(n => {
+        knownNumbers.add(n.replace(/,/g, ''));
+        knownNumbers.add(n);
+      });
+    });
+
+    entityNumberMap[name.toLowerCase()] = knownNumbers;
+    allEntityNames.push(name);
+
+    // Also index by last name for fuzzy matching
+    const parts = name.split(/\s+/);
+    if (parts.length >= 2) {
+      const lastName = parts[parts.length - 1].toLowerCase();
+      if (lastName.length > 3) {
+        entityNumberMap[lastName] = knownNumbers;
+        allEntityNames.push(parts[parts.length - 1]);
+      }
+    }
+  });
+
+  // Also harvest numbers from user context for completeness
+  const userContextNumbers = new Set<string>();
+  if (userContextContent) {
+    const nums = userContextContent.match(/\d+(?:,\d{3})*(?:\.\d+)?/g) || [];
+    nums.forEach(n => {
+      userContextNumbers.add(n.replace(/,/g, ''));
+      userContextNumbers.add(n);
+    });
+  }
+
+  let cleaned = text;
+
+  // Remove header/footer admin sections
+  cleaned = cleaned.replace(/PRIMARY SOURCE URL:[^\n]*\n?/gi, '');
+  cleaned = cleaned.replace(/SOURCES?:[\s\S]*$/i, '');
+  cleaned = cleaned.replace(/\[\d+\]\s*https?:\/\/[^\s]+/g, '');
+  cleaned = cleaned.replace(/\(?\s*https?:\/\/[^\s)]+\s*\)?/g, '');
+
+  // Process sentence-by-sentence
+  const sentences = cleaned.split(/(?<=[.!?])\s+/);
+
+  const processedSentences = sentences.map(sentence => {
+    const lower = sentence.toLowerCase();
+
+    // Check if this sentence mentions any Tier 1A/1B entity
+    const mentionedEntity = allEntityNames.find(name =>
+      lower.includes(name.toLowerCase())
+    );
+
+    if (!mentionedEntity) {
+      // General-context sentence — leave numbers alone
+      return sentence;
+    }
+
+    // Entity-specific sentence — strip numbers that don't match known facts
+    const knownNumbers = entityNumberMap[mentionedEntity.toLowerCase()] || new Set<string>();
+
+    return sentence.replace(/\d+(?:,\d{3})*(?:\.\d+)?/g, (match) => {
+      const normalized = match.replace(/,/g, '');
+      if (knownNumbers.has(normalized) || knownNumbers.has(match)) return match;
+      if (userContextNumbers.has(normalized) || userContextNumbers.has(match)) return match;
+      // Keep tiny numbers (likely ordinals, not stats)
+      if (parseInt(normalized) < 10 && !match.includes('.') && !match.includes(',')) return match;
+      return '[STAT]';
+    });
+  });
+
+  let result = processedSentences.join(' ');
+
+  // Collapse runs of [STAT] placeholders
+  result = result.replace(/(\[STAT\][\s,]*){3,}/g, '[multiple stats] ');
+
+  // Strip direct quotes longer than 30 chars (likely lifted quotes)
+  result = result.replace(/"([^"]{30,300})"/g, '[quote omitted]');
+  result = result.replace(/“([^”]{30,300})”/g, '[quote omitted]');
+
+  // Clean whitespace
+  result = result.replace(/\n\s*\n\s*\n/g, '\n\n');
+  result = result.replace(/[ \t]+/g, ' ');
+  result = result.trim();
+
+  return {
+    sanitized: result,
+    stats: {
+      originalLength: text.length,
+      sanitizedLength: result.length,
+      statPlaceholders: (result.match(/\[STAT\]/g) || []).length,
+      quotesRemoved: (result.match(/\[quote omitted\]/g) || []).length,
+      entitiesTracked: allEntityNames.length,
+    },
+  };
+}
+
 export async function mergeResearch(data: ResearchedData, retryResp?: PerplexityRaw): Promise<MergedData> {
   let answer    = data.perplexityAnswer;
   let citations = data.perplexityCitations;
@@ -736,58 +856,132 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
   const userContextContent = data.userContext ?? '';
   const alignScore         = data.sourceAnalysis?.alignmentScore ?? 0;
 
-  // Detect if atomization failed despite having a rich source
-  const atomizationItemCount = data.atomizedFacts?.filter(f => f.itemName !== 'USER_CONTEXT_DATA').length ?? 0;
-  const atomizationFailed = userSourceContent.length > 2000 && atomizationItemCount <= 1;
-  if (atomizationFailed) {
-    console.warn(`[mergeResearch] Atomization produced only ${atomizationItemCount} item(s) from ${userSourceContent.length} chars of source — full source text will be used directly`);
-  }
-
+  // Determine source quality tier
+  const combinedUserContent = [userSourceContent, userContextContent].filter(Boolean).join('\n');
   let sourceQuality: string;
-  if (userSourceContent.length > 2000 && alignScore >= 60) {
+  if (combinedUserContent.length > 2000 && alignScore >= 60) {
     sourceQuality = 'COMPREHENSIVE';
-  } else if (userSourceContent.length > 500 || alignScore >= 35) {
+  } else if (combinedUserContent.length > 500 || alignScore >= 35) {
     sourceQuality = 'PARTIAL';
   } else {
     sourceQuality = 'MINIMAL';
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // LIGHT PERPLEXITY SANITIZATION
+  // Strip numbers from sentences that mention a Tier 1A/1B entity
+  // when those numbers DO NOT match a known Tier 1A/1B fact.
+  // ═══════════════════════════════════════════════════════════════
+
+  const { sanitized: sanitizedPerplexity, stats: sanitizationStats } =
+    lightSanitizePerplexity(answer, data.atomizedFacts, userContextContent);
+
+  // ═══════════════════════════════════════════════════════════════
+  // BUILD FACT DATABASE
+  // ═══════════════════════════════════════════════════════════════
+
   let combinedFactRepresentation = '';
 
+  combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+  combinedFactRepresentation += 'FACT DATABASE — READ THESE RULES BEFORE WRITING\n';
+  combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+
   if (sourceQuality === 'COMPREHENSIVE') {
-    combinedFactRepresentation += 'ABSOLUTE RULE: User source is COMPREHENSIVE.\nEVERY stat, name, ranking, date, quote MUST come from TIER 1A (scraped source) below.\nTIER 1B (User Context) contains ADDITIONAL facts, context, and instructions from the writer. USE these to enrich slides with extra information, angles, and details not in TIER 1A.\nTIER 2 (Perplexity) exists ONLY for tone/framing. ZERO facts from TIER 2.\nIf TIER 1A and TIER 2 conflict, TIER 1A wins. TIER 1B facts are authoritative and should be woven into slides.\n\n';
+    combinedFactRepresentation += 'SOURCE QUALITY: COMPREHENSIVE\n\n';
+    combinedFactRepresentation += 'TIER 1A is your FACT AUTHORITY — the source of truth for numbers, names, dates, rankings, achievements, and quotes. Treat it as a reference, not a template. The facts are yours to use; the phrasing is not. Build each sentence fresh, then verify the facts against Tier 1A afterward.\n\n';
+    combinedFactRepresentation += 'TIER 1B (User Context) provides ADDITIONAL authoritative facts and writer instructions. Use the facts. Follow the instructions. Never write a TIER 1B instruction into a slide as if it were content.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity supplementary context) provides tone, mood, historical framing, and subjective angles — at MOST 40% of your contextual material. It is NOT a fact source. Numbers, quotes, and recent claims in TIER 2 have been lightly stripped where they conflict with TIER 1A/1B. Do NOT pull stats, dates, or quotes from TIER 2.\n\n';
+    combinedFactRepresentation += 'If TIER 1A and TIER 2 disagree on anything factual, TIER 1A wins. Always.\n\n';
   } else if (sourceQuality === 'PARTIAL') {
-    combinedFactRepresentation += 'PARTIAL USER SOURCE.\nTIER 1A (scraped source): Use for ALL items that appear in it.\nTIER 1B (User Context): USE to add information, facts, framing, and detail to ANY slide. Writer-provided data is authoritative.\nFor items NOT in TIER 1A or 1B, you may use TIER 2 Perplexity data but MARK with [P] tag.\n\n';
+    combinedFactRepresentation += 'SOURCE QUALITY: PARTIAL\n\n';
+    combinedFactRepresentation += 'TIER 1A is your FACT AUTHORITY for items it covers. Treat it as a reference, not a template — use its facts, write your own sentences.\n\n';
+    combinedFactRepresentation += 'TIER 1B (User Context) provides additional authoritative facts and writer instructions. Use the facts. Follow the instructions.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity) provides tone, framing, and subjective context. For items NOT in TIER 1A or 1B, TIER 2 may also serve as a fact source (mark such facts with [P]). For items IN TIER 1A or 1B, TIER 2 is framing-only — at MOST 40% of contextual material.\n\n';
   } else {
-    combinedFactRepresentation += 'NO SUBSTANTIAL SCRAPED SOURCE.\nTIER 1B (User Context) is your PRIMARY fact source if provided. Use all data from it.\nPerplexity research is your secondary data source. All TIER 2 data may also be used.\n\n';
+    combinedFactRepresentation += 'SOURCE QUALITY: MINIMAL\n\n';
+    combinedFactRepresentation += 'TIER 1B (User Context), if present, is your primary authoritative fact source and provides writer instructions.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity) is your secondary fact source for items not covered by TIER 1B. Use facts from TIER 2 where TIER 1B is silent.\n\n';
   }
 
-  if (userSourceContent || data.factOnlyRepresentation) {
-    combinedFactRepresentation += '## TIER 1A: SCRAPED SOURCE — HIGHEST FACT AUTHORITY\nEvery stat, ranking, name, date, quote MUST come from here when available.\n\n';
-    if (data.factOnlyRepresentation && !atomizationFailed) {
-      combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
-    } else if (atomizationFailed) {
-      combinedFactRepresentation += '### NOTE: Atomized facts were not available. The full source text below IS your Tier 1A fact database. Read it carefully to extract all items, stats, and facts.\n\n';
-    }
-    if (userSourceContent) {
-      combinedFactRepresentation += '### Full Source Text\n' + userSourceContent + '\n\n';
+  // ═══════════════════════════════════════════════════════════════
+  // TIER 1A — Fact Authority
+  // ═══════════════════════════════════════════════════════════════
+
+  if (data.factOnlyRepresentation || userSourceContent) {
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+    combinedFactRepresentation += 'TIER 1A: FACT AUTHORITY\n';
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+
+    if (sourceQuality === 'COMPREHENSIVE') {
+      // FACT-ONLY MODE: send only atomized facts, hide raw markdown
+      if (data.factOnlyRepresentation) {
+        combinedFactRepresentation += data.factOnlyRepresentation + '\n\n';
+      }
+      combinedFactRepresentation += '[Note: Raw source prose is intentionally not included. Use the facts above to construct original sentences.]\n\n';
+    } else if (sourceQuality === 'PARTIAL') {
+      // PARTIAL: facts + trimmed snippets for item identification
+      if (data.factOnlyRepresentation) {
+        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
+      }
+      if (userSourceContent) {
+        // Trim each section to ~800 chars for identification only
+        const trimmedSections = userSourceContent
+          .split(/(?=##?\s*\d+[.):]?\s*)/)
+          .map(section => {
+            if (section.length <= 800) return section;
+            return section.substring(0, 800) + '\n[section trimmed — for item identification only, not for phrasing reference]';
+          })
+          .join('\n\n');
+        combinedFactRepresentation += '### Source Snippets (for item identification only, not for phrasing reference)\n' + trimmedSections + '\n\n';
+      }
+    } else {
+      // MINIMAL: original behavior
+      if (data.factOnlyRepresentation) {
+        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
+      }
+      if (userSourceContent) {
+        combinedFactRepresentation += '### Full Source Text\n' + userSourceContent + '\n\n';
+      }
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════
+  // TIER 1B — User Context (never sanitized)
+  // ═══════════════════════════════════════════════════════════════
 
   if (userContextContent) {
-    combinedFactRepresentation += '## TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA (USE TO ENRICH EVERY RELEVANT SLIDE)\nThis was provided directly by the writer. It contains facts, stats, angles, emphasis instructions, and context.\nRULES FOR TIER 1B:\n- Every fact, stat, or data point here is AUTHORITATIVE. Use it in the relevant slide.\n- If TIER 1B provides additional stats about an item already in TIER 1A, ADD those stats to the slide. Do not ignore them.\n- If TIER 1B mentions items, angles, or details not in TIER 1A, INCLUDE them in the article.\n- If TIER 1B contains instructions (tone, emphasis, angles), FOLLOW them as directives.\n- If TIER 1B directly contradicts a specific number in TIER 1A, TIER 1A wins. Otherwise TIER 1B stands as fact.\n- DO NOT discard TIER 1B content. The writer provided it for a reason.\n\n';
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+    combinedFactRepresentation += 'TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA & INSTRUCTIONS\n';
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+    combinedFactRepresentation += 'This was provided directly by the writer. It contains BOTH facts (to use as data) AND instructions (to follow as directives).\n';
+    combinedFactRepresentation += '• DATA (stats, names, dates) → use as facts in relevant slides\n';
+    combinedFactRepresentation += '• INSTRUCTIONS (tone, emphasis, formatting) → follow as directives, never quote into slide content\n';
+    combinedFactRepresentation += '• If TIER 1B contradicts a specific number in TIER 1A, TIER 1A wins. Otherwise TIER 1B stands.\n\n';
     combinedFactRepresentation += userContextContent + '\n\n';
   }
 
-  if (sourceQuality === 'COMPREHENSIVE') {
-    combinedFactRepresentation += '## TIER 2: PERPLEXITY — TONE & FRAMING ONLY (ZERO FACTS FROM HERE)\nDO NOT use any stat, date, ranking, achievement, or quote from this section.\nUse ONLY for: understanding why something matters, category context, writing tone.\n\n';
-  } else if (sourceQuality === 'PARTIAL') {
-    combinedFactRepresentation += '## TIER 2: PERPLEXITY — SUPPLEMENTARY (for items NOT in TIER 1A or 1B only)\nFor items that have TIER 1A or 1B data: IGNORE this section entirely for that item.\nFor items with NO TIER 1A or 1B data: you may use facts below, marked with [P].\n\n';
-  } else {
-    combinedFactRepresentation += '## TIER 2: PERPLEXITY RESEARCH — SECONDARY DATA SOURCE\nNo substantial scraped source provided. Use this alongside TIER 1B (if present) as your fact source.\n\n';
+  // ═══════════════════════════════════════════════════════════════
+  // TIER 2 — Perplexity (LAST, framing-only, 40% max)
+  // ═══════════════════════════════════════════════════════════════
+
+  if (sanitizedPerplexity) {
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+    combinedFactRepresentation += 'TIER 2: SUPPLEMENTARY TONE & CONTEXT (40% WEIGHT MAX)\n';
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+
+    if (sourceQuality === 'COMPREHENSIVE' || sourceQuality === 'PARTIAL') {
+      combinedFactRepresentation += 'Use this section for tone, mood, historical framing, comparisons across eras, why something matters in the broader category, and subjective takes. Do NOT pull numbers, dates, recent claims, or quotes from here. Stats that conflicted with TIER 1A/1B have been replaced with [STAT].\n';
+      combinedFactRepresentation += 'This should inform AT MOST 40% of your contextual material. The bulk of every slide comes from TIER 1A/1B facts.\n\n';
+    } else {
+      combinedFactRepresentation += 'For items not covered by TIER 1B, you may use facts from this section. Stats that conflicted with TIER 1B have been replaced with [STAT].\n\n';
+    }
+
+    combinedFactRepresentation += sanitizedPerplexity + '\n\n';
   }
 
-  combinedFactRepresentation += answer.substring(0, 3000);
+  const sourceList = citations.map((url, i) => `[${i + 1}] ${url}`).join('\n');
+
+  console.log(`[mergeResearch] Perplexity sanitization: ${sanitizationStats.statPlaceholders} stats replaced, ${sanitizationStats.quotesRemoved} quotes removed, ${sanitizationStats.entitiesTracked} entities tracked`);
 
   return {
     ...data,
@@ -795,7 +989,7 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
     combinedFactRepresentation,
     primarySourceUrl,
     citations,
-    sourceList: citations.map((url, i) => `[${i + 1}] ${url}`).join('\n'),
+    sourceList,
     researchWordCount: answer.split(/\s+/).length,
     researchOk: answer.length > 500 && citations.length >= 2,
     hasUserSource: !!(userSourceContent || data.factOnlyRepresentation),
@@ -822,7 +1016,7 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
 
   const BANNED_AI = `Delve, Embark, Foster, Navigate, Harness, Unlock, Elevate, Empower, Demystify, Catalyze, Optimize, Streamline, Tapestry, Landscape, Journey, Blueprint, Gateway, Intersection, Realm, Catalyst, Heartbeat, Pivotal, Comprehensive, Seamless, Vibrant, Dynamic, Synergistic, Multifaceted, Unparalleled, Robust, Transformative, Profound, Testament, Era, Synergy, "In today's world", "It is worth noting", "Moreover", "In conclusion", "Ultimately", "At the end of the day", "A testament to", "In today's fast-paced world", "In the rapidly evolving landscape of", "Since the dawn of", "Furthermore", "In addition to", "Conversely", "On the other hand", "Consequently", "It is important to note that", "In summary", "To wrap up", "As we look to the future", "A game-changer for", "The ultimate guide to", "Wait, There's More", "Therefore", "Hence", "Accordingly", "Nevertheless", "Nonetheless", "Despite this", "Critically important", "highly significant", "deeply impactful", "The future of [Topic] looks promising", "A wide variety of factors", "a plethora of options", "It serves as a testament to", "It acts as a catalyst for", showcase, underscore, highlight, cement, solidify, storied, remarkable, notable, impressive, outstanding, exceptional, incredible, unparalleled, unprecedented, larger than life, household name, the rest is history`;
 
-  const BANNED_CONTENT = `Nude, Naked, Suicide, Kill, Shot, Stabbed, Fake News, Misinformation, Conspiracy Theory, Hoax, Exploitation, Fetish, Adultery, Scandal, Trans, War, Terrorist, shit, Vaccination, Weed, Cannabis, Murder, Prison, Fraud, Conspiracy, Jail, Racist, Sex, Sexual, Mutilate, Pussy, Vagina, Dick, Penis, Sexy, Fuck, Harassment, Marijuana, Cocaine, Assault, Scam, Gambling, Drug, Racism, Allegation, Vaccine, Ganja, Battery, Laundering, Butt, ass, Betting, Pedophile, Rape, Molest, Damn, Faggot, Fag, Nigga, Bitch, Cigarette, Cigar, Cum, Dominatrix, Ejaculation, Genitals, Hooters, Jackass, Masturbate, Nipple, NSFW, Onlyfans, Opioids, Orgasm, Pedos, Piss, Porn, Schlong, Smoking, Spunk, Striptease, Testicle, Tobacco, Vibrator, WTF`;
+  const BANNED_CONTENT = `Nude, Naked, Suicide, Kill, Shot, Stabbed, Fake News, Misinformation, Conspiracy Theory, Hoax, Nigger, Exploitation, Fetish, Adultery, Scandal, Trans, War, Terrorist, shit, Vaccination, Weed, Cannabis, Murder, Prison, Fraud, Conspiracy, Jail, Racist, Sex, Sexual, Mutilate, Pussy, Vagina, Dick, Penis, Sexy, Fuck, Harassment, Marijuana, Cocaine, Assault, Scam, Gambling, Drug, Racism, Allegation, Vaccine, Ganja, Battery, Laundering, Butt, ass, Betting, Pedophile, Rape, Molest, Damn, Faggot, Fag, Nigga, Bitch, Cigarette, Cigar, Cum, Dominatrix, Ejaculation, Genitals, Hooters, Jackass, Masturbate, Nipple, NSFW, Onlyfans, Opioids, Orgasm, Pedos, Piss, Porn, Schlong, Smoking, Spunk, Striptease, Testicle, Tobacco, Vibrator, WTF`;
 
   const ta = data.titleAnalysis;
   const fc = data.formatConfig;
@@ -834,26 +1028,31 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
 ${tc.dateAnchor}
 ${tc.seasonAnchor}${writingStyleBlock}
 
+═══════════════════════════════════════════════════════════════
 SOURCE HIERARCHY — ABSOLUTE LAW (READ FIRST, OBEY ALWAYS)
+═══════════════════════════════════════════════════════════════
 
-You will receive content in three labeled tiers. The hierarchy is non-negotiable:
+You will receive content in tiers. The hierarchy is non-negotiable:
 
-TIER 1A: SCRAPED SOURCE — HIGHEST FACT AUTHORITY
-This is your primary fact source. Stats, names, rankings, dates, achievements, quotes, item ordering from here override everything else.
+▓▓▓ TIER 1A: FACT AUTHORITY ▓▓▓
+This is your source of truth for numbers, names, dates, rankings, achievements, and quotes. Treat it as a reference, not a template. The facts are yours to use. The phrasing is not.
 
 Rules for Tier 1A:
-- If Tier 1A says "Player X had 42 TDs," write 42. Not "over 40," not "around 40," not "more than 40."
-- If Tier 1A orders items 1-25, the article orders them 1-25. No re-ranking, no reordering.
+- If Tier 1A says "Player X had 42 TDs," write 42. Not "over 40," not "around 40."
+- If Tier 1A orders items 1-25, the article orders them 1-25. No re-ranking.
 - If Tier 1A lists 10 facts about an item, you may use any subset of those 10.
 - If Tier 1A contradicts anything else, Tier 1A wins. Always.
+- You read Tier 1A to learn the facts. You do not read Tier 1A to learn how to phrase them. Build each sentence fresh, then verify the facts against Tier 1A afterward.
 
-TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA (USE ACTIVELY)
+▓▓▓ TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA (USE ACTIVELY) ▓▓▓
 The writer pasted this manually. It may contain additional facts, stats, angles, emphasis instructions, and context that MUST be used in the article.
 
 CRITICAL — DATA vs. INSTRUCTIONS:
 TIER 1B may contain BOTH data and instructions. You must distinguish between them:
 - DATA (stats, names, dates, rankings, achievements, quotes) = use as FACTS in the relevant slides.
 - INSTRUCTIONS (tone preferences, what to emphasize, things to avoid, formatting notes, angles to take) = follow as DIRECTIVES that shape how you write. Never quote an instruction as if it were a fact in a slide.
+Example of data: "Patrick Mahomes threw 4,183 yards" → use as a fact.
+Example of instruction: "Focus on playoff performances" → follow this when choosing which facts to highlight, but do not write "The writer noted to focus on playoff performances" in a slide.
 
 Rules for Tier 1B:
 - Every fact, stat, or data point in Tier 1B is AUTHORITATIVE. Use it in the relevant slide.
@@ -861,39 +1060,63 @@ Rules for Tier 1B:
 - If Tier 1B mentions items, angles, or details not in Tier 1A, INCLUDE them in the article.
 - If Tier 1B contains instructions (tone, what to emphasize, what to avoid), FOLLOW them as directives.
 - If Tier 1B directly contradicts a specific number in Tier 1A, Tier 1A wins. For everything else, Tier 1B stands as fact.
-- DO NOT discard Tier 1B content. The writer provided it for a reason.
+- DO NOT discard Tier 1B content. The writer provided it for a reason. If you wrote the article without using Tier 1B data or following Tier 1B instructions, you failed.
 
-TIER 2: PERPLEXITY RESEARCH + SCRAPED CITATIONS
-This is BACKGROUND CONTEXT ONLY. NEVER a fact source.
+▓▓▓ TIER 2: SUPPLEMENTARY TONE & CONTEXT (40% MAX) ▓▓▓
+This is for tone, mood, framing, and subjective angles. NEVER a fact source for stats, dates, or recent claims.
 
 Rules for Tier 2:
-- Use ONLY for: tone calibration, historical framing, category background, understanding why something matters
-- NEVER use for: stats, dates, rankings, achievements, quotes, specific factual claims
-- If Tier 1A or 1B covers an item, ignore what Tier 2 says about that item
-- If Tier 2 contradicts Tier 1A or 1B, Tier 2 is wrong by definition
+- USE for: tone calibration, historical framing, comparisons across eras, why something matters in the category, subjective takes, mood
+- DO NOT pull from Tier 2: stats, dates, recent claims, percentages, dollar amounts, rankings, or direct quotes
+- Stats that conflicted with Tier 1A/1B have already been replaced with [STAT] — do not invent values for those placeholders
+- Tier 2 should inform AT MOST 40% of your contextual material. The bulk of every slide comes from Tier 1A/1B facts.
+- If Tier 1A and Tier 2 disagree on anything factual, Tier 1A wins
 
-TIER 3: NEUTRAL PUBLIC FACTS (LAST RESORT, MARK WITH [*])
-Only for genuinely neutral facts not in Tier 1A or 1B that are common knowledge.
+▓▓▓ TIER 3: NEUTRAL PUBLIC FACTS (LAST RESORT, MARK WITH [*]) ▓▓▓
+Only for genuinely neutral facts that are not in Tier 1A, 1B, and are common knowledge.
 
-Allowed Tier 3: Team city, league name, standard role, sport's basic rules.
-NEVER allowed as Tier 3: Any stat, career totals, championships, awards, years, dates, quotes, rankings.
+Allowed Tier 3 examples:
+- Team city ("the Kansas City Chiefs")
+- League name ("in the NBA")
+- Standard role ("the point guard")
+- Sport's basic rules
+
+NEVER allowed as Tier 3:
+- Any stat, even if "well-known"
+- Career totals, championships, awards
+- Years, dates, seasons
+- Quotes
+- Rankings or comparisons
 
 Mark every Tier 3 use with [*] inline.
 
+═══════════════════════════════════════════════════════════════
 ANTI-HALLUCINATION PROTOCOL — NON-NEGOTIABLE
+═══════════════════════════════════════════════════════════════
 
 Before writing each slide, do this internal check:
 
 STEP 1 — IDENTIFY: What is this slide about? Find the matching item in Tier 1A and Tier 1B.
-STEP 2 — INVENTORY: List every fact Tier 1A gives you about this item, THEN every fact (not instruction) Tier 1B gives you. Combined, that is your complete fact pool.
-STEP 3 — SELECT: Pick the 2-4 strongest facts from your inventory.
-STEP 4 — WRITE: Build the slide using ONLY those selected facts plus connective tissue.
-STEP 5 — VERIFY: Re-read the slide. For every specific claim ask: "Is this in my Tier 1A or Tier 1B fact inventory?" If YES: keep it. If NO: delete it. No exceptions.
+
+STEP 2 — INVENTORY: List every fact Tier 1A gives you about this item, THEN every fact (not instruction) Tier 1B gives you. Combined, that is your complete fact pool for this slide. Tier 1B instructions shape your writing but are not facts to include.
+
+STEP 3 — SELECT: Pick the 2-4 strongest facts from your inventory. Strength means: most specific, most surprising, most central to the slideshow's angle. If Tier 1B instructions tell you to emphasize certain aspects, let that guide your selection.
+
+STEP 4 — WRITE: Build the slide using ONLY those selected facts plus connective tissue (verbs, transitions, framing).
+
+STEP 5 — VERIFY: Re-read the slide. For every specific claim ask: "Is this in my Tier 1A or Tier 1B fact inventory?"
+- If YES: keep it
+- If NO: delete it
+- No exceptions, no "but it's true," no "but it makes the slide better"
+- Also check: "Did I accidentally quote a Tier 1B instruction as content?" If yes, remove it.
 
 WHEN TIER 1A IS THIN FOR AN ITEM:
 - Check Tier 1B for additional facts about this item before writing a shorter slide
+- If Tier 1B has relevant data, USE it to build a fuller slide
 - If BOTH Tier 1A and 1B are thin, write a shorter, sharper slide using only what they provide
+- Use stronger writing (better verbs, contrast, rhythm) to reach 35-50 words — not more facts
 - A 38-word slide of pure truth beats a 48-word slide with one invented detail
+- If Tier 1A and 1B truly only give you one fact, build the slide around that one fact with framing
 
 WHAT YOU MUST NEVER DO:
 - Invent a stat to round out a slide
@@ -901,22 +1124,50 @@ WHAT YOU MUST NEVER DO:
 - Add a championship, award, or milestone not mentioned in Tier 1A or 1B
 - Quote anyone unless the quote is verbatim in Tier 1A or 1B
 - Reorder, re-rank, or substitute items from Tier 1A's list
+- Fill word count by adding fabricated context
 - Ignore Tier 1B data that the writer provided
+- Write a Tier 1B instruction into a slide as if it were a fact or quote
 
+═══════════════════════════════════════════════════════════════
 ABSOLUTE OUTPUT RULE
+═══════════════════════════════════════════════════════════════
 
 You MUST always produce the complete slideshow. No exceptions.
+
 These responses are FORBIDDEN:
 - "I need more data before I can proceed"
 - "The fact database is insufficient"
+- "I cannot write this without X"
+- Asking clarifying questions instead of writing slides
 - Any response that is not the full formatted slideshow
 
-ORIGINALITY: Facts are yours to use. Language is NOT.
-Use any stat, date, name, achievement from Tier 1A or 1B. Write every sentence fresh.
+If Tier 1A is thin, check Tier 1B. If both are thin, write tighter slides using only their facts. Never substitute training knowledge for Tier 1A/1B data. A complete article built strictly on Tier 1A + 1B — even if some slides are shorter or simpler — is the correct output. Always.
 
+═══════════════════════════════════════════════════════════════
+ORIGINALITY REQUIREMENTS — WRITING FRESH FROM FACTS
+═══════════════════════════════════════════════════════════════
+
+You are writing ORIGINAL content using Tier 1A and 1B FACTS. You are NOT paraphrasing.
+
+THE RULE: Facts are yours to use. Language is NOT.
+- Use any stat, date, name, achievement from Tier 1A or 1B
+- Write every sentence fresh — no copying phrases from sources
+- If you find yourself swapping synonyms, you're paraphrasing — rewrite completely
+
+When using a Tier 1A or 1B fact, vary how you present it:
+- REFRAME: lead with the consequence or reaction, not the stat itself
+- RESTRUCTURE: if the source uses one long sentence, try two short ones
+- ADD A LAYER: pair the fact with a sharp observation the source doesn't make
+
+Quick check before moving on: if any 6-word string of your sentence could be Google-searched and land on the source article, rewrite that string.
+
+═══════════════════════════════════════════════════════════════
 TITLE-BODY CORRELATION (Highest Priority)
+═══════════════════════════════════════════════════════════════
 
 Title: "${data.title}"
+
+EVERY promise in this title MUST be delivered:
 - Numbers in title = exact count in body (${ta.promisedCount} items)
 - Emotions (${ta.emotionalPromise ?? 'none detected'}) = explain WHO felt it, WHEN, WHY
 - Main angle: ${ta.mainAngle}
@@ -924,7 +1175,9 @@ ${ta.secondaryAngle ? `- Secondary angle: ${ta.secondaryAngle}` : ''}
 - If title makes a claim, literally substantiate it in the body using Tier 1A/1B facts
 - Negative keywords in the title must find their place in the copy verbatim
 
+═══════════════════════════════════════════════════════════════
 WORD COUNTS (STRICT - Count every word)
+═══════════════════════════════════════════════════════════════
 
 - Meta Description: MAX 120 characters
 - Intro slide (Slide 1): MAX 60 words
@@ -932,14 +1185,20 @@ WORD COUNTS (STRICT - Count every word)
 - If over or under, rewrite until it fits. Do not approximate.
 - NEVER pad word count with invented facts. Use stronger writing instead.
 
+═══════════════════════════════════════════════════════════════
 META DESCRIPTION
+═══════════════════════════════════════════════════════════════
 
 Max 120 characters. Intriguing. Angle-focused. Has a hook.
 Cannot be: CTA, reveal the main angle, paraphrased title.
+
 AI patterns to NEVER use: "Discover the...", "Explore the top...", "Find out why...", "You won't want to miss..."
+
 Good pattern: [Specific unexpected fact from Tier 1A or 1B]. [Implied question].
 
+═══════════════════════════════════════════════════════════════
 INTRO SLIDE (Slide 1) — MAX 60 WORDS
+═══════════════════════════════════════════════════════════════
 
 Your intro MUST:
 - Create CURIOSITY — make readers NEED to scroll
@@ -947,55 +1206,88 @@ Your intro MUST:
 - Hint at what's coming WITHOUT naming specific items
 - End with forward momentum
 - Talk about something the title is promising
+- Tease the main angle, not reveal it entirely
 
 Your intro must NOT:
 - Name any items from the list
 - Reveal the #1 pick or any rankings
 - Use "let's dive in" / "here are" / "we'll explore"
 - Use generic openers ("Since the dawn of...", "In today's world...")
+- Paraphrase the title anywhere
 - Have generic background that assumes reader ignorance
+- Stack adjectives without information backing them
 - Use any fact not present in Tier 1A or 1B
 
+═══════════════════════════════════════════════════════════════
 WRITING VOICE — THE SPICY WRITER FACTOR
+═══════════════════════════════════════════════════════════════
 
-You are not summarizing facts. You are REACTING to them. Write like a sharp, witty sports columnist or pop culture critic who genuinely cares about the subject.
+You are not summarizing facts. You are REACTING to them. Write like a sharp, witty sports columnist or pop culture critic who genuinely cares about the subject and has opinions — but whose every factual claim traces back to Tier 1A or 1B.
 
 THE ENERGY RULES:
 - Lead with what made YOU react. If a Tier 1A/1B stat shocked you, let that shock hit the reader first.
-- One-sentence gut punches are your weapon.
+- One-sentence gut punches are your weapon. "38 years old. 40 touchdowns. Zero signs of slowing down." (assuming all numbers from Tier 1A/1B)
 - Contrast is your best friend. Set up expectation, then break it — using Tier 1A/1B facts.
-- Specificity IS creativity.
+- Specificity IS creativity. Pull the specific from Tier 1A/1B, then frame it sharply.
 
 RHYTHM AND PACING:
 - Alternate sentence lengths deliberately. Short punch. Then longer context. Then short again.
 - Never let two slides have the same energy.
+- The reader should feel a tempo change every 2-3 slides.
 
-EMOTIONAL TEXTURE (rotate through): DISBELIEF, RESPECT, HUMOR (light), TENSION, NOSTALGIA
+EMOTIONAL TEXTURE (rotate through):
+- DISBELIEF, RESPECT, HUMOR (light), TENSION, NOSTALGIA
 
 WHAT TO AVOID:
 - Wikipedia voice: "He is widely regarded as one of the greatest..."
 - Cheerleader voice: "What an incredible, amazing, stunning performance!"
 - Resume voice: stat-dumping without framing
 
-CONTENT SLIDES — 5Ws + 1H Framework
+THE GOLDEN RULE: Every slide should make someone want to text their friend about it. AND every fact must come from Tier 1A or 1B.
 
-Every slide must answer the RELEVANT questions using Tier 1A/1B:
+═══════════════════════════════════════════════════════════════
+CONTENT SLIDES — 5Ws + 1H Framework
+═══════════════════════════════════════════════════════════════
+
+Every slide must answer the RELEVANT questions for that item using Tier 1A/1B:
 WHO / WHAT / WHEN / WHERE / WHY / HOW
 
+You don't need all six — but the ones that matter MUST be answered using Tier 1A/1B facts.
+
+═══════════════════════════════════════════════════════════════
 STATS NEED CONTEXT — MAX 2 STATS PER SLIDE
+═══════════════════════════════════════════════════════════════
 
-Every stat needs ONE of these as framing: WHY it matters / WHEN it happened / WHO it affected / WHAT it led to.
+Every stat (from Tier 1A/1B) needs ONE of these as framing:
+- WHY it matters
+- WHEN it happened
+- WHO it affected
+- WHAT it led to
 
-${fc.isMultiSlideFormat ? `MULTI-SLIDE FORMAT — 2 SLIDES PER ENTITY
+The framing can come from your writing voice. The stat itself must be Tier 1A/1B.
 
-SLIDE A: WHO they are, PRIMARY achievement (from Tier 1A/1B), key stat
-SLIDE B: Supporting context, additional Tier 1A/1B stats, legacy/impact. Must BUILD ON Slide A using DIFFERENT facts.
-` : ''}${ta.requiresCorrelation ? `CORRELATION WRITING
+${fc.isMultiSlideFormat ? `
+═══════════════════════════════════════════════════════════════
+MULTI-SLIDE FORMAT — 2 SLIDES PER ENTITY
+═══════════════════════════════════════════════════════════════
+
+SLIDE A: WHO they are, PRIMARY achievement (from Tier 1A/1B), key stat (from Tier 1A/1B)
+SLIDE B: Supporting context, additional Tier 1A/1B stats, legacy/impact
+SLIDE B must BUILD ON Slide A using DIFFERENT Tier 1A/1B facts — not repeat.
+` : ''}${ta.requiresCorrelation ? `
+═══════════════════════════════════════════════════════════════
+CORRELATION WRITING
+═══════════════════════════════════════════════════════════════
 
 Every slide must CONNECT two things using Tier 1A/1B facts about both.
-FORMULA: [Entity A's trait] + [How it addresses Entity B's need] + [Evidence]
+FORMULA: [Entity A's Tier 1A/1B trait] + [How it addresses Entity B's Tier 1A/1B need] + [Tier 1A/1B evidence]
 ` : ''}
+
+═══════════════════════════════════════════════════════════════
 QUALITY CONSISTENCY ENGINE
+═══════════════════════════════════════════════════════════════
+
+Quality decay is the most common failure. Combat it with these rules.
 
 PRE-WRITING PLANNING (MANDATORY before writing Slide 1):
 1. Read ALL Tier 1A and Tier 1B content completely
@@ -1004,30 +1296,45 @@ PRE-WRITING PLANNING (MANDATORY before writing Slide 1):
 4. Check Tier 1B for additional facts that can enrich each slide
 5. Verify slide 15's anchor is as specific as slide 3's
 6. If ANY slide has no Tier 1A/1B anchor, write a shorter slide — do NOT pull from Tier 2 or training
+7. Do NOT begin writing until every slide has a Tier 1A/1B anchor (or an acknowledged short-slide plan)
 
 THREE TESTS — every slide must pass ALL:
 TEST 1 — STRANGER TEST: Reading only this slide, would someone learn one specific real thing?
 TEST 2 — SIDE-BY-SIDE TEST: Is this as specific as slide 3?
 TEST 3 — SOURCE TEST: Does every specific claim trace to Tier 1A or 1B?
 
+THE SECOND HALF RULE:
+Re-read your second-half slides in isolation. If any embarrasses you next to slide 3, rewrite using more Tier 1A/1B facts (not invented ones).
+
 NO FILLER SLIDES — ZERO TOLERANCE.
 
+═══════════════════════════════════════════════════════════════
 VARIETY ENFORCEMENT
+═══════════════════════════════════════════════════════════════
 
 1. OPENING WORDS — Never start 2 consecutive slides with the same word
 2. SENTENCE STRUCTURE — Rotate through patterns A/B/C/D
 3. ANTI-REPETITION: Track openings, structures, transitions, tones. Break patterns.
 
-${ta.isRanking ? `RANKING ORDER — FOLLOW TIER 1A EXACTLY
+${ta.isRanking ? `
+═══════════════════════════════════════════════════════════════
+RANKING ORDER — FOLLOW TIER 1A EXACTLY
+═══════════════════════════════════════════════════════════════
 
 If Tier 1A provides a ranked list, USE THAT EXACT ORDER. Do not re-rank.
 
 For descending presentation:
 Slide 2 = Tier 1A's rank ${ta.promisedCount} (lowest)
+Slide 3 = Tier 1A's rank ${ta.promisedCount - 1}
+...
 Last slide = Tier 1A's rank 1 (best/top)
+
 Each slide title for rankings must start with the rank number.
 ` : ''}
+
+═══════════════════════════════════════════════════════════════
 HUMAN VOICE
+═══════════════════════════════════════════════════════════════
 
 - Clear, direct sentences. Vary length naturally.
 - Let Tier 1A/1B facts create emotion — don't say "amazing", show the stat that IS amazing
@@ -1035,7 +1342,9 @@ HUMAN VOICE
 - Predominantly active voice
 - No cliches, no forced regional metaphors
 
+═══════════════════════════════════════════════════════════════
 PUNCTUATION BANS (STRICT)
+═══════════════════════════════════════════════════════════════
 
 NO em-dashes (—). NO semicolons (;). NO ellipsis (...).
 Banned in ALL slide descriptions. One violation = rewrite.
@@ -1054,13 +1363,17 @@ ${BANNED_CONTENT}
 Profanity in direct quotes only: censor as first letter + asterisks (s***, f***)
 Dick cannot be used anywhere, including in names.
 
+═══════════════════════════════════════════════════════════════
 MSN SAFETY — 10-12 YEAR OLD TEST
+═══════════════════════════════════════════════════════════════
 
 Before every slide ask: "Should a 10-12 year old be reading this?"
 Avoid: sexual content, graphic violence, drugs, gambling, political content, sensationalized celebrity drama, body shaming, bullying.
 No profanity in titles or meta descriptions ever.
 
+═══════════════════════════════════════════════════════════════
 FORMAT (Plain text only, no markdown)
+═══════════════════════════════════════════════════════════════
 
 ${data.title}
 
@@ -1085,23 +1398,29 @@ SOURCES:
     ? '\nSOURCE QUALITY: PARTIAL — Your scraped source covers some items.\nFor items IN TIER 1A: use TIER 1A facts, enrich with TIER 1B data, follow TIER 1B instructions. For items NOT IN TIER 1A: use TIER 1B first, then TIER 2 marked with [P].\n'
     : '\nSOURCE QUALITY: MINIMAL — Use TIER 1B (user context) as your primary fact source if available. Follow any TIER 1B instructions. Use Perplexity research as secondary.\n';
 
-  const claudeUserPrompt = `TIER 1A + 1B FACT DATABASE — YOUR ONLY FACT SOURCES
+  const claudeUserPrompt = `═══════════════════════════════════════════════════════════════
+TIER 1A + 1B FACT DATABASE — YOUR ONLY FACT SOURCES
+═══════════════════════════════════════════════════════════════
 
 ${data.combinedFactRepresentation}
 
 ${citationContext}
 
+═══════════════════════════════════════════════════════════════
 ASSIGNMENT
+═══════════════════════════════════════════════════════════════
 
 Title: "${data.title}"
 Category: ${data.category}
-Slides: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides, no more, no fewer. If the source material covers fewer than ${data.slideCount} items, add additional slides with honorable mentions, historical context, or related entries to reach exactly ${data.slideCount}.)
+Slides: 1 intro + ${data.slideCount} content slides
 ${fc.isMultiSlideFormat ? `Format: ${fc.slidesPerEntity} slides per entity (${fc.entityCount} entities total)` : ''}
 ${data.hasMustInclude ? `\nMANDATORY ITEMS (must all appear, all from Tier 1A/1B):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}` : ''}
 
 Primary Source: ${data.primarySourceUrl || 'See Tier 1A above'}
 
+
 ${sourceQualityBlock}
+
 BEFORE WRITING — run this checklist:
 1. What promise does the title make?
 2. What is each slide's anchor fact from TIER 1A? (not Tier 2, not training)
@@ -1386,18 +1705,35 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
 
 export async function extractClaims(data: ValidatedData): Promise<ClaimedData> {
   const articleText = data.articleText;
+  const factDb = (data.combinedFactRepresentation || '').toLowerCase();
+
+  // ── Build a Set of numbers/years that already appear in the Tier 1A/1B
+  // fact database. Any extracted claim whose number is already in here is
+  // authoritative — skip it (don't waste a Grok claim slot on it).
+  const trustedNumbers = new Set<string>();
+  for (const m of factDb.matchAll(/\d+(?:,\d{3})*(?:\.\d+)?/g)) {
+    trustedNumbers.add(m[0].replace(/,/g, ''));
+    trustedNumbers.add(m[0]);
+  }
+
   const claims: ClaimedData['claimsToVerify'] = [];
+  let preFilteredStats = 0;
+  let preFilteredDates = 0;
 
   for (const m of articleText.matchAll(/(\d+(?:,\d{3})*(?:\.\d+)?)\s*(yards?|points?|touchdowns?|TDs?|rebounds?|assists?|wins?|%|million|billion|championships?|titles?|Pro Bowls?|MVPs?|Emmy|Oscar)/gi)) {
+    const numNorm = m[1].replace(/,/g, '');
+    if (trustedNumbers.has(numNorm) || trustedNumbers.has(m[1])) { preFilteredStats++; continue; }
     const start = Math.max(0, m.index! - 40);
     const end   = Math.min(articleText.length, m.index! + m[0].length + 40);
     claims.push({ type: 'stat', claim: m[0], context: articleText.slice(start, end).replace(/\n/g, ' ') });
   }
   for (const m of articleText.matchAll(/\b((19|20)\d{2})\b/g)) {
+    if (trustedNumbers.has(m[1])) { preFilteredDates++; continue; }
     const start = Math.max(0, m.index! - 40);
     const end   = Math.min(articleText.length, m.index! + 4 + 40);
     claims.push({ type: 'date', claim: m[1], context: articleText.slice(start, end).replace(/\n/g, ' ') });
   }
+  // Superlatives have no numeric anchor — always send to Grok for triage.
   for (const m of articleText.matchAll(/\b(first|only|most|best|worst|largest|oldest|youngest|fastest|highest|record|all-time)\b[^.]{10,80}/gi)) {
     claims.push({ type: 'superlative', claim: m[0].trim(), context: m[0].trim() });
   }
@@ -1405,6 +1741,7 @@ export async function extractClaims(data: ValidatedData): Promise<ClaimedData> {
   const seen = new Set<string>();
   const uniqueClaims = claims.filter(c => { const k = c.claim.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
 
+  console.log(`[extractClaims] ${uniqueClaims.length} claims to verify (pre-filtered ${preFilteredStats} stats + ${preFilteredDates} dates already in Tier 1A/1B; trusted numbers tracked: ${trustedNumbers.size})`);
   return { ...data, claimsToVerify: uniqueClaims.slice(0, 25) };
 }
 
@@ -1412,60 +1749,67 @@ export async function extractClaims(data: ValidatedData): Promise<ClaimedData> {
 
 export async function grokFactCheck(data: ClaimedData): Promise<unknown> {
   const tc = data.temporalContext;
-  const systemContent = `You are a STRICT fact-checker AND surgical style editor with LIVE web search access.
+  const systemContent = `You are a STRICT, COST-CONSCIOUS fact-checker for an MSN slideshow article.
 
-Your job has TWO parts in ONE pass:
-  PART A — Verify every factual claim in this MSN slideshow article (with web search).
-  PART B — Identify style violations (em-dashes, banned phrases, banned content words, META length) and emit surgical patches to fix them.
+Web search is EXPENSIVE. You have access to web_search and x_search tools, but USE THEM SPARINGLY. Default to your training data and ONLY search when you genuinely cannot fully verify a claim from memory.
 
-The fact-corrected version produced from your output is what reaches the writer's UI, so this is the only Grok step that may change article text. A later audit step is read-only.
+This is the only step that emits numeric fact corrections. Style violations (em-dashes, banned phrases, etc.) are handled by a downstream audit step — DO NOT emit style patches here.
 
 ${tc.dateAnchor}
 ${tc.seasonAnchor}
 
 ═══════════════════════════════════════════════════════════════
-PART A — FACT VERIFICATION (with web search)
+TWO-PHASE VERIFICATION PROTOCOL
 ═══════════════════════════════════════════════════════════════
 
-Pay attention to:
+PHASE 1 — TRAINING-DATA TRIAGE (NO web search)
+
+For EACH factual claim in the article, classify it WITHOUT searching first:
+
+  • VERIFIED_TRAINING  → You can confirm this with HIGH CONFIDENCE from your training data
+                         AND it's a STABLE historical fact (typically >1 year old, not
+                         time-sensitive). Examples: career championships of retired players,
+                         decades-old records, team city/league, established records.
+
+  • HIGH_CONF_INCORRECT → Your training clearly contradicts the claim. If there is ANY
+                         doubt, escalate to NEEDS_SEARCH instead.
+
+  • NEEDS_SEARCH       → ANY of the following:
+                         - Time-sensitive: current season, last season (${tc.lastSeason}),
+                           recent transfers, awards within the last 2 years, ongoing
+                           record chases, this-year stats
+                         - Anything you're not 100% certain about
+                         - Specific numeric claims you can't recall verbatim
+                         - Quotes (always need exact verification)
+                         - Superlatives ("most", "first ever", "all-time") unless trivially true
+
+PHASE 2 — SELECTIVE WEB SEARCH
+
+For each NEEDS_SEARCH claim ONLY, do ONE focused web search.
+
+HARD CAP: maximum 8 web_search calls total for this entire article. If you exceed
+the cap, prioritize the most prominent / most prominent-stat claims and mark the
+rest UNVERIFIABLE with METHOD: TRAINING.
+
+Source priority: ESPN, official league/team sites, Sports Reference, AP/Reuters
+                 > Wikipedia > CBS/Fox Sports > aggregators.
+
+═══════════════════════════════════════════════════════════════
+WHAT TO FLAG
+═══════════════════════════════════════════════════════════════
+
 - Stats that look rounded or approximated
-- Dates and years (last season = ${tc.lastSeason}, current season = ${tc.currentSeason})
+- Dates and years (last season = ${tc.lastSeason}, current = ${tc.currentSeason})
 - Rankings, superlatives, record claims
-- Quotes — verify exact wording and attribution
+- Quotes — verify exact wording AND attribution
 - Player/team associations, transfers, awards
 
-For EACH slide:
-1. IDENTIFY every specific factual claim
-2. SEARCH the web independently for each — do NOT rely on training data
-3. COMPARE article vs authoritative sources
-4. FLAG any discrepancy, no matter how small
-
-Standards: VERIFIED only if exact match. INCORRECT if any difference. UNVERIFIABLE if no reliable source confirms or denies after searching. "Close enough" is NOT verified.
-
-Source priority: ESPN, official league/team sites, Sports Reference, AP/Reuters > Wikipedia > CBS/Fox Sports > aggregators.
+Standards: VERIFIED only if exact match. INCORRECT if any difference. UNVERIFIABLE if
+no reliable source confirms or denies after searching (or after a deliberate decision
+not to search). "Close enough" is NOT verified.
 
 ═══════════════════════════════════════════════════════════════
-PART B — STYLE PATCHES (no web search needed)
-═══════════════════════════════════════════════════════════════
-
-Scan the article for these violations and emit one patch per violation:
-
-1. PUNCTUATION BANS in slide bodies: em-dashes (—), semicolons (;), ellipsis (... or …). Patch to comma/period.
-2. BANNED AI PHRASES anywhere:
-   Delve, Embark, Foster, Navigate, Harness, Unlock, Elevate, Empower, Demystify, Catalyze, Optimize, Streamline, Tapestry, Landscape, Journey, Blueprint, Gateway, Realm, Catalyst, Pivotal, Comprehensive, Seamless, Vibrant, Dynamic, Synergistic, Multifaceted, Unparalleled, Robust, Transformative, Profound, Testament, Era, Moreover, Furthermore, In conclusion, Ultimately, At the end of the day, A testament to, Since the dawn of, It is worth noting, Game-changer, showcase, underscore, highlight, cement, solidify, storied, remarkable, notable, impressive, outstanding, exceptional, incredible, unparalleled, unprecedented, larger than life, household name, the rest is history
-3. BANNED CONTENT WORDS:
-   Nude, Naked, Suicide, Kill, Stabbed, Fake News, Conspiracy, Sex, Sexual, Harassment, Marijuana, Cocaine, Assault, Scam, Drug, Racism, Rape, Molest, Damn, Porn, Murder, Prison, Fraud, Jail, Racist, War, Terrorist, Gambling, Betting, Pedophile, Bitch, Fuck, Dick, Penis, Vagina, NSFW
-4. META violations: > 120 chars, CTA wording ("Discover", "Explore", "Find out"), or paraphrases the title.
-5. INTRO violations: names an item from the list, reveals a ranking, generic opener.
-
-Patches must:
-- Use the SMALLEST verbatim span as FIND
-- Have REPLACE be a clean rewrite that preserves meaning
-- Never invent new facts in REPLACE
-- Never == FIND
-
-═══════════════════════════════════════════════════════════════
-OUTPUT FORMAT — EXACTLY THIS, IN THIS ORDER
+OUTPUT FORMAT — EXACTLY THIS
 ═══════════════════════════════════════════════════════════════
 
 === FACT CHECK ===
@@ -1473,8 +1817,9 @@ OUTPUT FORMAT — EXACTLY THIS, IN THIS ORDER
 --- SLIDE [N]: [Entity Name] ---
 CLAIM 1: "[exact claim text from article]"
   STATUS: VERIFIED | INCORRECT | UNVERIFIABLE
-  FOUND: [what your web search actually found]
-  SOURCE: [URL]
+  METHOD: TRAINING | WEB_SEARCH
+  FOUND: [one short line — what your training or search shows]
+  SOURCE: [URL if METHOD=WEB_SEARCH, else "training_data"]
   CORRECTION: [only if INCORRECT — what the article should say instead]
 
 CLAIM 2: ...
@@ -1486,43 +1831,28 @@ Total claims checked: [N]
 Verified: [N]
 Incorrect: [N]
 Unverifiable: [N]
+Web searches used: [N]/8
 Verification rate: [X]%
 
 === END FACT CHECK ===
 
-=== STYLE PATCHES ===
-
-<<<PATCH>>>
-SCOPE: SLIDE 5
-FIND:
-the moment—a turning point
-END_FIND
-REPLACE:
-the moment, a turning point
-END_REPLACE
-REASON: em-dash
-<<<END>>>
-
-(emit one block per style violation; no blocks if article is clean)
-
-=== END STYLE PATCHES ===
-
 HARD RULES:
-- FIND text must appear VERBATIM in the original article.
-- Never reproduce slides or the full article outside the PATCHES blocks.
-- The FACT CHECK section is for reporting; the STYLE PATCHES section is what edits the article.
-- For factual corrections, use the CORRECTION field in FACT CHECK — do NOT also emit a patch (the pipeline handles those).
-- START output with === FACT CHECK ===.`;
-  const userContent = `Fact-check and style-patch this MSN slideshow.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nLast completed season: ${tc.lastSeason}\nCurrent/ongoing season: ${tc.currentSeason}\n\nPrimary Source URL: ${data.primarySourceUrl || 'Not provided'}\n\nARTICLE TO VERIFY AND PATCH\n\n${data.articleText}\n\nDo BOTH parts: verify every claim with web search AND emit style patches. Output in the exact format specified, starting with === FACT CHECK ===.`;
+- NEVER reproduce slides or the full article in your output.
+- For factual corrections, use the CORRECTION field — the pipeline applies it automatically.
+- DO NOT emit style patches, em-dash fixes, or banned-phrase corrections — the audit step handles those.
+- Start output with === FACT CHECK ===.
+- Default to TRAINING for stable historical facts. Reserve WEB_SEARCH for time-sensitive
+  or low-confidence claims. Aim to keep web searches well under the 8-call cap.`;
+  const userContent = `Fact-check this MSN slideshow using the two-phase protocol.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nLast completed season: ${tc.lastSeason}\nCurrent/ongoing season: ${tc.currentSeason}\n\nPrimary Source URL: ${data.primarySourceUrl || 'Not provided'}\n\nARTICLE TO VERIFY\n\n${data.articleText}\n\nRun PHASE 1 first (training-data triage). ONLY call web_search for claims classified NEEDS_SEARCH, hard-capped at 8 calls. Output in the exact format specified, starting with === FACT CHECK ===.`;
 
   const resp = await axios.post(
     'https://api.x.ai/v1/responses',
     {
       model: 'grok-4-fast-non-reasoning',
       tools: [{ type: 'web_search' }, { type: 'x_search' }],
-      max_output_tokens: 7000,
+      max_output_tokens: 4000,
       temperature: 0.0,
-      prompt_cache_key: 'msn-slideshow-auditor-v7',
+      prompt_cache_key: 'msn-slideshow-factcheck-v8',
       input: [
         { role: 'system', content: systemContent },
         { role: 'user', content: userContent },
@@ -1562,25 +1892,32 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
   const urlMatches = [...text.matchAll(/https?:\/\/[^\s)>\"\]]+/g)];
   const citations = [...new Set(urlMatches.map(m => m[0]))].slice(0, 10);
 
-  // ── Step 1: Parse fact-check section (CLAIM/STATUS/CORRECTION) ────────────
-  // Only look inside the FACT CHECK block to avoid hitting URLs inside PATCHES.
+  // ── Parse fact-check section (CLAIM/STATUS/CORRECTION) ─────────────────────
+  // Style patches now happen in the audit step, not here.
   const factSection = (text.match(/=== FACT CHECK ===([\s\S]*?)=== END FACT CHECK ===/i)?.[1]) ?? text;
 
   let articleText = data.articleText;
   const results: VerifiedData['perplexityVerification']['results'] = [];
-  const claimPattern = /CLAIM\s*\d+:\s*"([^"]+)"\s*\n\s*STATUS:\s*(VERIFIED|INCORRECT|UNVERIFIABLE)\s*\n\s*FOUND:\s*([^\n]+)\s*\n\s*SOURCE:\s*([^\n]+)(?:\s*\n\s*CORRECTION:\s*([^\n]+))?/gi;
+  // Regex tolerates the optional METHOD: TRAINING|WEB_SEARCH line emitted by the
+  // two-phase protocol. Older outputs without METHOD: still parse correctly.
+  const claimPattern = /CLAIM\s*\d+:\s*"([^"]+)"\s*\n\s*STATUS:\s*(VERIFIED|INCORRECT|UNVERIFIABLE)\s*\n(?:\s*METHOD:\s*([A-Z_]+)\s*\n)?\s*FOUND:\s*([^\n]+)\s*\n\s*SOURCE:\s*([^\n]+)(?:\s*\n\s*CORRECTION:\s*([^\n]+))?/gi;
   let m: RegExpExecArray | null;
   let claimIdx = 0;
+  let trainingCount = 0;
+  let webSearchCount = 0;
   while ((m = claimPattern.exec(factSection)) !== null) {
     const claim = m[1].trim();
     const status = m[2].toUpperCase();
-    const found = m[3].trim();
-    const source = m[4].trim();
-    const correction = m[5]?.trim() ?? null;
+    const method = (m[3] ?? '').toUpperCase();
+    const found = m[4].trim();
+    const source = m[5].trim();
+    const correction = m[6]?.trim() ?? null;
     results.push({ claimIndex: claimIdx++, claim, status, finding: found, source });
 
+    if (method === 'TRAINING') trainingCount++;
+    else if (method === 'WEB_SEARCH') webSearchCount++;
+
     // Auto-correct numeric facts marked INCORRECT when a correction is provided.
-    // (Style/text corrections go through the patch path below.)
     if (status === 'INCORRECT' && correction) {
       const claimNums = claim.match(/[\d,]+(?:\.\d+)?/g);
       const corrNums = correction.match(/[\d,]+(?:\.\d+)?/g);
@@ -1590,21 +1927,7 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
     }
   }
 
-  // ── Step 2: Parse + apply STYLE PATCHES from the same Grok output ─────────
-  // Grok emits style patches in the dedicated PATCHES block; we apply them
-  // surgically so the article structure is preserved no matter what.
-  const styleBlock = text.match(/=== STYLE PATCHES ===([\s\S]*?)=== END STYLE PATCHES ===/i)?.[1] ?? '';
-  const stylePatches = styleBlock ? parseAuditPatches(styleBlock) : [];
-  const patchApply = applyAuditPatches(articleText, stylePatches);
-  // Safety: never lose slides via patch application
-  const slidesBefore = (data.articleText.match(/SLIDE\s*\d+/gi) ?? []).length;
-  const slidesAfter  = (patchApply.result.match(/SLIDE\s*\d+/gi) ?? []).length;
-  if (slidesAfter >= slidesBefore) {
-    articleText = patchApply.result;
-  } else {
-    console.warn(`[processVerification] Style patches lost slides (${slidesBefore} → ${slidesAfter}). Skipped patches.`);
-  }
-  console.log(`[processVerification] fact-corrections: ${results.filter(r => r.status === 'INCORRECT').length} incorrect / ${results.length} total; style patches: applied=${patchApply.applied} skipped=${patchApply.skipped}`);
+  console.log(`[processVerification] fact-corrections: ${results.filter(r => r.status === 'INCORRECT').length} incorrect / ${results.length} total · method: ${trainingCount} training, ${webSearchCount} web_search`);
 
   const verified     = results.filter(r => r.status === 'VERIFIED').length;
   const incorrect    = results.filter(r => r.status === 'INCORRECT').length;
@@ -1627,15 +1950,23 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
 export async function grokAuditAndVerify(data: VerifiedData): Promise<string> {
   const tc = data.temporalContext;
   const ta = data.titleAnalysis;
-  const systemContent = `You are an MSN Slideshow compliance auditor.
+  const systemContent = `You are an MSN Slideshow compliance auditor AND surgical style editor.
 
-CRITICAL: YOU DO NOT MODIFY THE ARTICLE. YOU DO NOT EMIT PATCHES.
-The article has already been fact-checked AND style-corrected upstream. Your ONLY job is to read the corrected article and produce a structured compliance REPORT. The pipeline will not apply any changes from your output. You only report.
+Your job has TWO parts in ONE pass — NO web search needed:
+
+  PART A — AUDIT REPORT: read the article and produce a structured compliance report.
+  PART B — STYLE PATCHES: emit surgical patches for mechanical style violations
+           (em-dashes, semicolons, ellipsis, banned phrases, banned content words,
+           META length/CTAs). The pipeline applies these patches surgically.
+
+You do NOT regenerate the article. You do NOT touch numeric facts (those were
+already corrected upstream by the fact-check step). Style patches must preserve
+all numbers verbatim.
 
 ${tc.dateAnchor}
 
 ═══════════════════════════════════════════════════════════════
-AUDIT CHECKLIST — EVALUATE EACH RULE
+PART A — AUDIT CHECKLIST (evaluate each rule)
 ═══════════════════════════════════════════════════════════════
 
 1. STRUCTURE
@@ -1674,7 +2005,39 @@ AUDIT CHECKLIST — EVALUATE EACH RULE
 8. MSN SAFETY (10-12 year old test)
 
 ═══════════════════════════════════════════════════════════════
-OUTPUT FORMAT — EXACTLY THIS
+PART B — STYLE PATCHES (the only thing that modifies the article)
+═══════════════════════════════════════════════════════════════
+
+For each mechanical violation, emit one PATCH block. Focus on these categories:
+
+1. PUNCTUATION BANS in slide bodies: em-dashes (—), semicolons (;), ellipsis (... or …).
+   Patch to comma/period.
+2. BANNED AI PHRASES anywhere:
+   Delve, Embark, Foster, Navigate, Harness, Unlock, Elevate, Empower, Demystify, Catalyze,
+   Optimize, Streamline, Tapestry, Landscape, Journey, Blueprint, Gateway, Realm, Catalyst,
+   Pivotal, Comprehensive, Seamless, Vibrant, Dynamic, Synergistic, Multifaceted, Unparalleled,
+   Robust, Transformative, Profound, Testament, Era, Moreover, Furthermore, In conclusion,
+   Ultimately, At the end of the day, A testament to, Since the dawn of, It is worth noting,
+   Game-changer, showcase, underscore, highlight, cement, solidify, storied, remarkable,
+   notable, impressive, outstanding, exceptional, incredible, unparalleled, unprecedented,
+   larger than life, household name, the rest is history
+3. BANNED CONTENT WORDS:
+   Nude, Naked, Suicide, Kill, Stabbed, Fake News, Conspiracy, Sex, Sexual, Harassment,
+   Marijuana, Cocaine, Assault, Scam, Drug, Racism, Rape, Molest, Damn, Porn, Murder,
+   Prison, Fraud, Jail, Racist, War, Terrorist, Gambling, Betting, Pedophile, Bitch, Fuck,
+   Dick, Penis, Vagina, NSFW
+4. META violations: > 120 chars, CTA wording ("Discover", "Explore", "Find out"),
+   or paraphrases the title.
+
+Patches must:
+- Use the SMALLEST verbatim span as FIND
+- Have REPLACE be a clean rewrite that preserves meaning
+- Never invent new facts in REPLACE
+- Never modify any numeric stat or year (facts were already corrected upstream)
+- Never == FIND
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT — EXACTLY THIS, IN THIS ORDER
 ═══════════════════════════════════════════════════════════════
 
 === AUDIT REPORT ===
@@ -1711,21 +2074,39 @@ Violations found: [N]
 Flags for writer review: [comma-separated list, or "None"]
 === END SUMMARY ===
 
+=== STYLE PATCHES ===
+
+<<<PATCH>>>
+SCOPE: SLIDE 5
+FIND:
+the moment—a turning point
+END_FIND
+REPLACE:
+the moment, a turning point
+END_REPLACE
+REASON: em-dash
+<<<END>>>
+
+(emit one block per mechanical violation; emit zero blocks if article is clean)
+
+=== END STYLE PATCHES ===
+
 ═══════════════════════════════════════════════════════════════
 HARD RULES
 ═══════════════════════════════════════════════════════════════
 
-- DO NOT output the article, any slide body, any rewritten text, or any patches.
-- DO NOT emit CORRECTED ARTICLE, PATCHES, or any block that would modify the article.
-- ONLY emit the AUDIT REPORT and SUMMARY blocks above.
+- DO NOT output the full article or any complete slide.
+- DO NOT emit any block that would replace whole slides or sections.
+- DO NOT touch numeric stats or years — facts were already corrected upstream.
+- FIND text in each PATCH must appear VERBATIM in the article.
 - If a category passes, write "PASS" with no extra text.`;
 
-  const userContent = `Audit this MSN slideshow for compliance. Output ONLY the AUDIT REPORT and SUMMARY blocks. Do NOT modify or reproduce the article.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nExpected content slides: ${data.slideCount}\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE TO AUDIT (read-only)\n\n${data.articleText}\n\nEmit only the report.`;
+  const userContent = `Audit this MSN slideshow for compliance AND emit style patches for any mechanical violations.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nExpected content slides: ${data.slideCount}\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE\n\n${data.articleText}\n\nEmit the AUDIT REPORT, SUMMARY, and STYLE PATCHES blocks in that order. Do not regenerate the article.`;
 
   const resp = await axios.post(
     'https://api.x.ai/v1/chat/completions',
     {
-      model: 'grok-3-latest', max_tokens: 2500, temperature: 0.0,
+      model: 'grok-3-latest', max_tokens: 3500, temperature: 0.0,
       messages: [
         { role: 'system', content: systemContent },
         { role: 'user',   content: userContent },
@@ -1739,10 +2120,7 @@ HARD RULES
 // ── 18. extractAuditResults (n8n: "Extract Audit Results") ───────────────────
 
 export async function extractAuditResults(data: VerifiedData, grokText: string): Promise<AuditedData> {
-  // The article was already fact-corrected and style-patched by the upstream
-  // fact-check step. This function ONLY parses the audit report — it never
-  // modifies the article. data.articleText passes through untouched.
-  const articleText = data.articleText;
+  let articleText = data.articleText;
 
   if (!grokText || grokText.length < 50) {
     return {
@@ -1753,10 +2131,23 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
     };
   }
 
-  // Parse compliance report. Categories are reported as either "PASS" or
-  // "FAIL"/"FOUND" with details on the following line(s).
-  const reportMatch = grokText.match(/=== AUDIT REPORT ===\s*([\s\S]*?)\s*=== END AUDIT REPORT ===/i);
+  // Parse audit report + summary + style patches blocks. Style patches are the
+  // ONLY place the article can be modified at this stage — facts are frozen.
+  const reportMatch  = grokText.match(/=== AUDIT REPORT ===\s*([\s\S]*?)\s*=== END AUDIT REPORT ===/i);
   const summaryMatch = grokText.match(/=== SUMMARY ===\s*([\s\S]*?)\s*=== END SUMMARY ===/i);
+  const styleBlock   = grokText.match(/=== STYLE PATCHES ===([\s\S]*?)=== END STYLE PATCHES ===/i)?.[1] ?? '';
+
+  // ── Apply style patches surgically ────────────────────────────────────────
+  const stylePatches = styleBlock ? parseAuditPatches(styleBlock) : [];
+  const patchApply = applyAuditPatches(articleText, stylePatches);
+  // Safety: never lose slides via patch application
+  const slidesBefore = (data.articleText.match(/SLIDE\s*\d+/gi) ?? []).length;
+  const slidesAfter  = (patchApply.result.match(/SLIDE\s*\d+/gi) ?? []).length;
+  if (slidesAfter >= slidesBefore) {
+    articleText = patchApply.result;
+  } else {
+    console.warn(`[extractAuditResults] Style patches lost slides (${slidesBefore} → ${slidesAfter}). Skipped patches.`);
+  }
 
   const reportBody  = reportMatch?.[1]?.trim() ?? grokText.trim();
   const summaryBody = summaryMatch?.[1]?.trim() ?? '';
@@ -1777,13 +2168,12 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
   }));
   const combinedSourceListText = factCheckSources.map((s, i) => `${i + 1}. ${s.url}\n   Verified by: ${s.verifiedBy}\n   Facts: ${s.factsVerified}`).join('\n\n');
 
-  console.log(`[extractAuditResults] report-only · rules ${passCount}/${totalChecks || 8} passed · violations ${failCount + foundCount}`);
+  console.log(`[extractAuditResults] rules ${passCount}/${totalChecks || 8} passed · violations ${failCount + foundCount} · style patches applied=${patchApply.applied} skipped=${patchApply.skipped}`);
 
   return {
     ...data,
-    // article unchanged — corrections happened upstream in processVerification
-    originalArticleText: data.originalArticleText ?? articleText,
-    articleText,
+    originalArticleText: data.originalArticleText ?? data.articleText,
+    articleText, // possibly modified by style patches above
     grokAudit: {
       status: 'COMPLETED',
       rawResponse: grokText,
@@ -1791,12 +2181,12 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
       stats: {
         rulesPassed: rulesPassedMatch ? `${rulesPassedMatch[1]}/${rulesPassedMatch[2]}` : `${passCount}/${totalChecks || 8}`,
         violations:  violationsMatch ? parseInt(violationsMatch[1], 10) : (failCount + foundCount),
-        corrections: 'Applied during fact-check step',
+        corrections: patchApply.applied > 0 ? `${patchApply.applied} style patches applied` : 'None',
         flags:       flagsMatch?.[1]?.trim() || (failCount + foundCount > 0 ? `${failCount + foundCount} rule(s) flagged` : 'None'),
       },
     },
     grokSources: [], combinedSourceList: factCheckSources, combinedSourceListText,
-    rewriteApplied: false,
+    rewriteApplied: patchApply.applied > 0,
   };
 }
 
