@@ -55,7 +55,11 @@ export interface SourceAnalysis {
   alignmentScore: number;
   estimatedItems?: number;
   factTypeChecks?: Record<string, boolean>;
+  /** Combined markdown of all sources (kept for backwards compat + sourceQuality sizing). */
   scrapedContent: string;
+  /** Per-source breakdown — used by atomizeFacts to atomize each source independently
+   * and then merge facts by item name. All sources treated as EQUAL Tier 1A authority. */
+  scrapedSources?: Array<{ url: string; markdown: string }>;
   sourceCount?: number;
   primaryLength?: number;
   secondaryLength?: number;
@@ -67,6 +71,13 @@ export interface AtomizedFact {
   itemName: string;
   facts: Array<{ type: string; value: string; isExactQuote?: boolean }>;
   rawContent: string;
+  /**
+   * Short non-numeric narrative excerpt (1-2 sentences, ~220 chars).
+   * Reference-only context for facts the regex extractors miss
+   * (rare positions, unusual phrasing, current affiliations).
+   * Claude is instructed NOT to mirror this for phrasing.
+   */
+  narrativeContext?: string;
 }
 
 // ── Accumulated pipeline data ─────────────────────────────────────────────────
@@ -134,6 +145,14 @@ export interface MergedData extends ResearchedData {
   hasUserContext: boolean;
   sourceQuality: string;
   alignmentScore: number;
+  /** Diagnostic counters from lightSanitizePerplexity (set by mergeResearch). */
+  perplexitySanitizationStats?: {
+    originalLength: number;
+    sanitizedLength: number;
+    statPlaceholders: number;
+    quotesRemoved: number;
+    entitiesTracked: number;
+  };
 }
 
 export interface PromptData extends MergedData {
@@ -337,6 +356,13 @@ export interface SlideshowSlide {
   title: string;
   description: string;
   imageSearch: string;
+  primarySubject?: string;
+  otherSubjects?: string[];
+  teamName?: string;
+  eventName?: string;
+  location?: string;
+  year?: string;
+  emotion?: string;
 }
 
 export interface WorkflowResult {
@@ -353,6 +379,7 @@ export interface WorkflowResult {
   summaryComment: string;
   flagsForReview: string;
   generatedBy: string;
+  enrichmentStatus?: string;
 }
 
 // ── Progress tracking ─────────────────────────────────────────────────────────
@@ -379,6 +406,7 @@ export const STAGE_DEFS: Array<{ id: string; label: string }> = [
   { id: 'verifying',         label: 'Verifying facts' },
   { id: 'auditing',          label: 'Auditing with Grok' },
   { id: 'creating_docs',     label: 'Assembling output' },
+  { id: 'enriching',         label: 'Enriching slides' },
   { id: 'complete',          label: 'Done' },
 ];
 
@@ -393,6 +421,7 @@ export const STAGE_DEFS_SUBJECTIVE: Array<{ id: string; label: string }> = [
   { id: 'validating',        label: 'Validating structure' },
   { id: 'auditing',          label: 'Style audit (Grok)' },
   { id: 'creating_docs',     label: 'Assembling output' },
+  { id: 'enriching',         label: 'Enriching slides' },
   { id: 'complete',          label: 'Done' },
 ];
 

@@ -380,16 +380,19 @@ export async function analyzeSourceAlignment(
   primaryMarkdown: string,
   additionalMarkdowns: string[] = [],
 ): Promise<SourcedData> {
-  // Build content from primary + every additional source (up to 4 extras).
-  const sourceSections: string[] = [];
-  if (primaryMarkdown) sourceSections.push(`=== PRIMARY SOURCE: ${prepData.userPrimaryUrl} ===\n${primaryMarkdown}`);
+  // ── ALL SOURCES TREATED EQUALLY ─────────────────────────────────────────
+  // No primary/secondary/tertiary tiering — each scraped URL is an equally
+  // authoritative Tier 1A source. atomizeFacts uses `scrapedSources` to
+  // atomize each independently and merge facts by item name.
+  const scrapedSources: Array<{ url: string; markdown: string }> = [];
+  if (primaryMarkdown) scrapedSources.push({ url: prepData.userPrimaryUrl, markdown: primaryMarkdown });
   additionalMarkdowns.forEach((md, i) => {
     if (md && md.length > 0) {
-      const url = prepData.userSecondaryUrls[i] ?? '';
-      const label = i === 0 ? 'SECONDARY' : i === 1 ? 'TERTIARY' : `SOURCE ${i + 2}`;
-      sourceSections.push(`=== ${label} SOURCE: ${url} ===\n${md}`);
+      scrapedSources.push({ url: prepData.userSecondaryUrls[i] ?? '', markdown: md });
     }
   });
+
+  const sourceSections: string[] = scrapedSources.map(s => `=== SOURCE: ${s.url} ===\n${s.markdown}`);
   const allSourceContent = sourceSections.join('\n\n');
 
   if (!allSourceContent || allSourceContent.length < 100) {
@@ -443,6 +446,7 @@ export async function analyzeSourceAlignment(
     sourceAnalysis: {
       status, recommendation, alignmentScore, estimatedItems, factTypeChecks,
       scrapedContent: allSourceContent,
+      scrapedSources,
       sourceCount:   prepData.sourceCount,
       primaryLength: primaryMarkdown.length,
       secondaryLength: additionalMarkdowns.reduce((s, m) => s + m.length, 0),
@@ -475,16 +479,85 @@ export async function buildResearchStrategy(prepData: PreparedData): Promise<Sou
 
 // ── 5. atomizeFacts (n8n: "Fact Atomizer") ───────────────────────────────────
 
+/**
+ * Merge atomized items that refer to the same entity across different sources.
+ * Match key = sorted lowercase tokens of itemName (length > 2). So
+ * "Caleb Williams — Chicago Bears" and "Chicago Bears: Caleb Williams" merge
+ * because they share the same tokens. Different specificity (just "Caleb
+ * Williams" vs the full form) stays separate — by design.
+ *
+ * All scraped sources are EQUAL Tier 1A authority. There is no priority
+ * tiering — facts from any source are unioned (deduped by type+value).
+ */
+function mergeAtomizedItems(items: AtomizedFact[]): AtomizedFact[] {
+  const normalizeKey = (name: string): string => {
+    if (!name) return '';
+    return name.toLowerCase()
+      .replace(/[—–:,()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter(t => t.length > 2)
+      .sort()
+      .join(' ');
+  };
+  const factKey = (f: { type: string; value: string }) => `${f.type}|${f.value.toLowerCase()}`;
+  const byKey = new Map<string, AtomizedFact>();
+  const orderKeys: string[] = [];
+
+  for (const item of items) {
+    const key = normalizeKey(item.itemName);
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, { ...item, facts: [...item.facts] });
+      orderKeys.push(key);
+      continue;
+    }
+    // Union facts (dedupe)
+    const seen = new Set(existing.facts.map(factKey));
+    for (const f of item.facts) {
+      if (!seen.has(factKey(f))) { existing.facts.push(f); seen.add(factKey(f)); }
+    }
+    // Concatenate rawContent (cap)
+    if (existing.rawContent.length < 600 && item.rawContent) {
+      existing.rawContent = (existing.rawContent + '\n' + item.rawContent).slice(0, 600);
+    }
+    // Concatenate narrativeContext (cap)
+    if (item.narrativeContext) {
+      if (!existing.narrativeContext) {
+        existing.narrativeContext = item.narrativeContext;
+      } else if (existing.narrativeContext.length < 500) {
+        existing.narrativeContext = (existing.narrativeContext + ' ' + item.narrativeContext).slice(0, 600);
+      }
+    }
+  }
+  const merged = orderKeys.map(k => byKey.get(k)!);
+  // Multi-source items can accumulate many facts — bump cap to 24
+  for (const item of merged) item.facts = item.facts.slice(0, 24);
+  return merged;
+}
+
 export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
-  const sourceContent     = data.sourceAnalysis?.scrapedContent ?? '';
-  const combinedRawContent = [sourceContent, data.userContext].filter(Boolean).join('\n\n');
+  // Multi-source equality: each scraped URL is an equally authoritative Tier 1A
+  // source. We atomize each independently, then merge facts by item name so
+  // duplicates across sources combine instead of bloating the prompt.
+  const scrapedSources = data.sourceAnalysis?.scrapedSources ?? [];
+  const sourcesToAtomize: string[] = scrapedSources.length > 0
+    ? scrapedSources.map(s => s.markdown).filter(md => md && md.length > 0)
+    : (data.sourceAnalysis?.scrapedContent ? [data.sourceAnalysis.scrapedContent] : []);
+
+  const combinedRawContent = [sourcesToAtomize.join('\n\n'), data.userContext].filter(Boolean).join('\n\n');
 
   if (!combinedRawContent || combinedRawContent.length < 50) {
     return { ...data, atomizedFacts: [], factOnlyRepresentation: '', sourceSignatures: [], atomizationStats: { itemsProcessed: 0, totalFacts: 0 } };
   }
 
-  const atomizedFacts: AtomizedFact[] = [];
+  const rawItems: AtomizedFact[] = [];
   const sourceSignatures: string[]    = [];
+
+  // Atomize each source independently — equal Tier 1A authority across all.
+  for (const sourceContent of sourcesToAtomize) {
+    if (!sourceContent || sourceContent.length < 50) continue;
 
   // Try multiple section-splitting strategies in priority order
   let sections: string[] = [];
@@ -506,8 +579,13 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
     }
 
     // Strategy 3: Original numbered format (## 1. Title, # 2: Title)
+    // We consume the leading newline as part of the delimiter so each section
+    // starts cleanly with `##` — without this, inner regexes anchored at `^##`
+    // fail because sections begin with `\n`. The regex also requires a literal
+    // separator (`.`, `)`, or `:`) between the digit and the title so it doesn't
+    // accidentally match content-internal patterns like "selected #1 overall".
     if (sections.length < 3) {
-      sections = sourceContent.split(/(?=##?\s*\d+[.):]?\s*)/);
+      sections = sourceContent.split(/\n(?=[ \t]*#{1,2}[ \t]+\d{1,3}[.):][ \t]+)/);
     }
   }
 
@@ -529,19 +607,23 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
       content = section.replace(/^[\s\S]*?\n##\s*[^\n]+\n/, '');
     } else {
       // Pattern B: ## [Team](url): Player or ## Team: Player
-      const headingMatch = section.match(/^##\s*\[?([^\]\n]+)\]?(?:\([^)]*\))?[:\s]+\[?([^\]\n(]+)\]?(?:\([^)]*\))?(?:\n|$)/);
+      // Requires a literal `:` separator — without this it swallows the numbered
+      // format "## 1. Player — Team" by treating the whole heading as `team` and
+      // the first content line as `subject`.
+      const headingMatch = section.match(/^##\s*\[?([^\]\n]+?)\]?(?:\([^)]*\))?\s*:\s+\[?([^\]\n(]+?)\]?(?:\([^)]*\))?\s*(?:\n|$)/);
       if (headingMatch) {
         const team = headingMatch[1].trim();
         const subject = headingMatch[2]?.trim().replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') ?? '';
         itemName = subject ? `${team}: ${subject}` : team;
         content = section.replace(/^##\s*[^\n]+\n/, '');
       } else {
-        // Pattern C: Original numbered format (## 1. Title)
-        const numberedMatch = section.match(/^##?\s*(\d+)[.):]?\s*(.+?)(?:\n|$)/);
+        // Pattern C: Original numbered format (## 1. Title) — must match the
+        // same shape the splitter accepted: line-start, space, separator required.
+        const numberedMatch = section.match(/^[ \t]*#{1,2}[ \t]+(\d{1,3})[.):][ \t]+(.+?)(?:\n|$)/);
         if (numberedMatch) {
           itemNumber = parseInt(numberedMatch[1]);
           itemName = numberedMatch[2].trim().replace(/\*\*/g, '');
-          content = section.replace(/^##?\s*\d+[.):]?\s*.+?\n/, '');
+          content = section.replace(/^[ \t]*#{1,2}[ \t]+\d{1,3}[.):][ \t]+.+?\n/, '');
         }
       }
     }
@@ -571,6 +653,107 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
     for (const m of content.matchAll(/\b((19|20)\d{2})\b/g)) facts.push({ type: 'date', value: m[1] });
     for (const m of content.matchAll(/"([^"]{15,150})"/g))  facts.push({ type: 'quote', value: m[1], isExactQuote: true });
 
+    // ── Non-numeric fact patterns ───────────────────────────────────────────
+    // Capture team affiliations, draft picks, transactions, positions, status —
+    // the kinds of facts that change recently and don't survive a pure-numeric
+    // atomization. These let Claude write accurate, time-sensitive prose
+    // (current team, latest draft, recent trade) without relying on training.
+    const narrativePatterns: StatDef[] = [
+      // Draft picks: numeric ("drafted #1 overall by the Bears", "3rd by Chicago")
+      // OR word-ordinal ("selected first overall by the Bears", "picked second")
+      { pattern: /\b(?:drafted|selected|picked|chosen)\s+(?:(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:overall\s+)?)?(?:in\s+(?:the\s+)?\d+(?:st|nd|rd|th)\s+round\s+)?by\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|with|after))/gi, type: 'draft' },
+      // "picked Drake Maye third overall" — verb + 1-4-word name + ordinal + overall (optionally + "by team")
+      { pattern: /\b(?:drafted|selected|picked|chose|chosen)\s+[A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,3}\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall(?:\s+by\s+(?:the\s+)?[A-Z][a-zA-Z'.& -]{2,30})?\b/gi, type: 'draft' },
+      // "Commanders selected him second overall" — team + verb + pronoun + ordinal
+      { pattern: /\b[A-Z][a-zA-Z'.-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,2}\s+(?:drafted|selected|picked|chose|chosen)\s+(?:him|her|them)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\b/gi, type: 'draft' },
+      // "picked X overall" / "selected X overall" (no "by" required) — bare ordinal pick
+      { pattern: /\b(?:drafted|selected|picked|chosen)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\b/gi, type: 'draft_pick' },
+      { pattern: /\b(?:#|No\.?\s*)(\d{1,2})(?:st|nd|rd|th)?\s+(?:overall\s+(?:pick|selection)|pick|selection)\b/gi, type: 'draft_pick' },
+      { pattern: /\b\d+(?:st|nd|rd|th)\s+overall\s+(?:pick|selection)\b/gi, type: 'draft_pick' },
+      { pattern: /\b(?:going|went)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\s+to\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/gi, type: 'draft' },
+      // Big contract signings: "signed a four-year, $39.5 million [rookie] contract/deal/extension"
+      // Allows up to two intervening adjectives between the dollar amount and the contract noun.
+      { pattern: /\bsigned\s+(?:a\s+)?(?:\w+(?:-year)?(?:[,\s]+\w+)?[,\s]+)?\$\d+(?:\.\d+)?\s*(?:million|billion|M|B)?(?:\s+\w+){0,2}\s+(?:contract|deal|extension|agreement)/gi, type: 'contract' },
+      // Transactions: trades, signings, free-agent moves
+      { pattern: /\b(?:traded|sent|dealt|moved|transferred)\s+to\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|for|with))/g, type: 'transaction' },
+      { pattern: /\b(?:signed|inked|agreed)\s+(?:a\s+(?:contract|deal|extension)\s+)?with\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/g, type: 'transaction' },
+      { pattern: /\b(?:joined|joins|joining)\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|as|after))/g, type: 'transaction' },
+      // Current team affiliation
+      { pattern: /\b(?:plays?|currently plays|now plays|started|stars?)\s+for\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/g, type: 'affiliation' },
+      { pattern: /\bwith\s+(?:the\s+)?([A-Z][a-zA-Z][a-zA-Z0-9 .&'-]{3,40}?)(?=[,.\n]|\s+(?:since|after|in\s+\d))/g, type: 'affiliation' },
+      // Positions
+      { pattern: /\b(?:starting|veteran|rookie|backup|All-Pro|Pro Bowl)\s+(quarterback|QB|running back|RB|wide receiver|WR|tight end|TE|cornerback|CB|safety|linebacker|LB|defensive end|edge rusher|defensive tackle|center|guard|tackle|kicker|punter|point guard|shooting guard|small forward|power forward|center|striker|midfielder|defender|goalkeeper)\b/gi, type: 'position' },
+      // Status changes
+      { pattern: /\b(retired|retiring|injured|suspended|released|cut|waived|placed on IR|on injured reserve|inactive|active roster)\b/gi, type: 'status' },
+    ];
+
+    for (const { pattern, type } of narrativePatterns) {
+      const rx = new RegExp(pattern.source, pattern.flags);
+      let m: RegExpExecArray | null;
+      while ((m = rx.exec(content)) !== null) {
+        const value = m[0].trim().replace(/\s+/g, ' ');
+        // Skip generic / overlong matches
+        if (value.length < 4 || value.length > 80) continue;
+        facts.push({ type, value });
+      }
+    }
+
+    // ── Smart narrative context: signal-scored selection + adaptive sizing ─────
+    // Sentences are scored by non-numeric-fact density (proper nouns, action
+    // verbs, time refs, positions) and penalized for noise (number-dominated
+    // lines, long quotes, markdown). Budget per item scales inversely with how
+    // many structured facts the regexes already captured — sparse items get
+    // up to 500 chars of CONTEXT, well-covered items get 200.
+    const ACTION_VERB_RE  = /\b(drafted|selected|picked|signed|inked|traded|sent|dealt|moved|joined|joins|retired|retiring|released|cut|waived|debut(?:ed)?|started|leads?|finished|won|broke|set|earned|named|hired|fired|coaches?|manages?|plays?|stars?|takes? over|stepped)\b/i;
+    const TIME_REF_RE     = /\b(last (?:season|year|month|week)|this (?:season|year|offseason)|currently|recently|since\s+\d{4}|in\s+(?:19|20)\d{2}|now|after)\b/i;
+    const POSITION_RE     = /\b(quarterback|QB|running back|RB|wide receiver|WR|tight end|TE|cornerback|CB|safety|linebacker|LB|defensive end|edge|center|guard|tackle|kicker|punter|point guard|shooting guard|forward|striker|midfielder|defender|goalkeeper|head coach|coach|GM|general manager|owner)\b/i;
+    const PROPER_NOUN_RE  = /\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b/;
+    const NUMBER_HEAVY_RE = /(?:\d[\d,.]*[\s,]+){3,}/;
+    const LONG_QUOTE_RE   = /"[^"]{20,}"/;
+    const MARKDOWN_RE     = /^(?:##|!\[|\[\[|\*\*)/;
+
+    type ScoredSent = { text: string; originalIdx: number; score: number };
+    const rawSentences = content
+      .split(/(?<=[.!?])\s+/)
+      .map((s, i) => ({ text: s.trim(), originalIdx: i }))
+      .filter(s => s.text.length > 25 && s.text.length < 280);
+
+    const scored: ScoredSent[] = rawSentences.map(s => {
+      let score = 0;
+      if (PROPER_NOUN_RE.test(s.text))  score += 2;
+      if (ACTION_VERB_RE.test(s.text))  score += 1;
+      if (TIME_REF_RE.test(s.text))     score += 1;
+      if (POSITION_RE.test(s.text))     score += 1;
+      if (NUMBER_HEAVY_RE.test(s.text)) score -= 1;
+      if (LONG_QUOTE_RE.test(s.text))   score -= 2;
+      if (MARKDOWN_RE.test(s.text))     score -= 2;
+      return { ...s, score };
+    });
+
+    // Adaptive char budget: more CONTEXT when structured fact extraction was sparse
+    const structuredFactCount = facts.length;
+    const charBudget = structuredFactCount >= 5 ? 200
+                     : structuredFactCount >= 2 ? 350
+                     :                            500;
+
+    // Greedy fill: take highest-scoring sentences until budget exhausted
+    const candidates = scored.filter(s => s.score >= 1).sort((a, b) => b.score - a.score);
+    const chosen: ScoredSent[] = [];
+    let runningLength = 0;
+    for (const s of candidates) {
+      if (runningLength + s.text.length + 1 > charBudget) continue;
+      chosen.push(s);
+      runningLength += s.text.length + 1;
+      if (chosen.length >= 5) break;
+    }
+
+    // Restore original reading order so the context flows naturally for Claude
+    const narrativeContext = chosen
+      .sort((a, b) => a.originalIdx - b.originalIdx)
+      .map(s => s.text)
+      .join(' ')
+      .slice(0, charBudget);
+
     const sentences = content.split(/[.!?]+/).filter(s => s.trim().length > 40);
     sentences.forEach(sentence => {
       const words = sentence.trim().split(/\s+/);
@@ -581,9 +764,14 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
     });
 
     if (facts.length > 0 || content.length > 100) {
-      atomizedFacts.push({ itemNumber, itemName, facts: facts.slice(0, 10), rawContent: content.slice(0, 400) });
+      rawItems.push({ itemNumber, itemName, facts: facts.slice(0, 18), rawContent: content.slice(0, 400), narrativeContext });
     }
   });
+  }  // ← end for-loop over sourcesToAtomize
+
+  // Merge items that match across sources (same entity, different heading format)
+  const atomizedFacts: AtomizedFact[] = mergeAtomizedItems(rawItems);
+  console.log(`[atomizeFacts] ${rawItems.length} raw items across ${sourcesToAtomize.length} source(s) → ${atomizedFacts.length} merged items`);
 
   if (data.userContext && data.userContext.length > 50) {
     const contextFacts: AtomizedFact['facts'] = [];
@@ -611,10 +799,23 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
     const achievements = item.facts.filter(f => f.type === 'achievement');
     const dates        = item.facts.filter(f => f.type === 'date');
     const quotes       = item.facts.filter(f => f.type === 'quote');
+    const affiliations = item.facts.filter(f => f.type === 'affiliation');
+    const drafts       = item.facts.filter(f => f.type === 'draft' || f.type === 'draft_pick');
+    const transactions = item.facts.filter(f => f.type === 'transaction');
+    const contracts    = item.facts.filter(f => f.type === 'contract');
+    const positions    = item.facts.filter(f => f.type === 'position');
+    const statuses     = item.facts.filter(f => f.type === 'status');
     if (stats.length)        lines.push(`  STATS: ${stats.map(s => s.value).join(', ')}`);
     if (achievements.length) lines.push(`  ACHIEVEMENTS: ${achievements.map(a => a.value).join(', ')}`);
     if (dates.length)        lines.push(`  DATES: ${[...new Set(dates.map(d => d.value))].join(', ')}`);
+    if (affiliations.length) lines.push(`  AFFILIATION: ${[...new Set(affiliations.map(a => a.value))].join('; ')}`);
+    if (drafts.length)       lines.push(`  DRAFT: ${[...new Set(drafts.map(d => d.value))].join('; ')}`);
+    if (transactions.length) lines.push(`  TRANSACTIONS: ${[...new Set(transactions.map(t => t.value))].join('; ')}`);
+    if (contracts.length)    lines.push(`  CONTRACT: ${[...new Set(contracts.map(c => c.value))].join('; ')}`);
+    if (positions.length)    lines.push(`  POSITION: ${[...new Set(positions.map(p => p.value))].join(', ')}`);
+    if (statuses.length)     lines.push(`  STATUS: ${[...new Set(statuses.map(s => s.value))].join(', ')}`);
     if (quotes.length)       lines.push(`  QUOTES: ${quotes.map(q => `"${q.value}"`).join('; ')}`);
+    if (item.narrativeContext) lines.push(`  CONTEXT (reference only — do NOT mirror phrasing): ${item.narrativeContext}`);
     return lines.join('\n');
   }).join('\n\n');
 
@@ -751,13 +952,32 @@ function lightSanitizePerplexity(
     entityNumberMap[name.toLowerCase()] = knownNumbers;
     allEntityNames.push(name);
 
-    // Also index by last name for fuzzy matching
-    const parts = name.split(/\s+/);
-    if (parts.length >= 2) {
-      const lastName = parts[parts.length - 1].toLowerCase();
-      if (lastName.length > 3) {
-        entityNumberMap[lastName] = knownNumbers;
-        allEntityNames.push(parts[parts.length - 1]);
+    // ── Fuzzy entity indexing across separator-joined item names ──────────
+    // itemName may take many forms:
+    //   "Caleb Williams"                  (person only)
+    //   "Caleb Williams — Chicago Bears"  (person — team, em-dash)
+    //   "Chicago Bears: Caleb Williams"   (team: person, colon)
+    //   "Bears - Caleb Williams"          (team - person, dash)
+    // Splitting only on whitespace makes the last-token fall on "Bears" when
+    // the format is "Person — Team", mismapping the team to the person's
+    // numbers. Instead, split on separators FIRST, then index each segment
+    // and its last meaningful token.
+    const segments = name.split(/\s*[—–:|]\s*|\s+-\s+/).map(s => s.trim()).filter(Boolean);
+    for (const segment of segments) {
+      const lowerSegment = segment.toLowerCase();
+      if (lowerSegment.length > 3 && lowerSegment.length < 50) {
+        entityNumberMap[lowerSegment] = knownNumbers;
+        allEntityNames.push(segment);
+      }
+      // Last meaningful token of each segment (last name, team mascot, etc.)
+      const tokens = segment.split(/\s+/);
+      for (let i = tokens.length - 1; i >= 0; i--) {
+        const clean = tokens[i].toLowerCase().replace(/[^a-z]/g, '');
+        if (clean.length > 3) {
+          entityNumberMap[clean] = knownNumbers;
+          allEntityNames.push(tokens[i]);
+          break;
+        }
       }
     }
   });
@@ -890,13 +1110,13 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
     combinedFactRepresentation += 'SOURCE QUALITY: COMPREHENSIVE\n\n';
     combinedFactRepresentation += 'TIER 1A is your FACT AUTHORITY — the source of truth for numbers, names, dates, rankings, achievements, and quotes. Treat it as a reference, not a template. The facts are yours to use; the phrasing is not. Build each sentence fresh, then verify the facts against Tier 1A afterward.\n\n';
     combinedFactRepresentation += 'TIER 1B (User Context) provides ADDITIONAL authoritative facts and writer instructions. Use the facts. Follow the instructions. Never write a TIER 1B instruction into a slide as if it were content.\n\n';
-    combinedFactRepresentation += 'TIER 2 (Perplexity supplementary context) provides tone, mood, historical framing, and subjective angles — at MOST 40% of your contextual material. It is NOT a fact source. Numbers, quotes, and recent claims in TIER 2 have been lightly stripped where they conflict with TIER 1A/1B. Do NOT pull stats, dates, or quotes from TIER 2.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity supplementary context) provides tone, mood, historical framing, and subjective angles — at MOST 35% of your contextual material. It is NOT a fact source. Numbers, quotes, and recent claims in TIER 2 have been lightly stripped where they conflict with TIER 1A/1B. Do NOT pull stats, dates, or quotes from TIER 2.\n\n';
     combinedFactRepresentation += 'If TIER 1A and TIER 2 disagree on anything factual, TIER 1A wins. Always.\n\n';
   } else if (sourceQuality === 'PARTIAL') {
     combinedFactRepresentation += 'SOURCE QUALITY: PARTIAL\n\n';
     combinedFactRepresentation += 'TIER 1A is your FACT AUTHORITY for items it covers. Treat it as a reference, not a template — use its facts, write your own sentences.\n\n';
     combinedFactRepresentation += 'TIER 1B (User Context) provides additional authoritative facts and writer instructions. Use the facts. Follow the instructions.\n\n';
-    combinedFactRepresentation += 'TIER 2 (Perplexity) provides tone, framing, and subjective context. For items NOT in TIER 1A or 1B, TIER 2 may also serve as a fact source (mark such facts with [P]). For items IN TIER 1A or 1B, TIER 2 is framing-only — at MOST 40% of contextual material.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity) provides tone, framing, and subjective context. For items NOT in TIER 1A or 1B, TIER 2 may also serve as a fact source (mark such facts with [P]). For items IN TIER 1A or 1B, TIER 2 is framing-only — at MOST 35% of contextual material.\n\n';
   } else {
     combinedFactRepresentation += 'SOURCE QUALITY: MINIMAL\n\n';
     combinedFactRepresentation += 'TIER 1B (User Context), if present, is your primary authoritative fact source and provides writer instructions.\n\n';
@@ -917,7 +1137,7 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
       if (data.factOnlyRepresentation) {
         combinedFactRepresentation += data.factOnlyRepresentation + '\n\n';
       }
-      combinedFactRepresentation += '[Note: Raw source prose is intentionally not included. Use the facts above to construct original sentences.]\n\n';
+      combinedFactRepresentation += '[Note: Raw source prose is intentionally not included. CONTEXT lines (where present) supply non-numeric facts (current team, draft, position, status) the regex extractors may have missed — treat CONTEXT as a fact reference only. Do NOT mirror its phrasing, do NOT copy its sentence structure. Construct every sentence from scratch using the facts above.]\n\n';
     } else if (sourceQuality === 'PARTIAL') {
       // PARTIAL: facts + trimmed snippets for item identification
       if (data.factOnlyRepresentation) {
@@ -961,17 +1181,17 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // TIER 2 — Perplexity (LAST, framing-only, 40% max)
+  // TIER 2 — Perplexity (LAST, framing-only, 35% max)
   // ═══════════════════════════════════════════════════════════════
 
   if (sanitizedPerplexity) {
     combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
-    combinedFactRepresentation += 'TIER 2: SUPPLEMENTARY TONE & CONTEXT (40% WEIGHT MAX)\n';
+    combinedFactRepresentation += 'TIER 2: SUPPLEMENTARY TONE & CONTEXT (35% WEIGHT MAX)\n';
     combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
 
     if (sourceQuality === 'COMPREHENSIVE' || sourceQuality === 'PARTIAL') {
       combinedFactRepresentation += 'Use this section for tone, mood, historical framing, comparisons across eras, why something matters in the broader category, and subjective takes. Do NOT pull numbers, dates, recent claims, or quotes from here. Stats that conflicted with TIER 1A/1B have been replaced with [STAT].\n';
-      combinedFactRepresentation += 'This should inform AT MOST 40% of your contextual material. The bulk of every slide comes from TIER 1A/1B facts.\n\n';
+      combinedFactRepresentation += 'This should inform AT MOST 35% of your contextual material. The bulk of every slide comes from TIER 1A/1B facts.\n\n';
     } else {
       combinedFactRepresentation += 'For items not covered by TIER 1B, you may use facts from this section. Stats that conflicted with TIER 1B have been replaced with [STAT].\n\n';
     }
@@ -996,6 +1216,7 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
     hasUserContext: !!userContextContent,
     sourceQuality,
     alignmentScore: alignScore,
+    perplexitySanitizationStats: sanitizationStats,
   };
 }
 
@@ -1043,6 +1264,8 @@ Rules for Tier 1A:
 - If Tier 1A lists 10 facts about an item, you may use any subset of those 10.
 - If Tier 1A contradicts anything else, Tier 1A wins. Always.
 - You read Tier 1A to learn the facts. You do not read Tier 1A to learn how to phrase them. Build each sentence fresh, then verify the facts against Tier 1A afterward.
+- Tier 1A items may include AFFILIATION / DRAFT / TRANSACTIONS / POSITION / STATUS lines. These are AUTHORITATIVE for current team, draft pick, recent trades, and role — override anything in your training that disagrees.
+- Some items may also have a CONTEXT line. CONTEXT is a fact reference only — pull factual details (team, role, recent events) from it if needed, but NEVER mirror its sentence structure or phrasing. Same 6-word Google-search test applies.
 
 ▓▓▓ TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA (USE ACTIVELY) ▓▓▓
 The writer pasted this manually. It may contain additional facts, stats, angles, emphasis instructions, and context that MUST be used in the article.
@@ -1062,14 +1285,14 @@ Rules for Tier 1B:
 - If Tier 1B directly contradicts a specific number in Tier 1A, Tier 1A wins. For everything else, Tier 1B stands as fact.
 - DO NOT discard Tier 1B content. The writer provided it for a reason. If you wrote the article without using Tier 1B data or following Tier 1B instructions, you failed.
 
-▓▓▓ TIER 2: SUPPLEMENTARY TONE & CONTEXT (40% MAX) ▓▓▓
+▓▓▓ TIER 2: SUPPLEMENTARY TONE & CONTEXT (35% MAX) ▓▓▓
 This is for tone, mood, framing, and subjective angles. NEVER a fact source for stats, dates, or recent claims.
 
 Rules for Tier 2:
 - USE for: tone calibration, historical framing, comparisons across eras, why something matters in the category, subjective takes, mood
 - DO NOT pull from Tier 2: stats, dates, recent claims, percentages, dollar amounts, rankings, or direct quotes
 - Stats that conflicted with Tier 1A/1B have already been replaced with [STAT] — do not invent values for those placeholders
-- Tier 2 should inform AT MOST 40% of your contextual material. The bulk of every slide comes from Tier 1A/1B facts.
+- Tier 2 should inform AT MOST 35% of your contextual material. The bulk of every slide comes from Tier 1A/1B facts.
 - If Tier 1A and Tier 2 disagree on anything factual, Tier 1A wins
 
 ▓▓▓ TIER 3: NEUTRAL PUBLIC FACTS (LAST RESORT, MARK WITH [*]) ▓▓▓
@@ -2409,6 +2632,49 @@ Write PRIMARY SOURCE URL: [best URL] on line 1. SOURCES section at bottom.`;
   }
 }
 
+// ── Lightweight fact synthesis from scraped markdown (for subjective pipeline) ──
+// The subjective pipeline doesn't run atomizeFacts, but lightSanitizePerplexity
+// needs entity names + numbers to strip conflicting stats. This scans section
+// headers in the scraped markdown and extracts numbers within each section into
+// a minimal AtomizedFact[] shape — just enough for the sanitizer to work.
+
+function synthesizeFactsFromScrape(scrapedContent: string): AtomizedFact[] {
+  if (!scrapedContent || scrapedContent.length < 50) return [];
+
+  // Split on markdown headers, bold names, or numbered items
+  const sections = scrapedContent.split(/\n(?=#{1,3}\s+[A-Z]|\*\*[A-Z]|\d{1,3}[.)]\s+[A-Z])/);
+  const facts: AtomizedFact[] = [];
+  let itemNumber = 0;
+
+  for (const section of sections) {
+    const firstLine = section.split('\n')[0]?.trim() ?? '';
+    let name = firstLine
+      .replace(/^#{1,3}\s*/, '')
+      .replace(/^\d{1,3}[.)]\s*/, '')
+      .replace(/\*\*/g, '')
+      .replace(/\[.*?\]/g, '')
+      .trim();
+
+    // Take first segment before common separators (em-dash, colon, pipe)
+    const sepIdx = name.search(/[—–:|]/);
+    if (sepIdx > 3) name = name.slice(0, sepIdx).trim();
+    if (!name || name.length < 3 || name.length > 80) continue;
+
+    itemNumber++;
+    const nums = section.match(/\d+(?:,\d{3})*(?:\.\d+)?/g) || [];
+    const factEntries = nums.map(n => ({ type: 'STAT', value: n }));
+
+    facts.push({
+      itemNumber,
+      itemName: name,
+      facts: factEntries,
+      rawContent: section.slice(0, 500),
+    });
+  }
+
+  return facts;
+}
+
 // ── S3. mergeSubjectiveContext (n8n: "Merge Context") ─────────────────────────
 
 export async function mergeSubjectiveContext(
@@ -2430,7 +2696,17 @@ export async function mergeSubjectiveContext(
   // explode when the user provides 5 URLs.
   const scraped1     = truncate(primaryMarkdown, 1200);
   const scrapedExtras = additionalMarkdowns.map((md, i) => truncate(md, i === 0 ? 900 : 500));
-  const perplexityTruncated = truncate(perplexityAnswer, 1000);
+
+  // ═══ Sanitize Perplexity against scraped-source entities (same logic as objective) ═══
+  // Synthesize minimal entity→numbers map from raw scraped content, then strip
+  // conflicting stats so Claude can't accidentally use Perplexity numbers when
+  // TIER 1A has the real data.
+  const allScrapedForSanitize = [primaryMarkdown, ...additionalMarkdowns].filter(Boolean).join('\n\n');
+  const synthesizedFacts = synthesizeFactsFromScrape(allScrapedForSanitize);
+  const { sanitized: sanitizedPerplexity, stats: sanitizationStats } =
+    lightSanitizePerplexity(perplexityAnswer, synthesizedFacts, data.userContext ?? '');
+  console.log(`[mergeSubjectiveContext] Perplexity sanitization: ${JSON.stringify(sanitizationStats)}`);
+  const perplexityTruncated = truncate(sanitizedPerplexity, 1000);
   const sourceList = citations.map((u, i) => `[${i + 1}] ${u}`).join('\n');
   const wordCount  = perplexityAnswer.split(/\s+/).filter(Boolean).length;
 
@@ -2475,9 +2751,9 @@ export async function mergeSubjectiveContext(
 
   // Tier 2 — Perplexity (demoted based on source quality)
   if (sourceQuality === 'COMPREHENSIVE') {
-    finalContext += '## TIER 2: PERPLEXITY CONTEXT — TONE & FRAMING ONLY (ZERO FACTS FROM HERE)\nUse ONLY for: understanding why something matters, emotional framing, audience context, cultural background.\nNEVER use for: specific quotes, dates, stats, achievements, or factual claims.\n\n';
+    finalContext += '## TIER 2: PERPLEXITY CONTEXT — TONE & FRAMING ONLY, 35% MAX (ZERO FACTS FROM HERE)\nUse ONLY for: understanding why something matters, emotional framing, audience context, cultural background.\nNEVER use for: specific quotes, dates, stats, achievements, or factual claims.\nStats that conflicted with TIER 1A have been replaced with [STAT] — do not invent values for those placeholders.\nTIER 2 should inform AT MOST 35% of your contextual material. The bulk of every slide comes from TIER 1A/1B.\n\n';
   } else if (sourceQuality === 'PARTIAL') {
-    finalContext += '## TIER 2: PERPLEXITY CONTEXT — SUPPLEMENTARY (for items NOT covered by TIER 1A/1B)\nFor items WITH TIER 1A/1B data: ignore this section for that item.\nFor items WITHOUT TIER 1A/1B data: you may use facts below.\n\n';
+    finalContext += '## TIER 2: PERPLEXITY CONTEXT — SUPPLEMENTARY, 35% MAX (for items NOT covered by TIER 1A/1B)\nFor items WITH TIER 1A/1B data: ignore this section for that item.\nFor items WITHOUT TIER 1A/1B data: you may use facts below.\nStats that conflicted with TIER 1A have been replaced with [STAT] — do not invent values for those placeholders.\nTIER 2 should inform AT MOST 35% of contextual material.\n\n';
   } else {
     finalContext += '## TIER 2: PERPLEXITY CONTEXT — SECONDARY DATA SOURCE\nNo scraped source available. Use alongside TIER 1B (if present) as your research base.\n\n';
   }
@@ -2521,6 +2797,8 @@ SOURCE HIERARCHY — ABSOLUTE LAW
 
 TIER 1A: SCRAPED SOURCE — HIGHEST AUTHORITY
 Quotes, names, dates, achievements, item ordering from here override everything else.
+Treat it as a reference, not a template. The facts are yours to use; the phrasing is not.
+Build each sentence fresh, then verify the facts against TIER 1A afterward.
 If TIER 1A provides an order, follow it. If it provides a quote, reproduce it verbatim.
 If TIER 1A contradicts anything else, TIER 1A wins. Always.
 
@@ -2531,10 +2809,11 @@ INSTRUCTIONS (tone, emphasis, angles) = follow as directives shaping how you wri
 Never quote an instruction as slide content. Never discard TIER 1B data.
 If TIER 1B contradicts a specific detail in TIER 1A, TIER 1A wins. Otherwise TIER 1B stands.
 
-TIER 2: PERPLEXITY CONTEXT — BACKUP ONLY
+TIER 2: PERPLEXITY CONTEXT — SUPPLEMENTARY (35% MAX)
 Use for tone calibration, cultural background, and understanding why something matters.
+Stats that conflicted with TIER 1A have been replaced with [STAT] — do not invent values for those placeholders.
 NEVER use TIER 2 for: specific quotes, dates, stats, achievements, or factual claims WHEN TIER 1A or 1B covers that item.
-For items NOT covered by TIER 1A/1B at all, you may use TIER 2 facts.
+For items NOT covered by TIER 1A/1B at all, you may use TIER 2 facts — but TIER 2 should inform AT MOST 35% of your contextual material.
 
 TIER 3: YOUR OWN KNOWLEDGE — LAST RESORT
 Widely known public facts only (team names, league names, basic career facts you are genuinely certain of).
@@ -2557,6 +2836,24 @@ Never invent specific precision:
 - Never write a specific record or stat unless confirmed.
 - Secondary aggregators (BrainyQuote, Goodreads) confirm quote TEXT only — never use them for origin, date, or context.
 - If uncertain, write around it. A vague honest slide beats a specific fabricated one.
+
+═══════════════════════════════════════════════════════════════
+ORIGINALITY REQUIREMENTS — WRITING FRESH FROM FACTS
+═══════════════════════════════════════════════════════════════
+
+You are writing ORIGINAL content using TIER 1A and 1B FACTS. You are NOT paraphrasing.
+
+THE RULE: Facts are yours to use. Language is NOT.
+- Use any quote, date, name, achievement from TIER 1A or 1B
+- Write every sentence fresh — no copying phrases from sources
+- If you find yourself swapping synonyms, you are paraphrasing — rewrite completely
+
+When using a TIER 1A or 1B fact, vary how you present it:
+- REFRAME: lead with the consequence, the emotion, the reaction — not the stat itself
+- RESTRUCTURE: if the source uses one long sentence, try two short ones
+- ADD A LAYER: pair the fact with your editorial voice — the insight the source does not make
+
+Quick check before moving on: if any 6-word string of your sentence could be Google-searched and land on the source article, rewrite that string.
 
 ═══════════════════════════════════════════════════════════════
 THE FEELING ENGINE — SUBJECTIVE WRITING VOICE
@@ -3209,5 +3506,142 @@ ${data.auditReport}
     generatedBy:      data.generatedBy || 'Unknown',
     generatedAt:      new Date().toISOString(),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slide enrichment — Claude Haiku structured-field extraction for image search
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface EnrichedSlideFields {
+  primarySubject: string;
+  otherSubjects: string[];
+  teamName: string;
+  eventName: string;
+  location: string;
+  year: string;
+  emotion: string;
+}
+
+function emptyEnrichmentFields(): EnrichedSlideFields {
+  return {
+    primarySubject: '', otherSubjects: [], teamName: '',
+    eventName: '', location: '', year: '', emotion: '',
+  };
+}
+
+const ENRICHER_SYSTEM_PROMPT = `You extract structured fields from MSN slideshow slides for image search. Given a slideshow title, category, and a list of slides (title + body), return ONLY a valid JSON array — no markdown fences, no explanation.
+
+Each element in the array corresponds to one input slide (same order) and must have exactly these fields:
+
+primarySubject (string): FULL first+last name of THE main person for the slide. Real human person ONLY — never a team, school, stadium, trophy, family name, character, or movie title. Spelling MUST match the source exactly. Do not correct, normalize, paraphrase, or invent. Surname-only ('Love', 'Murray') is FORBIDDEN — scan the source for the full first name; if you cannot find it, leave as ''. Position labels ('Running Back Jeremiyah Love', 'Head Coach Andy Reid') are NOT names — extract just the person's name. Leave as '' if the slide is about no specific person.
+
+otherSubjects (string[], max 3): FULL first+last names of OTHER persons relevant to this slide. Same rules as primarySubject. Use for comparisons ('Brady vs Manning' -> primarySubject: 'Tom Brady', otherSubjects: ['Peyton Manning']), trades, multi-person slides. Use [] when no additional persons.
+
+teamName (string): Team or school name only. Examples: 'Detroit Lions', 'Notre Dame', 'Kansas City Chiefs', 'Team Penske', 'Manchester United'. NO sport identifier ('Detroit Lions NFL' is wrong). NO multiple teams ('Lions vs Bears' is wrong). Leave as '' if no team.
+
+eventName (string): Tournament, race, or event MOST RELEVANT TO THIS SPECIFIC SLIDE — not the slideshow umbrella. Examples:
+- Slide about "The LIV Golf Complication" inside a Masters slideshow -> eventName: 'LIV Golf' (the slide's topic, NOT 'Masters')
+- Slide about "Fowler's Path through the Houston Open" -> eventName: 'Houston Open' (NOT 'Masters')
+- Slide about a player's runner-up moment at the 2018 Masters -> eventName: 'Masters' (slide IS about the Masters)
+- Slide about "World Ranking Crunch" with no specific event -> eventName: '' (don't default to umbrella event)
+Leave as '' if no SLIDE-SPECIFIC event applies. NEVER default to the slideshow-level event just because the slideshow is about it.
+
+location (string): Pure city or geographic location only. Examples: 'Augusta', 'Detroit', 'Las Vegas'. Do NOT put tournaments here (those go in eventName). Leave as '' if none.
+
+year (string): Single 4-digit year. EXTRACT AGGRESSIVELY — if the slide mentions ANY year (game, season, draft, championship, milestone, debut, release), capture the MOST CENTRAL one. Format: 4 digits only ('2024', '1995'). No ranges, no 'season' suffix. Use '' only if NO year appears.
+
+emotion (string): EXACTLY ONE of these canonical values:
+- 'celebration' — wins, championships, milestones, records, joyful moments
+- 'defeat' — losses, eliminations, blown leads, painful endings
+- 'focus' — game action, in-play moments, neutral intensity
+- 'concern' — injuries, controversies, struggles, retirement, sad news
+- 'confident' — pre-game poses, calm portraits, smiling press shots
+- 'intense' — high-stakes plays, rivalries, fights, confrontations
+- 'reflection' — retirement tributes, hall-of-fame, historical retrospective
+- '' — neutral or no strong tone
+
+Field rules (apply to every slide):
+- All fields are INDEPENDENT. Do NOT combine values across fields.
+- Do NOT include sport identifiers (NFL, NBA, NASCAR, F1, etc.) in any structured field — sport is auto-detected downstream.
+- Do NOT include filler words ('back-to-back', 'record-breaking', 'historic', 'iconic', 'legendary', 'famous') in any structured field.
+- teamName vs eventName: NFL/NBA/MLB/NHL/Soccer/Racing crews -> teamName. Tournaments, races, individual-sport events -> eventName.
+- eventName vs location: 'Masters' -> eventName, 'Augusta' -> location. 'Wimbledon' -> eventName, 'London' -> location.
+- eventName vs slideshow umbrella: eventName is SLIDE-SPECIFIC. Don't paste the slideshow's central event into every slide.
+
+Return ONLY the JSON array. Example: [{"primarySubject":"Tom Brady","otherSubjects":[],"teamName":"New England Patriots","eventName":"Super Bowl","location":"","year":"2019","emotion":"celebration"}]`;
+
+export async function enrichSlides(
+  slides: Array<{ title: string; description: string }>,
+  slideshowTitle: string,
+  slideshowCategory: string,
+): Promise<{ slides: EnrichedSlideFields[]; status: string }> {
+  if (!slides.length) return { slides: [], status: 'no-slides' };
+  if (!ANTHROPIC_KEY) {
+    console.warn('[enrichSlides] No ANTHROPIC_API_KEY — returning empty fields');
+    return { slides: slides.map(() => emptyEnrichmentFields()), status: 'no-api-key' };
+  }
+
+  const slidesText = slides.map((s, i) =>
+    `${i + 1}. Title: ${s.title}\n   Body: ${s.description}`
+  ).join('\n\n');
+
+  const userPrompt = `Slideshow title: "${slideshowTitle}"\nCategory: ${slideshowCategory}\n\nSlides:\n${slidesText}\n\nReturn the JSON array now.`;
+
+  try {
+    const resp = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 3500,
+        temperature: 0,
+        system: ENRICHER_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: userPrompt }],
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-api-key': ANTHROPIC_KEY,
+        },
+        timeout: 60_000,
+      },
+    );
+
+    const rawText = ((resp.data?.content as Array<{ text: string }>)?.[0]?.text ?? '').trim();
+    const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) {
+      console.warn('[enrichSlides] No JSON array found in Haiku response');
+      return { slides: slides.map(() => emptyEnrichmentFields()), status: 'no-json' };
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as Array<Record<string, unknown>>;
+    if (!Array.isArray(parsed)) {
+      return { slides: slides.map(() => emptyEnrichmentFields()), status: 'malformed-shape' };
+    }
+
+    // Map to typed fields, padding to input length
+    const result: EnrichedSlideFields[] = slides.map((_, i) => {
+      const raw = parsed[i] ?? {};
+      return {
+        primarySubject: String(raw.primarySubject ?? ''),
+        otherSubjects:  Array.isArray(raw.otherSubjects) ? raw.otherSubjects.map(String).slice(0, 3) : [],
+        teamName:       String(raw.teamName ?? ''),
+        eventName:      String(raw.eventName ?? ''),
+        location:       String(raw.location ?? ''),
+        year:           String(raw.year ?? ''),
+        emotion:        String(raw.emotion ?? ''),
+      };
+    });
+
+    console.log(`[enrichSlides] Enriched ${result.length} slides via Claude Haiku`);
+    return { slides: result, status: 'success' };
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      console.error(`[enrichSlides] HTTP ${err.response?.status}: ${JSON.stringify(err.response?.data ?? err.message)}`);
+    } else {
+      console.error('[enrichSlides] Error:', err);
+    }
+    return { slides: slides.map(() => emptyEnrichmentFields()), status: `error: ${String(err)}` };
+  }
 }
 

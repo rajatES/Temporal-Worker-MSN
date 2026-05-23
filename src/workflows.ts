@@ -39,7 +39,7 @@ const {
   grokAuditAndVerify,
   extractAuditResults,
   finalAssembly,
-  // Subjective pipeline
+  enrichSlides,
   prepareInputSubjective,
   perplexitySubjectiveContext,
   mergeSubjectiveContext,
@@ -66,9 +66,9 @@ const {
   generateWithGrok: grokLong,
   grokFactCheck: grokFactCheckLong,
 } = proxyActivities<typeof activities>({
-    startToCloseTimeout: '8 minutes',
-    retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2, maximumInterval: '60s' },
-  });
+  startToCloseTimeout: '8 minutes',
+  retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2, maximumInterval: '60s' },
+});
 
 // ── Query + Signal definitions (module-level, deterministic) ─────────────────
 
@@ -77,88 +77,189 @@ export const humanDecisionSignal = defineSignal<[HumanDecision]>('humanDecision'
 
 // ── Shared post-processing helpers (used by both modes) ──────────────────────
 
-const STOP_WORDS = new Set([
-  'a','an','the','and','or','but','in','on','at','to','for','of','with','by','from',
-  'is','was','are','were','has','had','have','his','her','their','its','this','that',
-  'he','she','they','it','who','which','also','as','be','been','being','into','up',
-  'out','over','after','before','when','than','not','no','so','if','would','could',
-  'should','two','three','four','five','despite','during','while','through',
-  'against','between','among','across','around','behind','below','above','under',
-]);
-const SPORT_LABELS: Record<string, string> = {
-  nfl: 'NFL', nba: 'NBA', mlb: 'MLB', nhl: 'NHL', nascar: 'NASCAR',
-  'f1': 'F1', 'formula 1': 'F1', golf: 'Golf', pga: 'Golf',
-  ufc: 'UFC', mma: 'MMA', tennis: 'Tennis', atp: 'Tennis', wta: 'Tennis',
-  wnba: 'WNBA', ncaa: 'NCAA', cfb: 'CFB', boxing: 'Boxing',
-};
+// ── Structured-field image search (replaces old proper-noun extraction) ───────
+// Ported from Next.js slide-enricher + ai-generate buildImageSearch pipeline.
+// Claude Haiku extracts 7 fields per slide → sanitizeSlide cleans them →
+// buildImageSearchFromFields assembles the final query string.
 
-function extractProperNouns(text: string): string[] {
-  const tokens = text.replace(/\*\*/g, '').split(/\s+/);
-  const nouns: string[] = [];
-  let i = 0;
-  while (i < tokens.length) {
-    const raw = tokens[i];
-    const clean = raw.replace(/[^a-zA-Z0-9]/g, '');
-    if (!clean || clean.length < 2 || STOP_WORDS.has(clean.toLowerCase())) { i++; continue; }
-    if (/^[A-Z]/.test(raw)) {
-      const parts = [clean];
-      let j = i + 1;
-      while (j < i + 4 && j < tokens.length) {
-        const nr = tokens[j], nc = nr.replace(/[^a-zA-Z0-9]/g, '');
-        if (/^[A-Z]/.test(nr) && nc.length > 1 && !STOP_WORDS.has(nc.toLowerCase())) {
-          parts.push(nc); j++;
-        } else break;
-      }
-      nouns.push(parts.join(' '));
-      i = j;
-    } else { i++; }
-  }
-  const unique: string[] = [];
-  const seen = new Set<string>();
-  for (const noun of nouns) {
-    const key = noun.toLowerCase();
-    if (seen.has(key)) continue;
-    if (unique.some(u => u.toLowerCase().includes(key))) continue;
-    unique.push(noun);
-    seen.add(key);
-  }
-  return unique;
+const VALID_EMOTIONS = new Set([
+  'celebration', 'defeat', 'focus', 'concern', 'confident', 'intense', 'reflection',
+]);
+
+const POSITION_BIGRAMS = new Set([
+  'running back', 'wide receiver', 'tight end', 'offensive lineman', 'defensive end',
+  'head coach', 'assistant coach', 'offensive coordinator', 'defensive coordinator',
+  'point guard', 'shooting guard', 'small forward', 'power forward', 'center fielder',
+  'starting pitcher', 'relief pitcher', 'designated hitter', 'free safety', 'strong safety',
+  'middle linebacker', 'outside linebacker', 'cornerback', 'quarterback', 'linebacker',
+  'general manager', 'team owner', 'team president',
+]);
+
+const BANNED_TOKENS = new Set([
+  'nfl', 'nba', 'mlb', 'nhl', 'nascar', 'f1', 'formula', 'ufc', 'mma', 'pga',
+  'wnba', 'ncaa', 'cfb', 'atp', 'wta', 'fifa',
+  'back-to-back', 'record-breaking', 'historic', 'iconic', 'legendary', 'famous',
+  'greatest', 'all-time', 'unprecedented', 'remarkable',
+]);
+
+const BANNED_TOKENS_EVENT = new Set([
+  ...BANNED_TOKENS,
+  'championship', 'tournament', 'season', 'final', 'finals', 'round',
+]);
+
+function toCleanString(raw: unknown): string {
+  if (raw === null || raw === undefined) return '';
+  const s = String(raw).trim();
+  if (!s || s === 'null' || s === 'undefined' || s === 'N/A' || s === 'n/a') return '';
+  return s;
 }
 
-function buildImageSearch(title: string, body: string, category: string): string {
-  const descNouns = extractProperNouns(body || '');
-  let candidates: string[] = [...descNouns];
-
-  if (candidates.length < 2) {
-    const titleNouns = extractProperNouns((title || '').replace(/^\d+\.\s*/, ''))
-      .map(n => n.split(' ').slice(0, 2).join(' '));
-    for (const n of titleNouns) {
-      if (!n.includes(' ')) continue;
-      if (!candidates.some(d => d.toLowerCase().includes(n.toLowerCase()) || n.toLowerCase().includes(d.toLowerCase()))) {
-        candidates.push(n);
-      }
+function cleanName(raw: string): string {
+  let name = toCleanString(raw);
+  if (!name) return '';
+  // Strip position labels (case-insensitive)
+  const lower = name.toLowerCase();
+  for (const pos of POSITION_BIGRAMS) {
+    if (lower.startsWith(pos + ' ')) {
+      name = name.slice(pos.length).trim();
+      break;
     }
-    if (candidates.length === 0) {
-      const fallback = (title || '').replace(/^\d+\.\s*/, '').replace(/[^a-zA-Z0-9\s]/g, '').trim().split(/\s+/).slice(0, 2).join(' ');
-      if (fallback) candidates.push(fallback);
+  }
+  // Keep letters (including accented), spaces, apostrophes, hyphens, periods
+  name = name.replace(/[^a-zA-ZÀ-ɏ\s'.\-]/g, '').trim();
+  // Must have at least first + last name (2 parts)
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return ''; // surname-only → reject
+  return parts.join(' ');
+}
+
+function cleanField(raw: string, extraBanned?: Set<string>): string {
+  const field = toCleanString(raw);
+  if (!field) return '';
+  const banned = extraBanned ?? BANNED_TOKENS;
+  const words = field.split(/\s+/);
+  const cleaned = words.filter(w => !banned.has(w.toLowerCase().replace(/[^a-z0-9-]/g, '')));
+  return cleaned.join(' ').trim();
+}
+
+function cleanYear(raw: unknown): string {
+  const s = toCleanString(raw);
+  if (!s) return '';
+  const m = s.match(/\b(19|20)\d{2}\b/);
+  return m ? m[0] : '';
+}
+
+function cleanEmotion(raw: unknown): string {
+  const s = toCleanString(raw).toLowerCase().trim();
+  return VALID_EMOTIONS.has(s) ? s : '';
+}
+
+function cleanOtherSubjects(raw: unknown, excludePrimary: string): string[] {
+  if (!Array.isArray(raw)) return [];
+  const primaryLower = excludePrimary.toLowerCase();
+  return raw
+    .map(item => cleanName(String(item ?? '')))
+    .filter(name => name && name.toLowerCase() !== primaryLower)
+    .slice(0, 3);
+}
+
+function expandSurnameFromText(surname: string, title: string, description: string): string {
+  if (!surname || surname.includes(' ')) return surname; // already full name or empty
+  const text = `${title} ${description}`;
+  // Look for "FirstName Surname" pattern in the text
+  const escaped = surname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(`([A-Z][a-z]+)\\s+${escaped}\\b`);
+  const m = text.match(regex);
+  return m ? `${m[1]} ${surname}` : '';
+}
+
+interface EnrichedSlideFields {
+  primarySubject: string;
+  otherSubjects: string[];
+  teamName: string;
+  eventName: string;
+  location: string;
+  year: string;
+  emotion: string;
+}
+
+function sanitizeSlideFields(
+  slide: { title: string; description: string },
+  raw: EnrichedSlideFields,
+): { imageSearch: string } & EnrichedSlideFields {
+  let primarySubject = cleanName(raw.primarySubject);
+  const teamName = cleanField(raw.teamName);
+  const eventName = cleanField(raw.eventName, BANNED_TOKENS_EVENT);
+  const location = cleanField(raw.location);
+  const year = cleanYear(raw.year);
+  const emotion = cleanEmotion(raw.emotion);
+
+  // Recover surname-only primarySubject by expanding from title+description
+  if (!primarySubject && raw.primarySubject) {
+    const surname = toCleanString(raw.primarySubject);
+    if (surname && !surname.includes(' ')) {
+      primarySubject = expandSurnameFromText(surname, slide.title, slide.description);
     }
   }
 
+  const otherSubjects = cleanOtherSubjects(raw.otherSubjects, primarySubject);
+
+  const imageSearch = buildImageSearchFromFields({
+    primarySubject, otherSubjects, teamName, eventName, location, year, emotion,
+  }) || slide.title || '';
+
+  return { primarySubject, otherSubjects, teamName, eventName, location, year, emotion, imageSearch };
+}
+
+function buildImageSearchFromFields(fields: {
+  primarySubject: string;
+  otherSubjects: string[];
+  teamName: string;
+  eventName: string;
+  location: string;
+  year: string;
+  emotion: string;
+}): string {
+  const MAX_TOKENS = 10;
   const seen = new Set<string>();
-  const terms: string[] = [];
-  for (const t of candidates) {
-    const k = t.toLowerCase();
-    if (seen.has(k)) continue;
-    if (terms.some(u => u.toLowerCase().includes(k) || k.includes(u.toLowerCase()))) continue;
-    terms.push(t);
-    seen.add(k);
+  const out: string[] = [];
+
+  const addTokens = (raw: unknown) => {
+    if (out.length >= MAX_TOKENS) return;
+    const s = toCleanString(raw);
+    if (!s) return;
+    for (const tok of s.split(/\s+/)) {
+      if (out.length >= MAX_TOKENS) return;
+      const cleaned = tok.replace(/[.,;:!?]+$/g, '').trim();
+      if (!cleaned) continue;
+      const lo = cleaned.toLowerCase();
+      if (seen.has(lo)) continue;
+      seen.add(lo);
+      out.push(cleaned);
+    }
+  };
+
+  // Substantive fields first — at least one must produce a token
+  addTokens(fields.primarySubject);
+  if (Array.isArray(fields.otherSubjects)) {
+    for (const o of fields.otherSubjects) addTokens(o);
   }
-  const catKey = (category || '').toLowerCase().replace('sports - ', '').trim();
-  const sport = SPORT_LABELS[catKey] || '';
-  if (sport && !terms.some(t => t.toLowerCase().includes(sport.toLowerCase()))) {
-    terms.push(sport);
+  addTokens(fields.teamName);
+  addTokens(fields.eventName);
+  addTokens(fields.location);
+  if (out.length === 0) return '';
+
+  // Year + emotion ONLY when a person anchor is present
+  const hasPersonAnchor = !!(
+    toCleanString(fields.primarySubject) ||
+    (Array.isArray(fields.otherSubjects) && fields.otherSubjects.some(o => toCleanString(o)))
+  );
+  if (hasPersonAnchor) {
+    addTokens(fields.year);
+    addTokens(fields.emotion);
   }
-  return terms.slice(0, 5).join(' ').replace(/\s+/g, ' ').trim();
+
+  return out.join(' ').trim();
 }
 
 type ParsedSlide = { slideNum: number; title: string; body: string };
@@ -200,33 +301,50 @@ function parseSlides(text: string): ParsedSlide[] {
   return result;
 }
 
-function buildWorkflowResult(articleText: string, final: { title: string; category: string; writerName: string; qualityScore: number; summaryComment: string; flagsForReview: string; generatedBy: string }): WorkflowResult {
-  const parsedSlides  = parseSlides(articleText);
-  const introSlide    = parsedSlides.find(s => s.slideNum === 1);
+interface EnrichmentResult {
+  slides: EnrichedSlideFields[];
+  status: string;
+}
+
+function buildWorkflowResult(
+  articleText: string,
+  final: { title: string; category: string; writerName: string; qualityScore: number; summaryComment: string; flagsForReview: string; generatedBy: string },
+  enrichment?: EnrichmentResult | null,
+): WorkflowResult {
+  const parsedSlides = parseSlides(articleText);
+  const introSlide = parsedSlides.find(s => s.slideNum === 1);
   const contentSlides = parsedSlides
     .filter(s => s.slideNum > 1)
-    .sort((a, b) => a.slideNum - b.slideNum)
-    .map(s => ({
-      title:       s.title,
-      description: s.body,
-      imageSearch: buildImageSearch(s.title, s.body, final.category),
-    }));
+    .sort((a, b) => a.slideNum - b.slideNum);
+
+  const enrichedContentSlides = contentSlides.map((s, i) => {
+    const base = { title: s.title, description: s.body };
+
+    if (enrichment?.status === 'success' && enrichment.slides[i]) {
+      const sanitized = sanitizeSlideFields(base, enrichment.slides[i]);
+      return { ...base, ...sanitized };
+    }
+
+    // Fallback: use slide title as imageSearch (no structured fields)
+    return { ...base, imageSearch: s.title || '' };
+  });
 
   const metaMatch = articleText.match(/META:\s*([^\n]+)/i);
   const metaDescription = metaMatch ? metaMatch[1].replace(/\*\*/g, '').trim() : '';
 
   return {
-    title:         final.title,
+    title: final.title,
     metaDescription,
-    introSlide:    introSlide ? { title: introSlide.title, body: introSlide.body } : null,
-    description:   metaDescription || introSlide?.body || '',
-    keywords:      final.category,
-    slides:        contentSlides,
-    author:        final.writerName,
-    qualityScore:  final.qualityScore,
+    introSlide: introSlide ? { title: introSlide.title, body: introSlide.body } : null,
+    description: metaDescription || introSlide?.body || '',
+    keywords: final.category,
+    slides: enrichedContentSlides,
+    author: final.writerName,
+    qualityScore: final.qualityScore,
     summaryComment: final.summaryComment,
     flagsForReview: final.flagsForReview,
-    generatedBy:   final.generatedBy,
+    generatedBy: final.generatedBy,
+    enrichmentStatus: enrichment?.status ?? 'skipped',
   };
 }
 
@@ -354,7 +472,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     let generated;
     try {
       const claudeRaw = await generateSubjectiveWithClaude(prompted.claudeSystemPrompt, prompted.claudeUserPrompt);
-      const checked   = await checkSubjectiveClaudeResponse(claudeRaw, prompted);
+      const checked = await checkSubjectiveClaudeResponse(claudeRaw, prompted);
 
       if (checked.claudeFailed) {
         activate('generating', 'Claude failed — falling back to Grok…');
@@ -362,11 +480,11 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
           const grokText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, prompted.claudeUserPrompt);
           generated = {
             ...prompted,
-            articleText:         grokText,
+            articleText: grokText,
             originalArticleText: grokText,
-            generatedBy:         'Grok (Fallback)',
-            claudeFailed:        true,
-            failureReason:       checked.failureReason,
+            generatedBy: 'Grok (Fallback)',
+            claudeFailed: true,
+            failureReason: checked.failureReason,
           };
         } catch {
           throw new Error('Both Claude and Grok generation failed — cannot produce subjective article');
@@ -380,11 +498,11 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
         const grokText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, prompted.claudeUserPrompt);
         generated = {
           ...prompted,
-          articleText:         grokText,
+          articleText: grokText,
           originalArticleText: grokText,
-          generatedBy:         'Grok (Fallback)',
-          claudeFailed:        true,
-          failureReason:       String(err),
+          generatedBy: 'Grok (Fallback)',
+          claudeFailed: true,
+          failureReason: String(err),
         };
       } catch {
         throw new Error('Both Claude and Grok generation failed — cannot produce subjective article');
@@ -412,9 +530,24 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     // Stage 8: final assembly
     activate('creating_docs', 'Assembling output…');
     const final = await finalAssemblySubjective(audited);
+    complete('creating_docs', `score ${final.qualityScore}/100`);
 
-    workflowResult = buildWorkflowResult(audited.articleText, final);
-    complete('creating_docs', `${workflowResult.slides.length} slides · score ${final.qualityScore}/100`);
+    // Stage 9: Slide enrichment (Claude Haiku structured-field extraction)
+    activate('enriching', 'Extracting image search fields…');
+    const parsedForEnrich = parseSlides(audited.articleText)
+      .filter(s => s.slideNum > 1)
+      .sort((a, b) => a.slideNum - b.slideNum)
+      .map(s => ({ title: s.title, description: s.body }));
+
+    let enrichment: EnrichmentResult | null = null;
+    try {
+      enrichment = await enrichSlides(parsedForEnrich, final.title, final.category);
+      complete('enriching', `${enrichment.status} · ${enrichment.slides.length} slides`);
+    } catch {
+      warn('enriching', 'Enrichment failed — using fallback');
+    }
+
+    workflowResult = buildWorkflowResult(audited.articleText, final, enrichment);
     complete('complete');
     return workflowResult;
   }
@@ -598,7 +731,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   activate('generating', 'Calling Claude…');
   let generatedData;
   try {
-    const claudeRaw     = await generateWithClaude(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
+    const claudeRaw = await generateWithClaude(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
     const claudeChecked = await checkClaudeResponse(claudeRaw, promptData);
 
     if (claudeChecked.claudeFailed) {
@@ -607,11 +740,11 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
         const grokText = await grokLong(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
         generatedData = {
           ...promptData,
-          articleText:         grokText,
+          articleText: grokText,
           originalArticleText: grokText,
-          generatedBy:         'Grok (Fallback)',
-          claudeFailed:        true,
-          failureReason:       claudeChecked.failureReason,
+          generatedBy: 'Grok (Fallback)',
+          claudeFailed: true,
+          failureReason: claudeChecked.failureReason,
         };
       } catch {
         throw new Error('Both Claude and Grok generation failed — cannot produce article');
@@ -625,11 +758,11 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
       const grokText = await grokLong(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
       generatedData = {
         ...promptData,
-        articleText:         grokText,
+        articleText: grokText,
         originalArticleText: grokText,
-        generatedBy:         'Grok (Fallback)',
-        claudeFailed:        true,
-        failureReason:       String(err),
+        generatedBy: 'Grok (Fallback)',
+        claudeFailed: true,
+        failureReason: String(err),
       };
     } catch {
       throw new Error('Both Claude and Grok generation failed — cannot produce article');
@@ -759,8 +892,24 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     }
   }
 
-  workflowResult = buildWorkflowResult(auditedData.articleText, final);
-  complete('creating_docs', `${workflowResult.slides.length} slides · score ${final.qualityScore}/100`);
+  complete('creating_docs', `score ${final.qualityScore}/100`);
+
+  // ── Stage 13: Slide enrichment (Claude Haiku structured-field extraction) ───
+  activate('enriching', 'Extracting image search fields…');
+  const parsedForEnrich = parseSlides(auditedData.articleText)
+    .filter(s => s.slideNum > 1)
+    .sort((a, b) => a.slideNum - b.slideNum)
+    .map(s => ({ title: s.title, description: s.body }));
+
+  let enrichment: EnrichmentResult | null = null;
+  try {
+    enrichment = await enrichSlides(parsedForEnrich, final.title, final.category);
+    complete('enriching', `${enrichment.status} · ${enrichment.slides.length} slides`);
+  } catch {
+    warn('enriching', 'Enrichment failed — using fallback');
+  }
+
+  workflowResult = buildWorkflowResult(auditedData.articleText, final, enrichment);
   complete('complete');
   return workflowResult;
 }
