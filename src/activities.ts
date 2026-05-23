@@ -341,6 +341,7 @@ export async function firecrawlScrape(url: string, onlyMainContent = true): Prom
 
       if (!cleaned) {
         console.warn(`[firecrawlScrape] Empty markdown for ${url} (status ${resp.status}, success=${resp.data?.success}, attempt ${attempt})`);
+        throw new Error(`Firecrawl returned empty markdown for ${url}`);
       } else {
         console.log(`[firecrawlScrape] ${url}: ${raw.length} chars raw → ${cleaned.length} chars cleaned (attempt ${attempt})`);
       }
@@ -367,10 +368,10 @@ export async function firecrawlScrape(url: string, onlyMainContent = true): Prom
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      return '';
+      throw new Error(`Firecrawl scrape failed for ${url}: ${errBody}`);
     }
   }
-  return '';
+  throw new Error(`Firecrawl scrape failed after all attempts for ${url}`);
 }
 
 // ── 3. analyzeSourceAlignment (n8n: "Analyze Source Alignment") ──────────────
