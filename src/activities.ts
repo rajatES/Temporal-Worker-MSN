@@ -116,6 +116,125 @@ export function applyAuditPatches(article: string, patches: AuditPatch[]): { res
   return { result, applied, skipped, log };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// parseMustIncludeItems — robust extraction of must-include items from any
+// user-supplied format: markdown tables, numbered/bulleted lists, plain lines,
+// or mixed. Strips source rank numbers, table formatting, header/separator
+// rows, and deduplicates by normalised entity name.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseMustIncludeItems(raw: string): string[] {
+  if (!raw || !raw.trim()) return [];
+
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  // Detect if this is a markdown/pipe table: 2+ lines contain at least 2 pipes
+  const pipeLines = lines.filter(l => (l.match(/\|/g) ?? []).length >= 2);
+  const isTable = pipeLines.length >= 2;
+
+  const extracted: string[] = [];
+
+  if (isTable) {
+    for (const line of lines) {
+      // Skip separator rows: | -- | --- | etc.
+      if (/^\|[\s\-:|]+\|$/.test(line)) continue;
+
+      // Split pipe-delimited cells
+      const cells = line.split('|').map(c => c.trim()).filter(Boolean);
+      if (cells.length < 2) continue;
+
+      // Skip header rows: detect by checking if first cell is a common header
+      // keyword or if all cells look like column headers (no digits in any cell)
+      const firstLower = cells[0].toLowerCase();
+      if (/^(#|rank|no\.?|number|pos\.?|position|sr\.?)$/i.test(firstLower)) continue;
+      if (cells.every(c => /^[a-z\s.()\/&]+$/i.test(c) && !/\d{4}/.test(c) && c.length < 30)) continue;
+
+      // Try to identify: rank-number cell, name cell(s), and optional context cells
+      // The first cell that's purely numeric (or #N) is the source rank — skip it
+      let nameParts: string[] = [];
+      let contextParts: string[] = [];
+      let seenName = false;
+
+      for (const cell of cells) {
+        // Pure rank number — skip
+        if (/^\d{1,3}$/.test(cell) || /^#\d+$/.test(cell)) continue;
+
+        // Year-only cell (e.g. "1993", "1985–1990") → context
+        if (/^\d{4}(\s*[–\-]\s*\d{4})?$/.test(cell)) {
+          contextParts.push(cell);
+          continue;
+        }
+
+        if (!seenName) {
+          nameParts.push(cell);
+          seenName = true;
+        } else {
+          contextParts.push(cell);
+        }
+      }
+
+      if (nameParts.length === 0) continue;
+
+      // Build a clean item string: "Name — Context1, Context2" or just "Name"
+      const name = nameParts.join(' ').trim();
+      const context = contextParts.filter(c => c.length > 0).join(', ').trim();
+      const item = context ? `${name} — ${context}` : name;
+      if (item.length > 2) extracted.push(item);
+    }
+  } else {
+    // Non-table: numbered list, bulleted list, comma-separated, or plain lines
+    // First, split by newlines (already done), then handle comma-separated items
+    // within each line (only if line has no clear list marker)
+    for (const line of lines) {
+      // Strip list markers: "1.", "1)", "#1", "- ", "* ", "•"
+      let cleaned = line
+        .replace(/^(\d{1,3}[.)]\s*|#\d+[.):]?\s*|[-*•]\s+)/, '')
+        .trim();
+
+      if (!cleaned) continue;
+
+      // If the cleaned line itself contains comma-separated items that look like
+      // distinct entities (each part has 2+ words), split them
+      const commaParts = cleaned.split(/,(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
+      if (commaParts.length > 1 && commaParts.every(p => p.split(/\s+/).length >= 2)) {
+        for (const part of commaParts) {
+          if (part.length > 2) extracted.push(stripLeadingRank(part));
+        }
+      } else {
+        if (cleaned.length > 2) extracted.push(stripLeadingRank(cleaned));
+      }
+    }
+  }
+
+  // Deduplicate by normalised form (lowercase, stripped of parenthetical aliases)
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const item of extracted) {
+    const norm = item.toLowerCase().replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!seen.has(norm)) {
+      seen.add(norm);
+      deduped.push(item);
+    }
+  }
+
+  return deduped;
+}
+
+// Strip a leading rank number that may survive from non-table formats
+// e.g. "40 Dr. Jack Griffin — The Invisible Man" → "Dr. Jack Griffin — The Invisible Man"
+// but preserve names that start with a number: "50 Cent", "21 Savage"
+function stripLeadingRank(s: string): string {
+  // Match: digits at start, followed by a period/colon/dash/whitespace, then a
+  // word that starts with uppercase (indicating a name follows the rank).
+  // Don't strip if the digits are part of the name (no separator between rank and name).
+  const m = s.match(/^(\d{1,3})\s*[.):\-–—]?\s+([A-Z])/);
+  if (m) {
+    const afterRank = s.slice(m.index! + m[0].length - 1); // keep the uppercase letter
+    return (m[2] + afterRank).trim();
+  }
+  return s;
+}
+
 // ── 1. prepareInputAndAnalyze (n8n: "Prepare Input & Analyze") ────────────────
 
 export async function prepareInputAndAnalyze(input: FormInput): Promise<PreparedData> {
@@ -201,7 +320,7 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   const userSecondaryUrls   = allUrls.slice(1);                // up to 4 extras (5 total)
   const isUserUrlRestricted = userPrimaryUrl ? isRestricted(userPrimaryUrl) : false;
   const hasValidUserSource  = !!userPrimaryUrl && !isUserUrlRestricted;
-  const mustIncludeItems    = mustIncludeRaw ? mustIncludeRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean) : [];
+  const mustIncludeItems    = parseMustIncludeItems(mustIncludeRaw ?? '');
 
   return {
     title, category, slideCount, writerName, userContext, writingStyle,
@@ -2530,9 +2649,7 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
   const shouldScrapePrimary = !!userPrimaryUrl;
   const hasUserUrl          = !!userPrimaryUrl;
 
-  const mustIncludeItems = mustIncludeRaw
-    ? mustIncludeRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean)
-    : [];
+  const mustIncludeItems = parseMustIncludeItems(mustIncludeRaw);
   const hasMustInclude = mustIncludeItems.length > 0;
 
   const mustIncludeBlock = hasMustInclude
