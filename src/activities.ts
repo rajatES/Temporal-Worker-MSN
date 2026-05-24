@@ -182,27 +182,48 @@ function parseMustIncludeItems(raw: string): string[] {
       if (item.length > 2) extracted.push(item);
     }
   } else {
-    // Non-table: numbered list, bulleted list, comma-separated, or plain lines
-    // First, split by newlines (already done), then handle comma-separated items
-    // within each line (only if line has no clear list marker)
+    // Non-table: numbered list, bulleted list, comma-separated, or plain lines.
+    // Handles any mix: "1. A, 2. B", "A\nB\nC", "1. A 2. B 3. C" (no delimiter),
+    // or single-word items like "Sektori, Dispatch, BALL x PIT".
     for (const line of lines) {
-      // Strip list markers: "1.", "1)", "#1", "- ", "* ", "•"
+      // Strip leading list marker: "1.", "1)", "#1", "- ", "* ", "•"
       let cleaned = line
         .replace(/^(\d{1,3}[.)]\s*|#\d+[.):]?\s*|[-*•]\s+)/, '')
         .trim();
 
       if (!cleaned) continue;
 
-      // If the cleaned line itself contains comma-separated items that look like
-      // distinct entities (each part has 2+ words), split them
+      // ── Inline-numbered items on one line ──────────────────────────────
+      // Catches "Game A 2. Game B 3. Game C" or "Game A, 2. Game B, 3. Game C"
+      // after the leading "1." was already stripped above.
+      const numberedParts = cleaned.split(/,?\s+(?=\d{1,3}[.)]\s|#\d+\s)/);
+      if (numberedParts.length >= 2) {
+        for (const part of numberedParts) {
+          const stripped = part
+            .replace(/^\d{1,3}[.)]\s*/, '')
+            .replace(/^#\d+[.):]?\s*/, '')
+            .replace(/,\s*$/, '')
+            .trim();
+          if (stripped.length > 2) extracted.push(stripLeadingRank(stripped));
+        }
+        continue;
+      }
+
+      // ── Comma-separated items ──────────────────────────────────────────
+      // Split on commas (but not commas inside parentheses).
+      // 3+ parts = always a list. 2 parts = only split if both have 2+ words
+      // (avoids false splits like "Game Title, 2025").
       const commaParts = cleaned.split(/,(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
-      if (commaParts.length > 1 && commaParts.every(p => p.split(/\s+/).length >= 2)) {
+      if (commaParts.length >= 3 ||
+          (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2))) {
         for (const part of commaParts) {
           if (part.length > 2) extracted.push(stripLeadingRank(part));
         }
-      } else {
-        if (cleaned.length > 2) extracted.push(stripLeadingRank(cleaned));
+        continue;
       }
+
+      // ── Single item ────────────────────────────────────────────────────
+      if (cleaned.length > 2) extracted.push(stripLeadingRank(cleaned));
     }
   }
 
@@ -229,8 +250,7 @@ function stripLeadingRank(s: string): string {
   // Don't strip if the digits are part of the name (no separator between rank and name).
   const m = s.match(/^(\d{1,3})\s*[.):\-–—]?\s+([A-Z])/);
   if (m) {
-    const afterRank = s.slice(m.index! + m[0].length - 1); // keep the uppercase letter
-    return (m[2] + afterRank).trim();
+    return s.slice(m.index! + m[0].length - 1).trim(); // start at the uppercase letter
   }
   return s;
 }
@@ -289,7 +309,7 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   // Title analysis
   const numberMatch  = title.match(/(\d+)\s+/);
   const promisedCount = numberMatch ? parseInt(numberMatch[1]) : entityCount;
-  const isRanking    = /\b(top|best|greatest|worst|most|ranked|ranking)\b/i.test(title);
+  const isRanking    = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
   const isListicle   = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
   const isTimeBased  = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
   const emotionMatch = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
