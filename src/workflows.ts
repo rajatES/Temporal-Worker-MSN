@@ -573,12 +573,10 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
       warn('scraping_source', 'Primary source scrape failed — continuing without it');
     }
 
-    // Scrape every remaining URL (up to 4) — secondaries use onlyMainContent=false
-    // to capture broader context (matches n8n behaviour for non-primary sources).
     const additionalMarkdowns: string[] = [];
     for (const url of preparedData.userSecondaryUrls) {
       try {
-        const md = await firecrawlScrape(url, false);
+        const md = await firecrawlScrape(url);
         if (md) additionalMarkdowns.push(md);
         else additionalMarkdowns.push('');
       } catch {

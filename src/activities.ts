@@ -334,6 +334,7 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
     .map(s => s.trim())
     .filter(s => /^https?:\/\/.+\..+/.test(s))
     .filter(s => !isRestricted(s))
+    .filter((url, i, arr) => arr.findIndex(u => u.replace(/\/+$/, '') === url.replace(/\/+$/, '')) === i)
     .slice(0, 5);
 
   const userPrimaryUrl      = allUrls[0] ?? '';
@@ -2659,6 +2660,7 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
         .map(s => s.trim())
         .filter(s => /^https?:\/\/.+\..+/.test(s))
         .filter(s => !SUBJECTIVE_RESTRICTED.some(d => s.toLowerCase().includes(d)))
+        .filter((url, i, arr) => arr.findIndex(u => u.replace(/\/+$/, '') === url.replace(/\/+$/, '')) === i)
         .slice(0, 5)
     : [];
 
