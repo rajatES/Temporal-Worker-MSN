@@ -1777,7 +1777,7 @@ Title: "${data.title}"
 Category: ${data.category}
 Slides: 1 intro + ${data.slideCount} content slides
 ${fc.isMultiSlideFormat ? `Format: ${fc.slidesPerEntity} slides per entity (${fc.entityCount} entities total)` : ''}
-${data.hasMustInclude ? `\nMANDATORY ITEMS (must all appear, all from Tier 1A/1B):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}` : ''}
+${data.hasMustInclude ? `\nMANDATORY ITEMS — these override Tier 1A item selection (every one MUST get its own slide, even if not in Tier 1A):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nDo NOT substitute any mandatory item with a different item from the source. If a mandatory item lacks Tier 1A data, use Tier 1B/2/3 instead.` : ''}
 
 Primary Source: ${data.primarySourceUrl || 'See Tier 1A above'}
 
@@ -1792,7 +1792,7 @@ BEFORE WRITING — run this checklist:
 5. For items where Tier 1A is thin — does Tier 1B have data I should use before writing a shorter slide?
 6. How will I vary structure across slides?
 ${ta.isRanking ? '7. Am I following Tier 1A\'s exact ranking order?' : ''}
-${data.hasMustInclude ? `${ta.isRanking ? '8' : '7'}. Are ALL mandatory items covered using their Tier 1A/1B facts?` : ''}
+${data.hasMustInclude ? `${ta.isRanking ? '8' : '7'}. Are ALL mandatory items present as their own slide? (use Tier 2/3 if Tier 1A/1B is missing for an item)` : ''}
 
 CRITICAL REMINDERS:
 - Every specific claim must trace to TIER 1A or TIER 1B
@@ -3108,10 +3108,17 @@ Every promise in the title MUST be delivered:
 - Negative keywords in title appear verbatim in the body
 
 ═══════════════════════════════════════════════════════════════
-MUST-INCLUDE ITEMS — MANDATORY
+MUST-INCLUDE ITEMS — OVERRIDES TIER 1A ITEM SELECTION
 ═══════════════════════════════════════════════════════════════
 
-If mandatory items are listed, every one must appear as its own dedicated slide at full spec. Not a passing mention. Not buried. After writing, scan the full article and confirm every mandatory item is present.
+If mandatory items are listed, they define WHICH items appear in the article. This overrides TIER 1A's item list. Even if a mandatory item does not appear in the scraped source, it MUST still get its own dedicated slide.
+
+RULES:
+- Every mandatory item = its own slide at full spec. Not a passing mention. Not buried.
+- Do NOT substitute a mandatory item with a different item from the scraped source.
+- Do NOT drop a mandatory item because it lacks TIER 1A data — use TIER 1B, TIER 2, or TIER 3 for that slide instead.
+- TIER 1A still governs facts and ordering for items that DO appear in it.
+- After writing, scan the full article and confirm every mandatory item is present. If any is missing, add it and remove a non-mandatory item.
 
 ═══════════════════════════════════════════════════════════════
 WORD COUNTS — STRICT
@@ -3179,7 +3186,7 @@ ABSOLUTE OUTPUT RULE
 Always produce the full slideshow. No exceptions. Never write 'I cannot' or any refusal. If source data is thin, write tighter slides using Tier 2/3. A complete article is always the correct output.`;
 
   const mandatoryBlock = data.hasMustInclude
-    ? `\n\nMANDATORY ITEMS — every one must appear as its own slide (non-negotiable):\n${data.mustIncludeItems.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nFill remaining slots (up to ${data.slideCount} total) with the best-fit entries.`
+    ? `\n\nMANDATORY ITEMS — these override the scraped source's item list (non-negotiable):\n${data.mustIncludeItems.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nEvery mandatory item MUST get its own slide, even if it does not appear in TIER 1A. Do NOT substitute any with a different item from the source. Fill remaining slots (up to ${data.slideCount} total) with the best-fit entries.`
     : '';
 
   const claudeUserPrompt = `SOURCE DATA — write from this:\n\n${data.finalContext}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
