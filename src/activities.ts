@@ -2496,7 +2496,7 @@ HARD RULES
   const resp = await axios.post(
     VERCEL_GATEWAY_URL,
     {
-      model: 'xai/grok-3-latest',
+      model: 'xai/grok-4.3',
       max_output_tokens: 3500,
       temperature: 0.0,
       input: [
