@@ -5,7 +5,8 @@ import {
   MergedData, PromptData, GeneratedData, ValidatedData, ClaimedData,
   VerifiedData, AuditedData, FinalOutput, TemporalCtx,
   FormatConfig, TitleAnalysis, AtomizedFact, SourceEntry, FactProvenance,
-  SubjectivePreparedData, SubjectiveResearchedData, SubjectiveMergedData,
+  SubjectivePreparedData, SubjectiveSourcedData, SubjectiveAtomizedData,
+  SubjectiveResearchedData, SubjectiveMergedData,
   SubjectivePromptData, SubjectiveGeneratedData, SubjectiveValidatedData,
   SubjectiveAuditedData,
 } from './types';
@@ -16,6 +17,24 @@ const FIRECRAWL_KEY  = process.env.FIRECRAWL_API_KEY!;
 const PERPLEXITY_KEY = process.env.PERPLEXITY_API_KEY!;
 const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY!;
 const GROK_KEY       = process.env.GROK_API_KEY!;
+const VERCEL_GATEWAY_KEY = process.env.VERCEL_AI_GATEWAY_KEY!;
+
+const VERCEL_GATEWAY_URL = 'https://ai-gateway.vercel.sh/v1/responses';
+
+function extractGrokResponseText(data: unknown): string {
+  const d = data as Record<string, unknown>;
+  const outputs = (d?.output as Array<Record<string, unknown>>) ?? [];
+  if (outputs.length > 0) {
+    const msgOutput = [...outputs].reverse().find((o: Record<string, unknown>) => o.type === 'message');
+    if (msgOutput?.content) {
+      const contentArr = msgOutput.content as Array<{ type: string; text?: string }>;
+      const text = contentArr.find(c => c.type === 'output_text')?.text;
+      if (text) return text;
+    }
+  }
+  const fallback = d as { choices?: Array<{ message: { content: string } }> };
+  return fallback?.choices?.[0]?.message?.content ?? '';
+}
 
 const RESTRICTED_DOMAINS = [
   'instagram.com', 'facebook.com', 'twitter.com', 'x.com', 'tiktok.com',
@@ -1883,11 +1902,19 @@ export async function checkClaudeResponse(claudeResp: unknown, promptData: Promp
 
 export async function generateWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
   const resp = await axios.post(
-    'https://api.x.ai/v1/chat/completions',
-    { model: 'grok-4.20-0309-reasoning', max_tokens: 7000, temperature: 0.3, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }] },
-    { headers: { Authorization: `Bearer ${GROK_KEY}`, 'Content-Type': 'application/json' }, timeout: 300_000 },
+    VERCEL_GATEWAY_URL,
+    {
+      model: 'xai/grok-4.20-0309-reasoning',
+      max_output_tokens: 7000,
+      temperature: 0.3,
+      input: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    },
+    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 300_000 },
   );
-  return resp.data?.choices?.[0]?.message?.content ?? '';
+  return extractGrokResponseText(resp.data);
 }
 
 // ── 13. validateStructure (n8n: "Structural Validator") ──────────────────────
@@ -2210,19 +2237,18 @@ HARD RULES:
   const userContent = `Fact-check this MSN slideshow using the two-phase protocol.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nLast completed season: ${tc.lastSeason}\nCurrent/ongoing season: ${tc.currentSeason}\n\nPrimary Source URL: ${data.primarySourceUrl || 'Not provided'}\n\nARTICLE TO VERIFY\n\n${data.articleText}\n\nRun PHASE 1 first (training-data triage). ONLY call web_search for claims classified NEEDS_SEARCH, hard-capped at 8 calls. Output in the exact format specified, starting with === FACT CHECK ===.`;
 
   const resp = await axios.post(
-    'https://api.x.ai/v1/responses',
+    VERCEL_GATEWAY_URL,
     {
-      model: 'grok-4-fast-non-reasoning',
-      tools: [{ type: 'web_search' }, { type: 'x_search' }],
-      max_output_tokens: 4000,
+      model: 'xai/grok-4.3',
+      tools: [{ type: 'web_search' }],
+      max_output_tokens: 7000,
       temperature: 0.0,
-      prompt_cache_key: 'msn-slideshow-factcheck-v8',
       input: [
         { role: 'system', content: systemContent },
         { role: 'user', content: userContent },
       ],
     },
-    { headers: { Authorization: `Bearer ${GROK_KEY}`, 'Content-Type': 'application/json' }, timeout: 300_000 },
+    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 300_000 },
   );
   return resp.data;
 }
@@ -2468,17 +2494,19 @@ HARD RULES
   const userContent = `Audit this MSN slideshow for compliance AND emit style patches for any mechanical violations.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nExpected content slides: ${data.slideCount}\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE\n\n${data.articleText}\n\nEmit the AUDIT REPORT, SUMMARY, and STYLE PATCHES blocks in that order. Do not regenerate the article.`;
 
   const resp = await axios.post(
-    'https://api.x.ai/v1/chat/completions',
+    VERCEL_GATEWAY_URL,
     {
-      model: 'grok-3-latest', max_tokens: 3500, temperature: 0.0,
-      messages: [
+      model: 'xai/grok-3-latest',
+      max_output_tokens: 3500,
+      temperature: 0.0,
+      input: [
         { role: 'system', content: systemContent },
         { role: 'user',   content: userContent },
       ],
     },
-    { headers: { Authorization: `Bearer ${GROK_KEY}`, 'Content-Type': 'application/json' }, timeout: 180_000 },
+    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 180_000 },
   );
-  return resp.data?.choices?.[0]?.message?.content ?? '';
+  return extractGrokResponseText(resp.data);
 }
 
 // ── 18. extractAuditResults (n8n: "Extract Audit Results") ───────────────────
@@ -2651,8 +2679,62 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
   if (!category) throw new Error('Topic Category is required.');
   if (slideCount < 1 || slideCount > 50) throw new Error(`Slide count ${slideCount} out of range (1-50).`);
 
-  // Parse up to 5 URLs, accepting newline, comma, OR whitespace separation.
-  // Restricted domains are filtered upfront so we don't waste a Firecrawl call.
+  // ── Temporal context (same logic as objective prepareInputAndAnalyze) ──────
+  const now          = new Date();
+  const currentYear  = now.getFullYear();
+  const currentMonth = now.getMonth() + 1;
+
+  type SeasonDef = { currentSeason: string; lastSeason: string; seasonFormat: string };
+  const sportSeasons: Record<string, SeasonDef> = {
+    NFL:    { currentSeason: currentMonth >= 9 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 9 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
+    NBA:    { currentSeason: currentMonth >= 10 ? `${currentYear}-${String(currentYear + 1).slice(2)}` : `${currentYear - 1}-${String(currentYear).slice(2)}`, lastSeason: currentMonth >= 10 ? `${currentYear - 1}-${String(currentYear).slice(2)}` : `${currentYear - 2}-${String(currentYear - 1).slice(2)}`, seasonFormat: 'split_year' },
+    WNBA:   { currentSeason: currentMonth >= 5 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 5 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
+    GOLF:   { currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
+    DEFAULT:{ currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
+  };
+
+  const sportKey    = category.replace('Sports - ', '').toUpperCase();
+  const seasonCtx   = sportSeasons[sportKey] ?? sportSeasons.DEFAULT;
+
+  const temporalContext: TemporalCtx = {
+    today: now.toISOString().split('T')[0],
+    currentYear, currentMonth,
+    ...seasonCtx,
+    dateAnchor:   `Today is ${now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
+    seasonAnchor: `The most recent completed ${sportKey || 'sports'} season is ${seasonCtx.lastSeason}. Current/ongoing season is ${seasonCtx.currentSeason}.`,
+  };
+
+  // ── Format config ─────────────────────────────────────────────────────────
+  const slidesPerEntity = 1; // subjective is always 1 slide per item
+  const entityCount     = slideCount;
+
+  let continuationStyle = 'same_name';
+  if (/\(cont\.?\)/i.test(userContext))     continuationStyle = 'cont';
+  else if (/continued/i.test(userContext))  continuationStyle = 'continued';
+  else if (/part\s*2/i.test(userContext))   continuationStyle = 'part2';
+
+  const formatConfig: FormatConfig = { slidesPerEntity, entityCount, isMultiSlideFormat: false, continuationStyle };
+
+  // ── Title analysis ────────────────────────────────────────────────────────
+  const numberMatch   = title.match(/(\d+)\s+/);
+  const promisedCount = numberMatch ? parseInt(numberMatch[1]) : entityCount;
+  const isRanking     = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
+  const isListicle    = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
+  const isTimeBased   = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
+  const emotionMatch  = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
+
+  const colonSplit     = title.split(/[:–—-]/);
+  const mainAngle      = colonSplit[0].trim();
+  const secondaryAngle = colonSplit.length > 1 ? colonSplit.slice(1).join(' ').trim() : null;
+  const requiresCorrelation = /mock draft|fit\s+(?:with|for)|compare|vs\.?|versus|how\s+\w+\s+(?:helps?|improves?)/i.test(title);
+
+  const titleAnalysis: TitleAnalysis = {
+    promisedCount, isRanking, isListicle, isTimeBased,
+    emotionalPromise: emotionMatch ? emotionMatch[1].toLowerCase() : null,
+    mainAngle, secondaryAngle, requiresCorrelation,
+  };
+
+  // ── URL parsing ───────────────────────────────────────────────────────────
   const preferred = sourcesRaw
     ? sourcesRaw
         .split(/[\n\r,]+/)
@@ -2665,15 +2747,17 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
     : [];
 
   const userPrimaryUrl    = preferred[0] ?? '';
-  const userSecondaryUrls = preferred.slice(1);                  // up to 4 extras
+  const userSecondaryUrls = preferred.slice(1);
 
-  const isPrimaryRestricted = false; // already filtered above; kept for shape
-  const shouldScrapePrimary = !!userPrimaryUrl;
-  const hasUserUrl          = !!userPrimaryUrl;
+  const isPrimaryRestricted  = false;
+  const shouldScrapePrimary  = !!userPrimaryUrl;
+  const hasValidUserSource   = !!userPrimaryUrl;
+  const isUserUrlRestricted  = false; // already filtered above
 
   const mustIncludeItems = parseMustIncludeItems(mustIncludeRaw);
   const hasMustInclude = mustIncludeItems.length > 0;
 
+  // ── Primary query (used by Perplexity research) ───────────────────────────
   const mustIncludeBlock = hasMustInclude
     ? `\nMANDATORY ITEMS — must appear in the final list:\n${mustIncludeItems.map((x, i) => `${i + 1}. ${x}`).join('\n')}\nFill remaining slots (up to ${slideCount} total) with the best-fit entries.`
     : '';
@@ -2688,240 +2772,180 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
   const primaryQuery = `Research this MSN subjective article: "${title}"\nArticle Type: ${articleType}\nTone: ${toneDial}\n\nFor each item find:\n- The core quote, moment, or claim\n- Enough biographical or cultural context to write a compelling slide (who, what, when, where, why, how)\n- 1-2 key facts that give the slide emotional grounding (a year, a career milestone, a record, a relevant event)\n- Why this item resonates with this specific audience\n${mustIncludeBlock}\n${sourceBlock}\n\nReturn EXACTLY ${slideCount} items. Focus on context and resonance over statistical depth.`;
 
   return {
-    title, category, articleType, toneDial, slideCount,
-    writerName, writingStyle, userContext,
-    userPrimaryUrl, userSecondaryUrls,
-    shouldScrapePrimary, hasUserUrl,
-    isPrimaryRestricted,
-    mustIncludeItems, hasMustInclude,
-    primaryQuery, builtInRestricted: SUBJECTIVE_RESTRICTED,
+    // PreparedData fields
+    title, category, slideCount, writerName, userContext, writingStyle,
+    userPrimaryUrl, userSecondaryUrls, hasValidUserSource, isUserUrlRestricted,
+    restrictedDomains: SUBJECTIVE_RESTRICTED, mustIncludeItems,
+    hasMustInclude, temporalContext, formatConfig, titleAnalysis,
+    sourceCount: preferred.length,
     timestamp: new Date().toISOString(),
+    isSports: category.startsWith('Sports'),
+    // SubjectivePreparedData-only fields
+    articleType, toneDial,
+    shouldScrapePrimary, isPrimaryRestricted,
+    primaryQuery, builtInRestricted: SUBJECTIVE_RESTRICTED,
   };
 }
 
-// ── S2. perplexitySubjectiveContext (n8n: two Perplexity context nodes) ───────
+// ── S2. mergeSubjectiveResearch ──────────────────────────────────────────────
+// Adapted from objective mergeResearch — builds the same tiered
+// combinedFactRepresentation from atomized facts + sanitized Perplexity,
+// plus a rawSourceExcerpt (2000 words) for subjective voice/narrative context.
 
-interface PerplexityRawSubjective {
-  choices: Array<{ message: { content: string } }>;
-  citations?: string[];
-}
-
-export async function perplexitySubjectiveContext(data: SubjectivePreparedData): Promise<PerplexityRawSubjective> {
-  const sourceGuided = data.hasUserUrl;
-
-  const systemContent = sourceGuided
-    ? `You are a context researcher for MSN with LIVE web search. Today is ${new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}.
-
-Your role is SUPPORTING — the user has a primary source. Search the web for ADDITIONAL context and depth that enriches each item.
-
-For each item provide:
-- Who: the person/entity and why they matter to this audience
-- What: the core quote, moment, or defining element
-- When: year or time period (only if a real source confirms it)
-- Where: relevant setting or context
-- Why: why this item resonates emotionally for this article's theme
-- How: how the moment or quote unfolded
-
-For quotes: verbatim text as widely appears. Only provide origin context (book, speech, interview) if a real source EXPLICITLY confirms it — never infer or invent.
-
-Do NOT contradict the user's source. Do NOT re-rank items.
-Write PRIMARY SOURCE URL: [user URL] on line 1. SOURCES section at bottom.`
-    : `You are a context researcher for MSN with LIVE web search. Today is ${new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}.
-
-For subjective articles, provide enough Who/What/When/Where/Why/How context per item that a writer can craft an emotionally resonant, specific slide — not a generic one.
-
-For each item:
-- WHO is this person/entity and why do they matter to the audience
-- WHAT is the core content (verbatim quote, defining moment, or central claim)
-- WHEN did the key moment happen (year, era — only if confirmed by a real source)
-- WHERE did it happen (setting, context)
-- WHY does this resonate for the article's specific theme
-- HOW did it unfold (specific episode, game, segment, event)
-
-For quotes: reproduce verbatim as widely appears. Origin (book/speech/interview) only if a real source EXPLICITLY confirms it — never infer.
-Widely attributed quotes are fine — just be honest about attribution confidence.
-
-Write PRIMARY SOURCE URL: [best URL] on line 1. SOURCES section at bottom.`;
-
-  const userContent = sourceGuided
-    ? `Search the web NOW for supporting context.\n\nTitle: "${data.title}"\nArticle Type: ${data.articleType}\nTone: ${data.toneDial}\nUser Primary URL: ${data.userPrimaryUrl}\n\n${data.primaryQuery}\n\nFor EACH item:\nITEM [number]: [name or quote]\n- Who/What/When/Where/Why/How (the Ws most relevant to this specific item)\n- Why it resonates for THIS article's theme specifically\n- Source URL\n\nReturn EXACTLY ${data.slideCount} items.`
-    : `Search the web NOW for medium-depth context.\n\nTitle: "${data.title}"\nArticle Type: ${data.articleType}\nTone: ${data.toneDial}\nCategory: ${data.category}\n\n${data.primaryQuery}\n\nFor EACH item:\nITEM [number]: [name or quote]\n- Who/What/When/Where/Why/How (focus on the Ws most relevant to this specific item)\n- 1-2 grounding facts (year, milestone, record, cultural moment)\n- Why it resonates for THIS article's theme\n- Source URL\n\nReturn EXACTLY ${data.slideCount} items. Prioritise context and emotional resonance.`;
-
-  try {
-    const resp = await axios.post(
-      'https://api.perplexity.ai/chat/completions',
-      {
-        model: 'sonar',
-        messages: [
-          { role: 'system', content: systemContent },
-          { role: 'user',   content: userContent },
-        ],
-        max_tokens: 2500,
-        return_citations: true,
-        return_related_questions: false,
-        temperature: 0.2,
-      },
-      { headers: { Authorization: `Bearer ${PERPLEXITY_KEY}`, 'Content-Type': 'application/json' }, timeout: 90_000 },
-    );
-    return resp.data;
-  } catch (err: unknown) {
-    if (axios.isAxiosError(err)) {
-      console.error(`[perplexitySubjectiveContext] HTTP ${err.response?.status}: ${JSON.stringify(err.response?.data ?? err.message)}`);
-    }
-    return { choices: [{ message: { content: '' } }], citations: [] };
-  }
-}
-
-// ── Lightweight fact synthesis from scraped markdown (for subjective pipeline) ──
-// The subjective pipeline doesn't run atomizeFacts, but lightSanitizePerplexity
-// needs entity names + numbers to strip conflicting stats. This scans section
-// headers in the scraped markdown and extracts numbers within each section into
-// a minimal AtomizedFact[] shape — just enough for the sanitizer to work.
-
-function synthesizeFactsFromScrape(scrapedContent: string): AtomizedFact[] {
-  if (!scrapedContent || scrapedContent.length < 50) return [];
-
-  // Split on markdown headers, bold names, or numbered items
-  const sections = scrapedContent.split(/\n(?=#{1,3}\s+[A-Z]|\*\*[A-Z]|\d{1,3}[.)]\s+[A-Z])/);
-  const facts: AtomizedFact[] = [];
-  let itemNumber = 0;
-
-  for (const section of sections) {
-    const firstLine = section.split('\n')[0]?.trim() ?? '';
-    let name = firstLine
-      .replace(/^#{1,3}\s*/, '')
-      .replace(/^\d{1,3}[.)]\s*/, '')
-      .replace(/\*\*/g, '')
-      .replace(/\[.*?\]/g, '')
-      .trim();
-
-    // Take first segment before common separators (em-dash, colon, pipe)
-    const sepIdx = name.search(/[—–:|]/);
-    if (sepIdx > 3) name = name.slice(0, sepIdx).trim();
-    if (!name || name.length < 3 || name.length > 80) continue;
-
-    itemNumber++;
-    const nums = section.match(/\d+(?:,\d{3})*(?:\.\d+)?/g) || [];
-    const factEntries = nums.map(n => ({ type: 'STAT', value: n }));
-
-    facts.push({
-      itemNumber,
-      itemName: name,
-      facts: factEntries,
-      rawContent: section.slice(0, 500),
-    });
-  }
-
-  return facts;
-}
-
-// ── S3. mergeSubjectiveContext (n8n: "Merge Context") ─────────────────────────
-
-export async function mergeSubjectiveContext(
-  data: SubjectivePreparedData,
-  primaryMarkdown: string,
-  additionalMarkdowns: string[],
-  perplexityResp: PerplexityRawSubjective,
+export async function mergeSubjectiveResearch(
+  data: ResearchedData,
+  retryResp?: PerplexityRaw,
+  primaryMarkdown?: string,
 ): Promise<SubjectiveMergedData> {
-  function truncate(text: string, maxWords: number): string {
-    if (!text) return '';
-    const words = text.split(/\s+/);
-    return words.length > maxWords ? words.slice(0, maxWords).join(' ') + '\n[truncated]' : text;
+  let answer    = data.perplexityAnswer;
+  let citations = data.perplexityCitations;
+
+  if (retryResp) {
+    const retryAnswer    = retryResp?.choices?.[0]?.message?.content ?? '';
+    const retryCitations = retryResp?.citations ?? [];
+    if (retryAnswer.length > answer.length) {
+      answer    = retryAnswer;
+      citations = retryCitations.length > citations.length ? retryCitations : citations;
+    }
   }
 
-  const perplexityAnswer = perplexityResp?.choices?.[0]?.message?.content ?? '';
-  const citations        = perplexityResp?.citations ?? [];
+  const primaryMatch      = answer.match(/PRIMARY SOURCE URL:\s*(https?:\/\/[^\s\n]+)/i);
+  const perplexityPrimary = primaryMatch ? primaryMatch[1].trim() : '';
+  const primarySourceUrl  = data.userPrimaryUrl || perplexityPrimary || citations[0] || '';
 
-  // Primary gets a bigger budget; extras share a budget so the prompt doesn't
-  // explode when the user provides 5 URLs.
-  const scraped1     = truncate(primaryMarkdown, 1200);
-  const scrapedExtras = additionalMarkdowns.map((md, i) => truncate(md, i === 0 ? 900 : 500));
-
-  // ═══ Sanitize Perplexity against scraped-source entities (same logic as objective) ═══
-  // Synthesize minimal entity→numbers map from raw scraped content, then strip
-  // conflicting stats so Claude can't accidentally use Perplexity numbers when
-  // TIER 1A has the real data.
-  const allScrapedForSanitize = [primaryMarkdown, ...additionalMarkdowns].filter(Boolean).join('\n\n');
-  const synthesizedFacts = synthesizeFactsFromScrape(allScrapedForSanitize);
-  const { sanitized: sanitizedPerplexity, stats: sanitizationStats } =
-    lightSanitizePerplexity(perplexityAnswer, synthesizedFacts, data.userContext ?? '');
-  console.log(`[mergeSubjectiveContext] Perplexity sanitization: ${JSON.stringify(sanitizationStats)}`);
-  const perplexityTruncated = truncate(sanitizedPerplexity, 1000);
-  const sourceList = citations.map((u, i) => `[${i + 1}] ${u}`).join('\n');
-  const wordCount  = perplexityAnswer.split(/\s+/).filter(Boolean).length;
-
+  const userSourceContent  = data.sourceAnalysis?.scrapedContent ?? '';
   const userContextContent = data.userContext ?? '';
-  const hasScrapedSource = scraped1.length > 100 || scrapedExtras.some(s => s.length > 100);
-  const hasUserContextFlag = userContextContent.length > 50;
+  const alignScore         = data.sourceAnalysis?.alignmentScore ?? 0;
 
-  let sourceQuality: SubjectiveMergedData['sourceQuality'];
-  if (hasScrapedSource && hasUserContextFlag) sourceQuality = 'COMPREHENSIVE';
-  else if (hasScrapedSource || hasUserContextFlag) sourceQuality = 'PARTIAL';
-  else sourceQuality = 'MINIMAL';
-
-  let finalContext = '';
-
-  // Tier header
-  if (sourceQuality === 'COMPREHENSIVE') {
-    finalContext += 'SOURCE QUALITY: COMPREHENSIVE — Scraped source + user context available.\nTIER 1A and TIER 1B are your ONLY fact sources. TIER 2 is for tone/framing only.\n\n';
-  } else if (sourceQuality === 'PARTIAL') {
-    finalContext += 'SOURCE QUALITY: PARTIAL — Some direct source material available.\nUse TIER 1A/1B for all covered items. TIER 2 may fill gaps for uncovered items only.\n\n';
+  let sourceQuality: string;
+  if ([userSourceContent, userContextContent].filter(Boolean).join('\n').length > 2000 && alignScore >= 60) {
+    sourceQuality = 'COMPREHENSIVE';
+  } else if ([userSourceContent, userContextContent].filter(Boolean).join('\n').length > 500 || alignScore >= 35) {
+    sourceQuality = 'PARTIAL';
   } else {
-    finalContext += 'SOURCE QUALITY: MINIMAL — No scraped source. TIER 1B (user context) is primary if present, then TIER 2.\n\n';
+    sourceQuality = 'MINIMAL';
   }
 
-  // Tier 1A — scraped sources (primary + up to 4 extras)
-  if (hasScrapedSource) {
-    finalContext += '## TIER 1A: SCRAPED SOURCE — HIGHEST FACT AUTHORITY\nEvery quote, name, date, achievement, and detail from here overrides all other tiers.\n\n';
-    if (scraped1) finalContext += '### Primary URL: ' + (data.userPrimaryUrl || 'N/A') + '\n' + scraped1 + '\n\n';
-    scrapedExtras.forEach((md, i) => {
-      if (md.length > 0) {
-        const url = data.userSecondaryUrls[i] || 'N/A';
-        const label = i === 0 ? 'Secondary URL' : `Source ${i + 2} URL`;
-        finalContext += '### ' + label + ': ' + url + '\n' + md + '\n\n';
+  const { sanitized: sanitizedPerplexity, stats: sanitizationStats } =
+    lightSanitizePerplexity(answer, data.atomizedFacts, userContextContent);
+
+  // ═══ BUILD FACT DATABASE (same structure as objective mergeResearch) ═══
+  let combinedFactRepresentation = '';
+
+  combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+  combinedFactRepresentation += 'FACT DATABASE — READ THESE RULES BEFORE WRITING\n';
+  combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+
+  if (sourceQuality === 'COMPREHENSIVE') {
+    combinedFactRepresentation += 'SOURCE QUALITY: COMPREHENSIVE\n\n';
+    combinedFactRepresentation += 'TIER 1A is your FACT AUTHORITY — the source of truth for numbers, names, dates, rankings, achievements, and quotes. Treat it as a reference, not a template. The facts are yours to use; the phrasing is not. Build each sentence fresh, then verify the facts against Tier 1A afterward.\n\n';
+    combinedFactRepresentation += 'TIER 1B (User Context) provides ADDITIONAL authoritative facts and writer instructions. Use the facts. Follow the instructions. Never write a TIER 1B instruction into a slide as if it were content.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity supplementary context) provides tone, mood, historical framing, and subjective angles — at MOST 35% of your contextual material. It is NOT a fact source. Numbers, quotes, and recent claims in TIER 2 have been lightly stripped where they conflict with TIER 1A/1B. Do NOT pull stats, dates, or quotes from TIER 2.\n\n';
+    combinedFactRepresentation += 'If TIER 1A and TIER 2 disagree on anything factual, TIER 1A wins. Always.\n\n';
+  } else if (sourceQuality === 'PARTIAL') {
+    combinedFactRepresentation += 'SOURCE QUALITY: PARTIAL\n\n';
+    combinedFactRepresentation += 'TIER 1A is your FACT AUTHORITY for items it covers. Treat it as a reference, not a template — use its facts, write your own sentences.\n\n';
+    combinedFactRepresentation += 'TIER 1B (User Context) provides additional authoritative facts and writer instructions. Use the facts. Follow the instructions.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity) provides tone, framing, and subjective context. For items NOT in TIER 1A or 1B, TIER 2 may also serve as a fact source (mark such facts with [P]). For items IN TIER 1A or 1B, TIER 2 is framing-only — at MOST 35% of contextual material.\n\n';
+  } else {
+    combinedFactRepresentation += 'SOURCE QUALITY: MINIMAL\n\n';
+    combinedFactRepresentation += 'TIER 1B (User Context), if present, is your primary authoritative fact source and provides writer instructions.\n\n';
+    combinedFactRepresentation += 'TIER 2 (Perplexity) is your secondary fact source for items not covered by TIER 1B. Use facts from TIER 2 where TIER 1B is silent.\n\n';
+  }
+
+  // TIER 1A — Fact Authority (atomized facts)
+  if (data.factOnlyRepresentation || userSourceContent) {
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+    combinedFactRepresentation += 'TIER 1A: FACT AUTHORITY\n';
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+
+    if (sourceQuality === 'COMPREHENSIVE') {
+      if (data.factOnlyRepresentation) {
+        combinedFactRepresentation += data.factOnlyRepresentation + '\n\n';
       }
-    });
+      combinedFactRepresentation += '[Note: Raw source prose is intentionally not included. CONTEXT lines (where present) supply non-numeric facts (current team, draft, position, status) the regex extractors may have missed — treat CONTEXT as a fact reference only. Do NOT mirror its phrasing, do NOT copy its sentence structure. Construct every sentence from scratch using the facts above.]\n\n';
+    } else if (sourceQuality === 'PARTIAL') {
+      if (data.factOnlyRepresentation) {
+        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
+      }
+      if (userSourceContent) {
+        const trimmedSections = userSourceContent
+          .split(/(?=##?\s*\d+[.):]?\s*)/)
+          .map(section => {
+            if (section.length <= 800) return section;
+            return section.substring(0, 800) + '\n[section trimmed — for item identification only, not for phrasing reference]';
+          })
+          .join('\n\n');
+        combinedFactRepresentation += '### Source Snippets (for item identification only, not for phrasing reference)\n' + trimmedSections + '\n\n';
+      }
+    } else {
+      if (data.factOnlyRepresentation) {
+        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
+      }
+      if (userSourceContent) {
+        combinedFactRepresentation += '### Full Source Text\n' + userSourceContent + '\n\n';
+      }
+    }
   }
 
-  // Tier 1B — user context
-  if (hasUserContextFlag) {
-    finalContext += '## TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA (USE ACTIVELY)\nThe writer pasted this directly. It may contain quotes, facts, angles, emphasis instructions, and context.\nRules: Use every fact/quote here in the relevant slide. Follow any instructions as directives.\nIf TIER 1B contradicts a specific detail in TIER 1A, TIER 1A wins. Otherwise TIER 1B stands as fact.\n\n';
-    finalContext += userContextContent + '\n\n';
+  // TIER 1B — User Context
+  if (userContextContent) {
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+    combinedFactRepresentation += 'TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA & INSTRUCTIONS\n';
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+    combinedFactRepresentation += 'This was provided directly by the writer. It contains BOTH facts (to use as data) AND instructions (to follow as directives).\n';
+    combinedFactRepresentation += '• DATA (stats, names, dates) → use as facts in relevant slides\n';
+    combinedFactRepresentation += '• INSTRUCTIONS (tone, emphasis, formatting) → follow as directives, never quote into slide content\n';
+    combinedFactRepresentation += '• If TIER 1B contradicts a specific number in TIER 1A, TIER 1A wins. Otherwise TIER 1B stands.\n\n';
+    combinedFactRepresentation += userContextContent + '\n\n';
   }
 
-  // Tier 2 — Perplexity (demoted based on source quality)
-  if (sourceQuality === 'COMPREHENSIVE') {
-    finalContext += '## TIER 2: PERPLEXITY CONTEXT — TONE & FRAMING ONLY, 35% MAX (ZERO FACTS FROM HERE)\nUse ONLY for: understanding why something matters, emotional framing, audience context, cultural background.\nNEVER use for: specific quotes, dates, stats, achievements, or factual claims.\nStats that conflicted with TIER 1A have been replaced with [STAT] — do not invent values for those placeholders.\nTIER 2 should inform AT MOST 35% of your contextual material. The bulk of every slide comes from TIER 1A/1B.\n\n';
-  } else if (sourceQuality === 'PARTIAL') {
-    finalContext += '## TIER 2: PERPLEXITY CONTEXT — SUPPLEMENTARY, 35% MAX (for items NOT covered by TIER 1A/1B)\nFor items WITH TIER 1A/1B data: ignore this section for that item.\nFor items WITHOUT TIER 1A/1B data: you may use facts below.\nStats that conflicted with TIER 1A have been replaced with [STAT] — do not invent values for those placeholders.\nTIER 2 should inform AT MOST 35% of contextual material.\n\n';
-  } else {
-    finalContext += '## TIER 2: PERPLEXITY CONTEXT — SECONDARY DATA SOURCE\nNo scraped source available. Use alongside TIER 1B (if present) as your research base.\n\n';
+  // TIER 2 — Perplexity
+  if (sanitizedPerplexity) {
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n';
+    combinedFactRepresentation += 'TIER 2: SUPPLEMENTARY TONE & CONTEXT (35% WEIGHT MAX)\n';
+    combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
+
+    if (sourceQuality === 'COMPREHENSIVE' || sourceQuality === 'PARTIAL') {
+      combinedFactRepresentation += 'Use this section for tone, mood, historical framing, comparisons across eras, why something matters in the broader category, and subjective takes. Do NOT pull numbers, dates, recent claims, or quotes from here. Stats that conflicted with TIER 1A/1B have been replaced with [STAT].\n';
+      combinedFactRepresentation += 'This should inform AT MOST 35% of your contextual material. The bulk of every slide comes from TIER 1A/1B facts.\n\n';
+    } else {
+      combinedFactRepresentation += 'For items not covered by TIER 1B, you may use facts from this section. Stats that conflicted with TIER 1B have been replaced with [STAT].\n\n';
+    }
+
+    combinedFactRepresentation += sanitizedPerplexity + '\n\n';
   }
-  finalContext += perplexityTruncated + '\n\n';
-  finalContext += '=== ALL CITATION URLS ===\n' + (sourceList || '(no citations returned)');
 
-  // Cap total context size at ~3500 words
-  const allWords = finalContext.split(/\s+/);
-  const cappedContext = allWords.length > 3500
-    ? allWords.slice(0, 3500).join(' ') + '\n[context capped]'
-    : finalContext;
+  const sourceList = citations.map((url, i) => `[${i + 1}] ${url}`).join('\n');
 
-  const primarySourceUrl = data.hasUserUrl ? data.userPrimaryUrl : (citations[0] ?? '');
+  // Raw source excerpt for subjective voice/narrative context (2000-word cap)
+  const rawSourceExcerpt = primaryMarkdown
+    ? (() => {
+        const words = primaryMarkdown.split(/\s+/);
+        return words.length > 2000
+          ? words.slice(0, 2000).join(' ') + '\n[truncated]'
+          : primaryMarkdown;
+      })()
+    : '';
+
+  console.log(`[mergeSubjectiveResearch] Perplexity sanitization: ${sanitizationStats.statPlaceholders} stats replaced, ${sanitizationStats.quotesRemoved} quotes removed, ${sanitizationStats.entitiesTracked} entities tracked`);
 
   return {
     ...data,
-    perplexityAnswer, citations,
-    primaryScraped: primaryMarkdown,
-    additionalScraped: additionalMarkdowns,
-    finalContext: cappedContext, sourceList,
-    allCitationsCount: citations.length, primarySourceUrl,
+    perplexityAnswer:    answer,
+    combinedFactRepresentation,
+    primarySourceUrl,
+    citations,
+    sourceList,
+    researchWordCount: answer.split(/\s+/).length,
+    researchOk: answer.length > 500 && citations.length >= 2,
+    hasUserSource: !!(userSourceContent || data.factOnlyRepresentation),
+    hasUserContext: !!userContextContent,
     sourceQuality,
-    contextWordCount: Math.min(allWords.length, 3500),
-    scraped1Ok: scraped1.length > 100,
-    scraped2Ok: scrapedExtras.some(s => s.length > 100),
-    hasScrapedSource, hasUserContextFlag,
-    researchOk: wordCount > 150 || scraped1.length > 200,
-  };
+    alignmentScore: alignScore,
+    perplexitySanitizationStats: sanitizationStats,
+    rawSourceExcerpt,
+  } as unknown as SubjectiveMergedData;
 }
 
 // ── S4. buildSubjectivePrompt (n8n: inlined in "Claude - Subjective Writer") ──
@@ -3191,7 +3215,7 @@ Always produce the full slideshow. No exceptions. Never write 'I cannot' or any 
     ? `\n\nMANDATORY ITEMS — these override the scraped source's item list (non-negotiable):\n${data.mustIncludeItems.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nEvery mandatory item MUST get its own slide, even if it does not appear in TIER 1A. Do NOT substitute any with a different item from the source. Fill remaining slots (up to ${data.slideCount} total) with the best-fit entries.`
     : '';
 
-  const claudeUserPrompt = `SOURCE DATA — write from this:\n\n${data.finalContext}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
+  const claudeUserPrompt = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${data.combinedFactRepresentation}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
 
   return { ...data, claudeSystemPrompt, claudeUserPrompt };
 }
@@ -3274,19 +3298,19 @@ export async function checkSubjectiveClaudeResponse(claudeResp: unknown, promptD
 
 export async function generateSubjectiveWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
   const resp = await axios.post(
-    'https://api.x.ai/v1/chat/completions',
+    VERCEL_GATEWAY_URL,
     {
-      model: 'grok-4-fast-non-reasoning',
-      max_tokens: 5000,
+      model: 'xai/grok-4-fast-non-reasoning',
+      max_output_tokens: 5000,
       temperature: 0.4,
-      messages: [
+      input: [
         { role: 'system', content: systemPrompt },
         { role: 'user',   content: userPrompt },
       ],
     },
-    { headers: { Authorization: `Bearer ${GROK_KEY}`, 'Content-Type': 'application/json' }, timeout: 120_000 },
+    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 120_000 },
   );
-  return resp.data?.choices?.[0]?.message?.content ?? '';
+  return extractGrokResponseText(resp.data);
 }
 
 // ── S8. validateSubjective (n8n: "Validate Output - Subjective") ──────────────
@@ -3508,19 +3532,19 @@ HARD RULES FOR PATCHES
 
   try {
     const resp = await axios.post(
-      'https://api.x.ai/v1/chat/completions',
+      VERCEL_GATEWAY_URL,
       {
-        model: 'grok-4-fast-non-reasoning',
-        max_tokens: 8000,
+        model: 'xai/grok-4-fast-non-reasoning',
+        max_output_tokens: 8000,
         temperature: 0.0,
-        messages: [
+        input: [
           { role: 'system', content: systemContent },
           { role: 'user',   content: userContent },
         ],
       },
-      { headers: { Authorization: `Bearer ${GROK_KEY}`, 'Content-Type': 'application/json' }, timeout: 240_000 },
+      { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 240_000 },
     );
-    return resp.data?.choices?.[0]?.message?.content ?? '';
+    return extractGrokResponseText(resp.data);
   } catch (err: unknown) {
     if (axios.isAxiosError(err)) {
       console.error(`[grokSubjectiveStyleAudit] HTTP ${err.response?.status}: ${JSON.stringify(err.response?.data ?? err.message)}`);

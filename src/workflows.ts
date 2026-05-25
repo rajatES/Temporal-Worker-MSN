@@ -41,8 +41,7 @@ const {
   finalAssembly,
   enrichSlides,
   prepareInputSubjective,
-  perplexitySubjectiveContext,
-  mergeSubjectiveContext,
+  mergeSubjectiveResearch,
   buildSubjectivePrompt,
   generateSubjectiveWithClaude,
   checkSubjectiveClaudeResponse,
@@ -456,18 +455,84 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     const totalScraped = primaryMarkdown.length + additionalMarkdowns.reduce((s, m) => s + m.length, 0);
     complete('scraping_source', totalScraped > 0 ? `${totalScraped} chars across ${1 + additionalMarkdowns.filter(Boolean).length} source(s)` : 'no source scraped');
 
-    // Stage 3: Perplexity context research
-    activate('researching');
-    const perplexityResp = await perplexitySubjectiveContext(prepared);
-    complete('researching', `${perplexityResp.citations?.length ?? 0} citations`);
+    // Stage 3: source alignment analysis (reuse objective activities)
+    activate('analyzing');
+    let sourcedData;
+    if (prepared.hasValidUserSource) {
+      sourcedData = await analyzeSourceAlignment(prepared as any, primaryMarkdown, additionalMarkdowns);
+    } else {
+      sourcedData = await buildResearchStrategy(prepared as any);
+    }
+    complete('analyzing', `alignment ${sourcedData.sourceAnalysis.alignmentScore}/100 · ${sourcedData.sourceAnalysis.status}`);
 
-    // Stage 4: merge tiers
+    // Stage 4: fact atomization (reuse objective activity)
+    activate('atomizing');
+    const atomizedData = await atomizeFacts(sourcedData as any);
+    complete('atomizing', `${atomizedData.atomizationStats.itemsProcessed} items · ${atomizedData.atomizationStats.totalFacts} facts`);
+
+    // Stage 5: Perplexity research + retry + merge
+    activate('researching');
+    const needsDeep =
+      atomizedData.slideCount >= 15 ||
+      (atomizedData as any).mustIncludeItems?.length >= 8 ||
+      !atomizedData.hasValidUserSource ||
+      (atomizedData as any).titleAnalysis?.requiresCorrelation;
+
+    const emptyPerplexity = { choices: [{ message: { content: '' } }], citations: [] };
+    let perplexityRaw;
+    try {
+      perplexityRaw = needsDeep
+        ? await perplexityDeepResearch(atomizedData as any)
+        : await perplexityStandardResearch(atomizedData as any);
+    } catch {
+      warn('researching', 'Perplexity research failed — continuing with source material only');
+      perplexityRaw = emptyPerplexity;
+    }
+
+    const researchedData = await validateRetry(atomizedData as any, perplexityRaw);
+
+    let merged;
+    if (researchedData.needsRetry) {
+      let retryRaw;
+      try {
+        retryRaw = await perplexityRetryResearch(atomizedData as any);
+      } catch {
+        warn('researching', 'Perplexity retry failed — continuing without retry data');
+        retryRaw = emptyPerplexity;
+      }
+      merged = await mergeSubjectiveResearch(researchedData as any, retryRaw, primaryMarkdown);
+    } else {
+      merged = await mergeSubjectiveResearch(researchedData as any, undefined, primaryMarkdown);
+    }
+    complete('researching', `${merged.researchWordCount} words · ${merged.citations.length} citations`);
+
+    // Stage 6: citation scraping
+    activate('scraping_citations');
+    const skipDomains = [
+      'twitter.com', 'x.com', 'reddit.com', 'facebook.com', 'instagram.com',
+      'tiktok.com', 'pinterest.com', 'quora.com', 'youtube.com', 'youtu.be',
+      'nytimes.com', 'wsj.com', 'bloomberg.com', 'theathletic.com', 'linkedin.com',
+    ];
+    function pickCitationSubj(citations: string[], primary: string, skip: string[]): string {
+      const excluded = [...skipDomains, ...skip];
+      return citations.find(
+        u => u?.startsWith('http') && u !== primary && !excluded.some(d => u.toLowerCase().includes(d))
+      ) ?? 'https://www.espn.com';
+    }
+    const cite1Url = pickCitationSubj(merged.citations, merged.primarySourceUrl, []);
+    const cite2Url = pickCitationSubj(merged.citations, merged.primarySourceUrl, [cite1Url]);
+    let cite1Markdown = '';
+    let cite2Markdown = '';
+    try { cite1Markdown = await firecrawlScrape(cite1Url); } catch { /* skip */ }
+    try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip */ }
+    complete('scraping_citations', `${cite1Url.split('/')[2]} + ${cite2Url.split('/')[2]}`);
+
+    // Stage 7: build prompt
     activate('building_prompt');
-    const merged = await mergeSubjectiveContext(prepared, primaryMarkdown, additionalMarkdowns, perplexityResp);
-    const prompted = await buildSubjectivePrompt(merged);
+    const prompted = await buildSubjectivePrompt(merged as any);
     complete('building_prompt', `source quality: ${merged.sourceQuality}`);
 
-    // Stage 5: generate (Claude → Grok fallback)
+    // Stage 8: generate (Claude → Grok fallback)
     activate('generating', 'Calling Claude…');
     let generated;
     try {
@@ -510,12 +575,12 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     }
     complete('generating', `Generated by ${generated.generatedBy}`);
 
-    // Stage 6: validate structure
+    // Stage 9: validate structure
     activate('validating');
-    const validated = await validateSubjective(generated);
+    const validated = await validateSubjective(generated as any);
     complete('validating', `${validated.slideResults.length} slides · ${validated.errors.length} errors · ${validated.warnings.length} warnings`);
 
-    // Stage 7: Grok style audit
+    // Stage 10: Grok style audit
     activate('auditing', 'Running Grok style audit…');
     let audited;
     try {
@@ -527,12 +592,12 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     }
     complete('auditing', audited.wasAudited ? 'Audited' : 'Skipped');
 
-    // Stage 8: final assembly
+    // Stage 11: final assembly
     activate('creating_docs', 'Assembling output…');
     const final = await finalAssemblySubjective(audited);
     complete('creating_docs', `score ${final.qualityScore}/100`);
 
-    // Stage 9: Slide enrichment (Claude Haiku structured-field extraction)
+    // Stage 12: Slide enrichment (Claude Haiku structured-field extraction)
     activate('enriching', 'Extracting image search fields…');
     const parsedForEnrich = parseSlides(audited.articleText)
       .filter(s => s.slideNum > 1)

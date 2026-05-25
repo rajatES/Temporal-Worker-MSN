@@ -258,47 +258,59 @@ export interface AuditedData extends VerifiedData {
 }
 
 // ── Subjective pipeline data types ────────────────────────────────────────────
+// Aligned with objective pipeline: same data-processing backbone
+// (alignment → atomization → structured research → merge), subjective-unique
+// voice/style/tone preserved in prompt building and generation.
 
-export interface SubjectivePreparedData {
-  title: string;
-  category: string;
+export interface SubjectivePreparedData extends PreparedData {
   articleType: string;
   toneDial: string;
-  slideCount: number;
-  writerName: string;
-  writingStyle: string;
-  userContext: string;
-  userPrimaryUrl: string;
-  userSecondaryUrls: string[];           // up to 4 additional URLs (5 total)
   shouldScrapePrimary: boolean;
-  hasUserUrl: boolean;
   isPrimaryRestricted: boolean;
-  mustIncludeItems: string[];
-  hasMustInclude: boolean;
   primaryQuery: string;
   builtInRestricted: string[];
-  timestamp: string;
 }
 
-export interface SubjectiveResearchedData extends SubjectivePreparedData {
+export interface SubjectiveSourcedData extends SubjectivePreparedData {
+  sourceAnalysis: SourceAnalysis;
+  preferredDomains?: string[];
+}
+
+export interface SubjectiveAtomizedData extends SubjectiveSourcedData {
+  atomizedFacts: AtomizedFact[];
+  factOnlyRepresentation: string;
+  sourceSignatures: string[];
+  atomizationStats: { itemsProcessed: number; totalFacts: number };
+}
+
+export interface SubjectiveResearchedData extends SubjectiveAtomizedData {
   perplexityAnswer: string;
-  citations: string[];
-  primaryScraped: string;
-  additionalScraped: string[];           // markdown for each userSecondaryUrls entry
+  perplexityCitations: string[];
+  perplexityWordCount: number;
+  needsRetry: boolean;
+  retryReason: string | null;
+  hadSoftRefusal: boolean;
 }
 
 export interface SubjectiveMergedData extends SubjectiveResearchedData {
-  finalContext: string;
-  sourceList: string;
-  allCitationsCount: number;
+  combinedFactRepresentation: string;
   primarySourceUrl: string;
-  sourceQuality: 'COMPREHENSIVE' | 'PARTIAL' | 'MINIMAL';
-  contextWordCount: number;
-  scraped1Ok: boolean;
-  scraped2Ok: boolean;
-  hasScrapedSource: boolean;
-  hasUserContextFlag: boolean;
+  citations: string[];
+  sourceList: string;
+  researchWordCount: number;
   researchOk: boolean;
+  hasUserSource: boolean;
+  hasUserContext: boolean;
+  sourceQuality: string;
+  alignmentScore: number;
+  perplexitySanitizationStats?: {
+    originalLength: number;
+    sanitizedLength: number;
+    statPlaceholders: number;
+    quotesRemoved: number;
+    entitiesTracked: number;
+  };
+  rawSourceExcerpt: string;
 }
 
 export interface SubjectivePromptData extends SubjectiveMergedData {
@@ -410,13 +422,16 @@ export const STAGE_DEFS: Array<{ id: string; label: string }> = [
   { id: 'complete',          label: 'Done' },
 ];
 
-// Subjective pipeline is shorter — no fact atomization, no fact verification,
-// no citation scraping. Reuses the same IDs the UI's ProgressTracker knows.
+// Subjective pipeline — aligned with objective data-processing backbone,
+// but keeps subjective voice/style and skips fact verification + human pauses.
 export const STAGE_DEFS_SUBJECTIVE: Array<{ id: string; label: string }> = [
   { id: 'parsing',           label: 'Parsing input' },
   { id: 'scraping_source',   label: 'Scraping source' },
+  { id: 'analyzing',         label: 'Analyzing alignment' },
+  { id: 'atomizing',         label: 'Extracting facts' },
   { id: 'researching',       label: 'Researching context' },
-  { id: 'building_prompt',   label: 'Merging context' },
+  { id: 'scraping_citations',label: 'Scraping citations' },
+  { id: 'building_prompt',   label: 'Building prompt' },
   { id: 'generating',        label: 'Generating article' },
   { id: 'validating',        label: 'Validating structure' },
   { id: 'auditing',          label: 'Style audit (Grok)' },
