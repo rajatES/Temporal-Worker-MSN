@@ -47,7 +47,6 @@ const {
   checkSubjectiveClaudeResponse,
   generateSubjectiveWithGrok,
   validateSubjective,
-  grokSubjectiveStyleAudit,
   extractSubjectiveAudit,
   finalAssemblySubjective,
 } = proxyActivities<typeof activities>({
@@ -64,6 +63,7 @@ const {
   grokAuditAndVerify: grokAuditLong,
   generateWithGrok: grokLong,
   grokFactCheck: grokFactCheckLong,
+  grokSubjectiveStyleAudit: grokSubjectiveStyleAuditLong,
 } = proxyActivities<typeof activities>({
   startToCloseTimeout: '8 minutes',
   retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2, maximumInterval: '60s' },
@@ -584,7 +584,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     activate('auditing', 'Running Grok style audit…');
     let audited;
     try {
-      const grokAuditText = await grokSubjectiveStyleAudit(validated);
+      const grokAuditText = await grokSubjectiveStyleAuditLong(validated);
       audited = await extractSubjectiveAudit(validated, grokAuditText);
     } catch {
       warn('auditing', 'Grok audit failed — using original article');

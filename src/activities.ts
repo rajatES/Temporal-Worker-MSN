@@ -3549,7 +3549,7 @@ HARD RULES FOR PATCHES
     if (axios.isAxiosError(err)) {
       console.error(`[grokSubjectiveStyleAudit] HTTP ${err.response?.status}: ${JSON.stringify(err.response?.data ?? err.message)}`);
     }
-    return '';
+    throw err;
   }
 }
 
