@@ -1904,7 +1904,7 @@ export async function generateWithGrok(systemPrompt: string, userPrompt: string)
   const resp = await axios.post(
     VERCEL_GATEWAY_URL,
     {
-      model: 'xai/grok-4.20-0309-reasoning',
+      model: 'xai/grok-4.3',
       max_output_tokens: 7000,
       temperature: 0.3,
       input: [
@@ -3300,7 +3300,7 @@ export async function generateSubjectiveWithGrok(systemPrompt: string, userPromp
   const resp = await axios.post(
     VERCEL_GATEWAY_URL,
     {
-      model: 'xai/grok-4-fast-non-reasoning',
+      model: 'xai/grok-4.3',
       max_output_tokens: 5000,
       temperature: 0.4,
       input: [
@@ -3534,7 +3534,7 @@ HARD RULES FOR PATCHES
     const resp = await axios.post(
       VERCEL_GATEWAY_URL,
       {
-        model: 'xai/grok-4-fast-non-reasoning',
+        model: 'xai/grok-4.3',
         max_output_tokens: 8000,
         temperature: 0.0,
         input: [
