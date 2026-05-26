@@ -211,6 +211,29 @@ export function applyAuditPatches(article: string, patches: AuditPatch[]): { res
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// parseWordCountOverride — detect explicit word-count instructions in userContext
+// e.g. "40-45 words only", "max 40 words", "keep it under 45 words"
+// ─────────────────────────────────────────────────────────────────────────────
+
+function parseWordCountOverride(userContext: string): { min: number; max: number } | undefined {
+  if (!userContext) return undefined;
+  const lower = userContext.toLowerCase();
+  let m: RegExpMatchArray | null;
+  // "40-45 words" or "40 to 45 words"
+  m = lower.match(/(\d{2,3})\s*(?:[-–—]|to)\s*(\d{2,3})\s*words/);
+  if (m && m[1] && m[2]) return { min: parseInt(m[1]), max: parseInt(m[2]) };
+  // "max 45 words" / "under 45 words" / "no more than 45 words"
+  m = lower.match(/(?:max|maximum|under|no more than|at most|limit)\s*(\d{2,3})\s*words/);
+  if (m) return { min: Math.max(20, parseInt(m[1]) - 10), max: parseInt(m[1]) };
+  // "45 words max" / "45 words only" / "45 words or less"
+  m = lower.match(/(\d{2,3})\s*words?\s*(?:max|maximum|limit|only|or less)/);
+  if (m) return { min: Math.max(20, parseInt(m[1]) - 10), max: parseInt(m[1]) };
+  // "keep it to 40 words" / "around 40 words"
+  m = lower.match(/(?:keep|aim|target|around|approximately|about)\s*(?:it\s*)?(?:to\s*)?(\d{2,3})\s*words/);
+  if (m) { const n = parseInt(m[1]); return { min: Math.max(20, n - 5), max: n + 5 }; }
+  return undefined;
+}
+
 // parseMustIncludeItems — robust extraction of must-include items from any
 // user-supplied format: markdown tables, numbered/bulleted lists, plain lines,
 // or mixed. Strips source rank numbers, table formatting, header/separator
@@ -225,6 +248,10 @@ function parseMustIncludeItems(raw: string): string[] {
   // Detect if this is a markdown/pipe table: 2+ lines contain at least 2 pipes
   const pipeLines = lines.filter(l => (l.match(/\|/g) ?? []).length >= 2);
   const isTable = pipeLines.length >= 2;
+
+  // Detect tab-separated table: 2+ lines contain 2+ tab characters
+  const tabLines = lines.filter(l => (l.match(/\t/g) ?? []).length >= 2);
+  const isTsv = !isTable && tabLines.length >= 2;
 
   const extracted: string[] = [];
 
@@ -275,6 +302,20 @@ function parseMustIncludeItems(raw: string): string[] {
       const item = context ? `${name} — ${context}` : name;
       if (item.length > 2) extracted.push(item);
     }
+  } else if (isTsv) {
+    for (const line of lines) {
+      if (/^[\s\-=:]+$/.test(line.replace(/\t/g, ''))) continue;
+      const cols = line.split('\t').map(c => c.trim()).filter(Boolean);
+      if (cols.length < 2) continue;
+      if (/^(#|rank|no\.?|number|pos\.?|position|sr\.?|team|name|player)$/i.test(cols[0])) continue;
+      if (cols.every(c => /^[a-z\s.()\/&]+$/i.test(c) && !/\d{4}/.test(c) && c.length < 30)) continue;
+      let nameCol = cols[0];
+      if (/^\d{1,3}$/.test(nameCol) || /^#\d+$/.test(nameCol)) {
+        nameCol = cols[1] ?? '';
+      }
+      const name = nameCol.trim();
+      if (name.length > 2) extracted.push(name);
+    }
   } else {
     // Non-table: numbered list, bulleted list, comma-separated, or plain lines.
     // Handles any mix: "1. A, 2. B", "A\nB\nC", "1. A 2. B 3. C" (no delimiter),
@@ -307,7 +348,7 @@ function parseMustIncludeItems(raw: string): string[] {
       // Split on commas (but not commas inside parentheses).
       // 3+ parts = always a list. 2 parts = only split if both have 2+ words
       // (avoids false splits like "Game Title, 2025").
-      const commaParts = cleaned.split(/,(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
+      const commaParts = cleaned.split(/,(?!\d{3}(?:\D|$))(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
       if (commaParts.length >= 3 ||
           (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2))) {
         for (const part of commaParts) {
@@ -436,6 +477,7 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   const isUserUrlRestricted = userPrimaryUrl ? isRestricted(userPrimaryUrl) : false;
   const hasValidUserSource  = !!userPrimaryUrl && !isUserUrlRestricted;
   const mustIncludeItems    = parseMustIncludeItems(mustIncludeRaw ?? '');
+  const userWordCountOverride = parseWordCountOverride(userContext);
 
   return {
     title, category, slideCount, writerName, userContext, writingStyle,
@@ -446,6 +488,7 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
     sourceCount: allUrls.length,
     timestamp: new Date().toISOString(),
     isSports: category.startsWith('Sports'),
+    userWordCountOverride,
   };
 }
 
@@ -1479,6 +1522,16 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
   const tc = data.temporalContext;
   const writingStyleBlock = data.writingStyle ? `\n\nWRITING STYLE INFLUENCE (from writer): ${data.writingStyle}\nApply this style naturally throughout the slideshow.` : '';
 
+  const wordCountOverrideBlock = data.userWordCountOverride
+    ? `\n\n═══════════════════════════════════════════════════════════════
+⚠️ WRITER OVERRIDE — WORD COUNT ⚠️
+═══════════════════════════════════════════════════════════════
+
+The writer EXPLICITLY requested ${data.userWordCountOverride.min}-${data.userWordCountOverride.max} words per content slide.
+This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
+Count every word before outputting each slide. Rewrite if out of range.`
+    : '';
+
   const claudeSystemPrompt = `You are an expert MSN Slideshow writer for American audiences covering ${data.category}.
 
 ${tc.dateAnchor}
@@ -1613,7 +1666,6 @@ THE RULE: Facts are yours to use. Language is NOT.
 - If you find yourself swapping synonyms, you're paraphrasing — rewrite completely
 
 When using a Tier 1A or 1B fact, vary how you present it:
-- REFRAME: lead with the consequence or reaction, not the stat itself
 - RESTRUCTURE: if the source uses one long sentence, try two short ones
 - ADD A LAYER: pair the fact with a sharp observation the source doesn't make
 
@@ -1897,6 +1949,7 @@ CRITICAL REMINDERS:
 - If Tier 1A and 1B don't have a fact, the article doesn't have that fact
 - Shorter true slides beat longer half-true slides
 - Output the complete slideshow no matter what — never refuse, never ask for clarification
+${wordCountOverrideBlock}
 
 Write the complete slideshow now.`;
 
@@ -2017,8 +2070,10 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
     if (slide.slideNum === 1) {
       if (slide.wordCount > 60) errors.push(`Slide 1 (Intro): ${slide.wordCount} words – MAX is 60`);
     } else {
-      if (slide.wordCount < 35) warnings.push(`Slide ${slide.slideNum}: ${slide.wordCount} words – min 35`);
-      if (slide.wordCount > 50) warnings.push(`Slide ${slide.slideNum}: ${slide.wordCount} words – max 50`);
+      const minWc = data.userWordCountOverride?.min ?? 35;
+      const maxWc = data.userWordCountOverride?.max ?? 50;
+      if (slide.wordCount < minWc) warnings.push(`Slide ${slide.slideNum}: ${slide.wordCount} words – min ${minWc}`);
+      if (slide.wordCount > maxWc) warnings.push(`Slide ${slide.slideNum}: ${slide.wordCount} words – max ${maxWc}`);
     }
   });
 
@@ -2884,6 +2939,7 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
 
   const mustIncludeItems = parseMustIncludeItems(mustIncludeRaw);
   const hasMustInclude = mustIncludeItems.length > 0;
+  const userWordCountOverride = parseWordCountOverride(userContext);
 
   // ── Primary query (used by Perplexity research) ───────────────────────────
   const mustIncludeBlock = hasMustInclude
@@ -2908,6 +2964,7 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
     sourceCount: preferred.length,
     timestamp: new Date().toISOString(),
     isSports: category.startsWith('Sports'),
+    userWordCountOverride,
     // SubjectivePreparedData-only fields
     articleType, toneDial,
     shouldScrapePrimary, isPrimaryRestricted,
@@ -3141,7 +3198,6 @@ THE RULE: Facts are yours to use. Language is NOT.
 - If you find yourself swapping synonyms, you are paraphrasing — rewrite completely
 
 When using a TIER 1A or 1B fact, vary how you present it:
-- REFRAME: lead with the consequence, the emotion, the reaction — not the stat itself
 - RESTRUCTURE: if the source uses one long sentence, try two short ones
 - ADD A LAYER: pair the fact with your editorial voice — the insight the source does not make
 
@@ -3337,7 +3393,15 @@ No sexual content, graphic violence, drugs, gambling, political content, body sh
 ABSOLUTE OUTPUT RULE
 ═══════════════════════════════════════════════════════════════
 
-Always produce the full slideshow. No exceptions. Never write 'I cannot' or any refusal. If source data is thin, write tighter slides using Tier 2/3. A complete article is always the correct output.`;
+Always produce the full slideshow. No exceptions. Never write 'I cannot' or any refusal. If source data is thin, write tighter slides using Tier 2/3. A complete article is always the correct output.${data.userWordCountOverride
+    ? `\n\n═══════════════════════════════════════════════════════════════
+⚠️ WRITER OVERRIDE — WORD COUNT ⚠️
+═══════════════════════════════════════════════════════════════
+
+The writer EXPLICITLY requested ${data.userWordCountOverride.min}-${data.userWordCountOverride.max} words per content slide.
+This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
+Count every word before outputting each slide. Rewrite if out of range.`
+    : ''}`;
 
   const mandatoryBlock = data.hasMustInclude
     ? `\n\nMANDATORY ITEMS — these override the scraped source's item list (non-negotiable):\n${data.mustIncludeItems.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nEvery mandatory item MUST get its own slide, even if it does not appear in TIER 1A. Do NOT substitute any with a different item from the source. Fill remaining slots (up to ${data.slideCount} total) with the best-fit entries.`
@@ -3492,7 +3556,11 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
       const wc = slideBody.trim().split(/\s+/).filter(Boolean).length;
       slideResults.push({ slide: slideNum, words: wc });
       if (slideNum === 1 && wc > 60) warnings.push(`Intro: ${wc} words (max 60)`);
-      else if (slideNum > 1 && (wc < 35 || wc > 55)) warnings.push(`Slide ${slideNum}: ${wc} words (expected 35-50)`);
+      else if (slideNum > 1) {
+        const minWc = data.userWordCountOverride?.min ?? 35;
+        const maxWc = data.userWordCountOverride?.max ?? 50;
+        if (wc < minWc || wc > maxWc + 5) warnings.push(`Slide ${slideNum}: ${wc} words (expected ${minWc}-${maxWc})`);
+      }
     }
     slideBody = '';
     slideTitleSet = false;

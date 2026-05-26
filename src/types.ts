@@ -103,6 +103,7 @@ export interface PreparedData {
   sourceCount: number;
   timestamp: string;
   isSports: boolean;
+  userWordCountOverride?: { min: number; max: number };
 }
 
 export interface SourcedData extends PreparedData {
