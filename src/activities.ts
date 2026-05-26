@@ -768,8 +768,13 @@ export async function buildResearchStrategy(prepData: PreparedData): Promise<Sou
  * tiering — facts from any source are unioned (deduped by type+value).
  */
 function mergeAtomizedItems(items: AtomizedFact[]): AtomizedFact[] {
-  const normalizeKey = (name: string): string => {
-    if (!name) return '';
+  // Default item names from the section splitter look like "Item 1", "Item 2", etc.
+  // These should NEVER merge with each other — each represents a distinct section
+  // whose heading didn't match any item-name pattern. Detect them and keep separate.
+  const GENERIC_NAME_RE = /^\s*item\s+\d+\s*$/i;
+  const normalizeKey = (name: string, fallbackIdx: number): string => {
+    if (!name) return `__empty_${fallbackIdx}`;
+    if (GENERIC_NAME_RE.test(name)) return `__generic_${name.toLowerCase().trim()}`;
     return name.toLowerCase()
       .replace(/[—–:,()]/g, ' ')
       .replace(/\s+/g, ' ')
@@ -783,8 +788,9 @@ function mergeAtomizedItems(items: AtomizedFact[]): AtomizedFact[] {
   const byKey = new Map<string, AtomizedFact>();
   const orderKeys: string[] = [];
 
-  for (const item of items) {
-    const key = normalizeKey(item.itemName);
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const key = normalizeKey(item.itemName, i);
     const existing = byKey.get(key);
     if (!existing) {
       byKey.set(key, { ...item, facts: [...item.facts] });
@@ -837,7 +843,10 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
   for (const sourceContent of sourcesToAtomize) {
     if (!sourceContent || sourceContent.length < 50) continue;
 
-  // Try multiple section-splitting strategies in priority order
+  // Try multiple section-splitting strategies in priority order.
+  // Order matters: numbered per-item splits run BEFORE the entity-prefix split,
+  // because the entity-prefix split would otherwise greedily grab top-level
+  // section headers (## AFC North) and miss the per-team ### sub-items inside.
   let sections: string[] = [];
   if (sourceContent) {
     // Strategy 1: "N of M" slideshow format (Yardbarker, Bleacher Report, etc.)
@@ -847,23 +856,25 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
       sections = nOfMSections;
     }
 
-    // Strategy 2: ## headers with linked or plain "Entity: Subject" format
+    // Strategy 2: Numbered headers — `## 1. Title`, `### 1\. Title`, `# 2: Title`.
+    // `\\?` allows the markdown-escaped period (`1\.`) used by SB Nation etc.
+    // `{1,3}` covers h1/h2/h3 — h3 sub-headers are how SB Nation lists per-team
+    // entries inside larger `## AFC North` division blocks. We attempt this BEFORE
+    // the entity-prefix split so per-item separation wins over per-division grouping.
+    if (sections.length < 3) {
+      const numberedSections = sourceContent.split(/\n(?=[ \t]*#{1,3}[ \t]+\d{1,3}\\?[.):][ \t]+)/);
+      if (numberedSections.length >= 3) {
+        sections = numberedSections;
+      }
+    }
+
+    // Strategy 3: ## headers with linked or plain "Entity: Subject" format
     // e.g. "## [Arizona Cardinals](url): Karlos Dansby" or "## Arizona Cardinals: Karlos Dansby"
     if (sections.length < 3) {
       const entitySections = sourceContent.split(/(?=##\s*\[?[A-Z])/);
       if (entitySections.length >= 3) {
         sections = entitySections;
       }
-    }
-
-    // Strategy 3: Original numbered format (## 1. Title, # 2: Title)
-    // We consume the leading newline as part of the delimiter so each section
-    // starts cleanly with `##` — without this, inner regexes anchored at `^##`
-    // fail because sections begin with `\n`. The regex also requires a literal
-    // separator (`.`, `)`, or `:`) between the digit and the title so it doesn't
-    // accidentally match content-internal patterns like "selected #1 overall".
-    if (sections.length < 3) {
-      sections = sourceContent.split(/\n(?=[ \t]*#{1,2}[ \t]+\d{1,3}[.):][ \t]+)/);
     }
   }
 
@@ -895,13 +906,15 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
         itemName = subject ? `${team}: ${subject}` : team;
         content = section.replace(/^##\s*[^\n]+\n/, '');
       } else {
-        // Pattern C: Original numbered format (## 1. Title) — must match the
-        // same shape the splitter accepted: line-start, space, separator required.
-        const numberedMatch = section.match(/^[ \t]*#{1,2}[ \t]+(\d{1,3})[.):][ \t]+(.+?)(?:\n|$)/);
+        // Pattern C: Numbered format (## 1. Title, ### 1\. Title, # 2: Title) — must
+        // match the same shape the splitter accepted: line-start, space, separator
+        // required. `\\?` allows the markdown-escaped period (`1\.`) used by SB Nation.
+        // `{1,3}` covers h1/h2/h3 so per-team `###` entries are captured.
+        const numberedMatch = section.match(/^[ \t]*#{1,3}[ \t]+(\d{1,3})\\?[.):][ \t]+(.+?)(?:\n|$)/);
         if (numberedMatch) {
           itemNumber = parseInt(numberedMatch[1]);
           itemName = numberedMatch[2].trim().replace(/\*\*/g, '');
-          content = section.replace(/^[ \t]*#{1,2}[ \t]+\d{1,3}[.):][ \t]+.+?\n/, '');
+          content = section.replace(/^[ \t]*#{1,3}[ \t]+\d{1,3}\\?[.):][ \t]+.+?\n/, '');
         }
       }
     }
@@ -1333,6 +1346,137 @@ function lightSanitizePerplexity(
   };
 }
 
+/**
+ * Clean a single scraped source's markdown for inclusion in Claude's prompt.
+ *
+ * Removes navigation, image markdown, link markup, "Related Articles" / "More From"
+ * sidebars, comment threads, and other tail-end widgets — but preserves the article
+ * body so Claude has the full context of WHAT THE WRITER WAS QUOTING when drafting.
+ *
+ * Used per-source by `prepareCleanSourceForPrompt` so multi-source articles don't
+ * lose later sources when an earlier source's "Related Articles" sidebar appears.
+ */
+function cleanOneSourceForPrompt(rawScraped: string, perSourceCharCap: number): string {
+  if (!rawScraped) return '';
+  let md = rawScraped;
+
+  // 1. Cut everything after the article body for THIS source. Most sources put
+  //    nav/related/comments AFTER the main content under predictable headings —
+  //    chop the first occurrence and discard the tail.
+  const tailHeadings = [
+    /\n##+\s*(?:Active Articles?|More (?:From|in)\s|The Latest|Recommended|Related (?:Articles?|Stories|Posts?|Reading)|Comments?|Replies|Trending|Popular|Most Read|You (?:May|Might) Also Like|Up Next|Editor'?s Pick)\b/i,
+    /\n##+\s*(?:About the (?:Author|Writer)|Newsletter|Sign Up|Subscribe)\b/i,
+    /\nSee More:\s*$/m,
+  ];
+  for (const rx of tailHeadings) {
+    const m = md.match(rx);
+    if (m && m.index !== undefined && m.index > 500) {
+      md = md.slice(0, m.index);
+    }
+  }
+
+  // 2. Remove image markdown and bare-link markdown so phrasing dominates.
+  md = md
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                                    // images
+    .replace(/\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)/g, '')                       // linked images
+    .replace(/\[([^\]]+)\]\((?:https?:[^)]+|mailto:[^)]+|#[^)]*)\)/g, '$1')  // [text](url) → text
+    .replace(/^\s*[-*]\s*\[[^\]]*\]\([^)]*\)\s*$/gm, '');                    // list-of-links lines
+
+  // 3. Same per-line filter the firecrawl cleaner already runs — catches widgets
+  //    that slip in between paragraphs of the article body.
+  md = md
+    .split('\n')
+    .filter(line => {
+      const t = line.trim();
+      if (!t) return true;
+      if (t.length > 40) return true;
+      return !NOISE_LINE_PATTERNS.some(rx => rx.test(t));
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  // 4. Cap per-source on a paragraph boundary if possible.
+  if (md.length > perSourceCharCap) {
+    const slice = md.slice(0, perSourceCharCap);
+    const lastBreak = slice.lastIndexOf('\n\n');
+    md = (lastBreak > perSourceCharCap * 0.6 ? slice.slice(0, lastBreak) : slice) + '\n\n[…source truncated for length…]';
+  }
+
+  return md;
+}
+
+/**
+ * Prepare ALL scraped sources for inclusion in Claude's prompt.
+ *
+ * Multi-source-aware: cleans each source independently and concatenates with
+ * `=== SOURCE: <url> ===` delimiters so Claude can see which fact came from where.
+ * Falls back to splitting a combined `scrapedContent` string on the delimiter
+ * pattern when per-source array isn't available.
+ *
+ * We deliberately send the cleaned source even when atomized facts are available:
+ * atomized facts power fact-check, while the full source powers narrative fidelity.
+ * Anti-plagiarism rules live in the prompt itself — not in withholding the source.
+ */
+function prepareCleanSourceForPrompt(
+  combinedContent: string,
+  totalCharCap: number,
+  scrapedSources?: Array<{ url: string; markdown: string }>,
+): string {
+  // Prefer the per-source array when available — it preserves URL attribution
+  // and avoids the multi-source bleed-through (where source #1's "Related Articles"
+  // section would chop sources #2/#3 if we treated the combined blob as one doc).
+  let sources: Array<{ url: string; markdown: string }> = [];
+  if (scrapedSources && scrapedSources.length > 0) {
+    sources = scrapedSources.filter(s => s.markdown && s.markdown.length > 0);
+  } else if (combinedContent) {
+    // Fallback: split on the `=== SOURCE: <url> ===` delimiters that
+    // analyzeSourceAlignment emits when building scrapedContent. The split
+    // alternates: [pre, url1, md1, url2, md2, ...]. If the input starts with a
+    // delimiter, `pre` is empty — drop it so URLs land at even indices.
+    const rawChunks = combinedContent.split(/\n*=== SOURCE: ([^=]+?) ===\n/);
+    const chunks = rawChunks[0] === '' ? rawChunks.slice(1) : rawChunks;
+    // After normalization, chunks should be [url1, md1, url2, md2, ...] starting
+    // with a URL at index 0.
+    if (chunks.length >= 2 && /^https?:/.test(chunks[0] ?? '')) {
+      for (let i = 0; i + 1 < chunks.length; i += 2) {
+        sources.push({ url: chunks[i].trim(), markdown: chunks[i + 1] ?? '' });
+      }
+    } else {
+      sources = [{ url: '', markdown: combinedContent }];
+    }
+  }
+
+  if (sources.length === 0) return '';
+
+  // Per-source budget: divide total cap, but give each source a floor of 5K so a
+  // single short source still gets its full content. Multi-source articles each
+  // get at least 5K and at most (totalCharCap / N) chars.
+  const perSourceCharCap = Math.max(5000, Math.floor(totalCharCap / sources.length));
+
+  const cleanedSections: string[] = [];
+  for (const s of sources) {
+    const cleaned = cleanOneSourceForPrompt(s.markdown, perSourceCharCap);
+    if (!cleaned) continue;
+    const header = s.url ? `=== SOURCE: ${s.url} ===` : '=== SOURCE ===';
+    cleanedSections.push(`${header}\n${cleaned}`);
+  }
+
+  if (cleanedSections.length === 0) return '';
+
+  let combined = cleanedSections.join('\n\n');
+
+  // Hard total cap as a safety net — per-source caps should already keep us under,
+  // but a single oversize source could bust the budget. Truncate on paragraph break.
+  if (combined.length > totalCharCap) {
+    const slice = combined.slice(0, totalCharCap);
+    const lastBreak = slice.lastIndexOf('\n\n');
+    combined = (lastBreak > totalCharCap * 0.6 ? slice.slice(0, lastBreak) : slice) + '\n\n[…sources truncated for length…]';
+  }
+
+  return combined;
+}
+
 export async function mergeResearch(data: ResearchedData, retryResp?: PerplexityRaw): Promise<MergedData> {
   let answer    = data.perplexityAnswer;
   let citations = data.perplexityCitations;
@@ -1410,36 +1554,37 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
     combinedFactRepresentation += 'TIER 1A: FACT AUTHORITY\n';
     combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
 
-    if (sourceQuality === 'COMPREHENSIVE') {
-      // FACT-ONLY MODE: send only atomized facts, hide raw markdown
-      if (data.factOnlyRepresentation) {
-        combinedFactRepresentation += data.factOnlyRepresentation + '\n\n';
-      }
-      combinedFactRepresentation += '[Note: Raw source prose is intentionally not included. CONTEXT lines (where present) supply non-numeric facts (current team, draft, position, status) the regex extractors may have missed — treat CONTEXT as a fact reference only. Do NOT mirror its phrasing, do NOT copy its sentence structure. Construct every sentence from scratch using the facts above.]\n\n';
-    } else if (sourceQuality === 'PARTIAL') {
-      // PARTIAL: facts + trimmed snippets for item identification
-      if (data.factOnlyRepresentation) {
-        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
-      }
-      if (userSourceContent) {
-        // Trim each section to ~800 chars for identification only
-        const trimmedSections = userSourceContent
-          .split(/(?=##?\s*\d+[.):]?\s*)/)
-          .map(section => {
-            if (section.length <= 800) return section;
-            return section.substring(0, 800) + '\n[section trimmed — for item identification only, not for phrasing reference]';
-          })
-          .join('\n\n');
-        combinedFactRepresentation += '### Source Snippets (for item identification only, not for phrasing reference)\n' + trimmedSections + '\n\n';
-      }
-    } else {
-      // MINIMAL: original behavior
-      if (data.factOnlyRepresentation) {
-        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
-      }
-      if (userSourceContent) {
-        combinedFactRepresentation += '### Full Source Text\n' + userSourceContent + '\n\n';
-      }
+    // Atomized facts ALWAYS go first — they are the structured fact spine that the
+    // fact-check stage validates against. Even when the full source is included
+    // below, this section serves as a quick-reference fact table.
+    if (data.factOnlyRepresentation) {
+      combinedFactRepresentation += '### Atomized Facts (structured fact spine — verified by fact-check)\n';
+      combinedFactRepresentation += data.factOnlyRepresentation + '\n\n';
+    }
+
+    // Cleaned source ALWAYS follows — Claude needs the full narrative context to
+    // understand WHAT the source says about each item. The plagiarism guard rails
+    // (RESTRUCTURE / ADD A LAYER / 6-word Google test) live in the prompt itself.
+    // Atomization is the safety net for fact-check; the source is the safety net
+    // for narrative fidelity (no more hallucinated 2024 records). Per-source
+    // cleaning preserves URL attribution and prevents multi-source bleed-through.
+    const cleanedSource = prepareCleanSourceForPrompt(
+      userSourceContent,
+      sourceQuality === 'COMPREHENSIVE' ? 16000 : sourceQuality === 'PARTIAL' ? 12000 : 8000,
+      data.sourceAnalysis?.scrapedSources,
+    );
+    if (cleanedSource) {
+      const sourceCount = data.sourceAnalysis?.scrapedSources?.length ?? 1;
+      const sourceLabel = sourceCount > 1 ? `Primary Sources (${sourceCount} sources — cleaned, full article bodies)` : 'Primary Source (cleaned — full article body)';
+      combinedFactRepresentation += `### ${sourceLabel}\n`;
+      combinedFactRepresentation += sourceCount > 1
+        ? 'These are the writer-supplied primary sources, each delimited by `=== SOURCE: <url> ===`. All sources are EQUAL Tier 1A authority. Treat the FACTS as your authoritative reference. Treat the PHRASING as off-limits.\n'
+        : 'This is the writer-supplied primary source. Treat the FACTS as your authoritative reference. Treat the PHRASING as off-limits.\n';
+      combinedFactRepresentation += '• Pull every stat, name, date, ranking, and quote from these sources.\n';
+      combinedFactRepresentation += '• Do NOT copy sentences. Do NOT paraphrase by swapping synonyms. Do NOT mirror sentence structure.\n';
+      combinedFactRepresentation += '• Build each slide from the FACTS, written in YOUR voice.\n';
+      combinedFactRepresentation += '• 6-word Google test: if any 6-word string of your sentence could be Google-searched and land on the source article, rewrite that string.\n\n';
+      combinedFactRepresentation += cleanedSource + '\n\n';
     }
   }
 
@@ -1658,18 +1803,35 @@ If Tier 1A is thin, check Tier 1B. If both are thin, write tighter slides using 
 ORIGINALITY REQUIREMENTS — WRITING FRESH FROM FACTS
 ═══════════════════════════════════════════════════════════════
 
+The Tier 1A block includes the FULL CLEANED SOURCE article. You have the original
+writing in front of you — and that is precisely WHY plagiarism risk is now highest.
 You are writing ORIGINAL content using Tier 1A and 1B FACTS. You are NOT paraphrasing.
 
 THE RULE: Facts are yours to use. Language is NOT.
-- Use any stat, date, name, achievement from Tier 1A or 1B
-- Write every sentence fresh — no copying phrases from sources
+- Use any stat, date, name, achievement, ranking, or quote from Tier 1A or 1B
+- Write every sentence fresh — no copying phrases from the source
 - If you find yourself swapping synonyms, you're paraphrasing — rewrite completely
+- If you find yourself echoing the source's sentence rhythm, restructure completely
 
 When using a Tier 1A or 1B fact, vary how you present it:
 - RESTRUCTURE: if the source uses one long sentence, try two short ones
 - ADD A LAYER: pair the fact with a sharp observation the source doesn't make
 
-Quick check before moving on: if any 6-word string of your sentence could be Google-searched and land on the source article, rewrite that string.
+THE 60:40 RULE — TIER 1A vs TIER 2 BALANCE:
+- At least 60% of every slide's substance comes from Tier 1A / Tier 1B FACTS
+  (numbers, names, dates, rankings, achievements, direct stats from the primary source)
+- At MOST 40% may be Tier 2 framing (tone, mood, era-context, why-it-matters)
+- Tier 2 is NOT a fact source — never pull stats, dates, recent claims, or quotes
+  from Tier 2 into a slide
+- If a slide is 100% Tier 2 framing with no Tier 1A/1B facts, that slide is a FAILURE
+
+Quick checks before moving on:
+1. 6-word Google test: if any 6-word string of your sentence could be Google-searched
+   and land on the source article, rewrite that string
+2. Synonym-swap test: read each sentence next to the source — if it's the same shape
+   with different words, it's a paraphrase. Rewrite from the facts, not from the line
+3. Fact-density test: count the Tier 1A/1B facts in your slide. If it's < 2, the slide
+   is leaning on Tier 2 framing too hard — pull in another concrete fact
 
 ═══════════════════════════════════════════════════════════════
 TITLE-BODY CORRELATION (Highest Priority)
@@ -2108,9 +2270,11 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
     if (slide.body.includes('...') || slide.body.includes('…')) warnings.push(`Slide ${slide.slideNum}: ellipsis (banned)`);
   });
 
-  // Unsafe content
+  // Unsafe content — start-anchored word-boundary check. `\bword` (no trailing
+  // boundary) catches inflections like "killed", "raped", "assaulted" while
+  // avoiding mid-word substring false positives like "scrapes" → "rape".
   const unsafeWords = ['nude','suicide','kill','sex','sexual','harassment','cocaine','marijuana','assault','rape','porn','fuck','shit','dick','penis','vagina'];
-  const foundUnsafe = unsafeWords.filter(w => lowerArticle.includes(w));
+  const foundUnsafe = unsafeWords.filter(w => new RegExp(`\\b${w}`, 'i').test(lowerArticle));
   if (foundUnsafe.length) errors.push(`UNSAFE content: ${foundUnsafe.join(', ')}`);
 
   // Quality degradation
@@ -3044,32 +3208,31 @@ export async function mergeSubjectiveResearch(
     combinedFactRepresentation += 'TIER 1A: FACT AUTHORITY\n';
     combinedFactRepresentation += '═══════════════════════════════════════════════════════════════\n\n';
 
-    if (sourceQuality === 'COMPREHENSIVE') {
-      if (data.factOnlyRepresentation) {
-        combinedFactRepresentation += data.factOnlyRepresentation + '\n\n';
-      }
-      combinedFactRepresentation += '[Note: Raw source prose is intentionally not included. CONTEXT lines (where present) supply non-numeric facts (current team, draft, position, status) the regex extractors may have missed — treat CONTEXT as a fact reference only. Do NOT mirror its phrasing, do NOT copy its sentence structure. Construct every sentence from scratch using the facts above.]\n\n';
-    } else if (sourceQuality === 'PARTIAL') {
-      if (data.factOnlyRepresentation) {
-        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
-      }
-      if (userSourceContent) {
-        const trimmedSections = userSourceContent
-          .split(/(?=##?\s*\d+[.):]?\s*)/)
-          .map(section => {
-            if (section.length <= 800) return section;
-            return section.substring(0, 800) + '\n[section trimmed — for item identification only, not for phrasing reference]';
-          })
-          .join('\n\n');
-        combinedFactRepresentation += '### Source Snippets (for item identification only, not for phrasing reference)\n' + trimmedSections + '\n\n';
-      }
-    } else {
-      if (data.factOnlyRepresentation) {
-        combinedFactRepresentation += '### Atomized Facts\n' + data.factOnlyRepresentation + '\n\n';
-      }
-      if (userSourceContent) {
-        combinedFactRepresentation += '### Full Source Text\n' + userSourceContent + '\n\n';
-      }
+    // Atomized facts → structured fact spine for fact-check stage.
+    if (data.factOnlyRepresentation) {
+      combinedFactRepresentation += '### Atomized Facts (structured fact spine)\n';
+      combinedFactRepresentation += data.factOnlyRepresentation + '\n\n';
+    }
+    // Cleaned source → full narrative context. Phrasing remains off-limits via the
+    // anti-plagiarism rules in the prompt itself. Per-source cleaning preserves URL
+    // attribution and prevents multi-source bleed-through.
+    const cleanedSource = prepareCleanSourceForPrompt(
+      userSourceContent,
+      sourceQuality === 'COMPREHENSIVE' ? 16000 : sourceQuality === 'PARTIAL' ? 12000 : 8000,
+      data.sourceAnalysis?.scrapedSources,
+    );
+    if (cleanedSource) {
+      const sourceCount = data.sourceAnalysis?.scrapedSources?.length ?? 1;
+      const sourceLabel = sourceCount > 1 ? `Primary Sources (${sourceCount} sources — cleaned, full article bodies)` : 'Primary Source (cleaned — full article body)';
+      combinedFactRepresentation += `### ${sourceLabel}\n`;
+      combinedFactRepresentation += sourceCount > 1
+        ? 'These are the writer-supplied primary sources, each delimited by `=== SOURCE: <url> ===`. All sources are EQUAL Tier 1A authority. Treat the FACTS as your authoritative reference. Treat the PHRASING as off-limits.\n'
+        : 'This is the writer-supplied primary source. Treat the FACTS as your authoritative reference. Treat the PHRASING as off-limits.\n';
+      combinedFactRepresentation += '• Pull every stat, name, date, ranking, and quote from these sources.\n';
+      combinedFactRepresentation += '• Do NOT copy sentences. Do NOT paraphrase by swapping synonyms. Do NOT mirror sentence structure.\n';
+      combinedFactRepresentation += '• Build each slide from the FACTS, written in YOUR voice.\n';
+      combinedFactRepresentation += '• 6-word Google test: if any 6-word string of your sentence could be Google-searched and land on the source article, rewrite that string.\n\n';
+      combinedFactRepresentation += cleanedSource + '\n\n';
     }
   }
 
@@ -3190,18 +3353,32 @@ Never invent specific precision:
 ORIGINALITY REQUIREMENTS — WRITING FRESH FROM FACTS
 ═══════════════════════════════════════════════════════════════
 
+The TIER 1A block includes the FULL CLEANED SOURCE article. You have the original
+writing in front of you — and that is precisely WHY plagiarism risk is now highest.
 You are writing ORIGINAL content using TIER 1A and 1B FACTS. You are NOT paraphrasing.
 
 THE RULE: Facts are yours to use. Language is NOT.
 - Use any quote, date, name, achievement from TIER 1A or 1B
-- Write every sentence fresh — no copying phrases from sources
+- Write every sentence fresh — no copying phrases from the source
 - If you find yourself swapping synonyms, you are paraphrasing — rewrite completely
+- If you find yourself echoing the source's sentence rhythm, restructure completely
 
 When using a TIER 1A or 1B fact, vary how you present it:
 - RESTRUCTURE: if the source uses one long sentence, try two short ones
 - ADD A LAYER: pair the fact with your editorial voice — the insight the source does not make
 
-Quick check before moving on: if any 6-word string of your sentence could be Google-searched and land on the source article, rewrite that string.
+THE 60:40 RULE — TIER 1A vs TIER 2 BALANCE:
+- At least 60% of every slide's substance comes from TIER 1A / TIER 1B FACTS
+  (quotes, names, dates, achievements, direct claims from the primary source)
+- At MOST 40% may be TIER 2 framing (tone, mood, era-context, emotional weight)
+- TIER 2 is NOT a fact source — never pull stats, dates, recent claims, or quotes
+  from TIER 2 into a slide
+
+Quick checks before moving on:
+1. 6-word Google test: if any 6-word string of your sentence could be Google-searched
+   and land on the source article, rewrite that string
+2. Synonym-swap test: read each sentence next to the source — if it's the same shape
+   with different words, it's a paraphrase. Rewrite from the facts, not from the line
 
 ═══════════════════════════════════════════════════════════════
 THE FEELING ENGINE — SUBJECTIVE WRITING VOICE
@@ -3524,11 +3701,14 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
   if (foundBanned.length) warnings.push(`Banned phrases: ${foundBanned.join(', ')}`);
 
   const unsafeWords = [
-    'nude','naked','suicide','kill','shot ','stabbed','fake news','conspiracy',
-    ' sex ','sexual','sexy','harassment','marijuana','cocaine','assault','scam',
-    'drug ','racism','vaccine','rape','molest','damn','porn','smoking','tobacco','wtf',
+    'nude','naked','suicide','kill','shot','stabbed','fake news','conspiracy',
+    'sex','sexual','sexy','harassment','marijuana','cocaine','assault','scam',
+    'drug','racism','vaccine','rape','molest','damn','porn','smoking','tobacco','wtf',
   ];
-  const foundUnsafe = unsafeWords.filter(w => lowerArticle.includes(w.trim().toLowerCase()));
+  // Start-anchored word-boundary check. `\bword` catches inflections like "killed",
+  // "raped", "assaulted" while avoiding mid-word substring false positives like
+  // "scrapes" → "rape".
+  const foundUnsafe = unsafeWords.filter(w => new RegExp(`\\b${w.replace(/\s+/g, '\\s+')}`, 'i').test(lowerArticle));
   if (foundUnsafe.length) errors.push(`UNSAFE content: ${foundUnsafe.join(', ')}`);
 
   const metaMatch = articleText.match(/^META:\s*(.+)$/m);
