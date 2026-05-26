@@ -20,6 +20,7 @@ const GROK_KEY       = process.env.GROK_API_KEY!;
 const VERCEL_GATEWAY_KEY = process.env.VERCEL_AI_GATEWAY_KEY!;
 
 const VERCEL_GATEWAY_URL = 'https://ai-gateway.vercel.sh/v1/responses';
+const XAI_DIRECT_URL     = 'https://api.x.ai/v1/chat/completions';
 
 function extractGrokResponseText(data: unknown): string {
   const d = data as Record<string, unknown>;
@@ -34,6 +35,80 @@ function extractGrokResponseText(data: unknown): string {
   }
   const fallback = d as { choices?: Array<{ message: { content: string } }> };
   return fallback?.choices?.[0]?.message?.content ?? '';
+}
+
+// ── Grok helper: Vercel AI Gateway → direct xAI API fallback ────────────────
+// Tries the Vercel gateway first (Responses API format). If it returns a
+// retryable error (403 Forbidden, 429 Rate-limit, or 5xx), falls back to the
+// direct xAI Chat Completions API using GROK_API_KEY. Returns the raw response
+// data — callers use extractGrokResponseText() on top as needed.
+
+async function callGrokWithFallback(opts: {
+  systemContent: string;
+  userContent: string;
+  maxTokens: number;
+  temperature: number;
+  timeout: number;
+  tools?: Array<{ type: string }>;
+  label: string;
+}): Promise<unknown> {
+  // ── 1. Try Vercel AI Gateway (Responses API format) ──────────────────────
+  try {
+    const body: Record<string, unknown> = {
+      model: 'xai/grok-4.3',
+      max_output_tokens: opts.maxTokens,
+      temperature: opts.temperature,
+      input: [
+        { role: 'system', content: opts.systemContent },
+        { role: 'user',   content: opts.userContent },
+      ],
+    };
+    if (opts.tools) body.tools = opts.tools;
+
+    const resp = await axios.post(VERCEL_GATEWAY_URL, body, {
+      headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' },
+      timeout: opts.timeout,
+    });
+    return resp.data;
+  } catch (err: unknown) {
+    const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+    const detail = axios.isAxiosError(err)
+      ? JSON.stringify(err.response?.data ?? err.message)
+      : String(err);
+    const retryable = status && (status === 403 || status === 429 || status >= 500);
+    console.warn(
+      `[${opts.label}] Vercel gateway failed (HTTP ${status}): ${detail}.` +
+      (retryable ? ' Falling back to direct xAI API…' : ' NOT retryable — re-throwing.'),
+    );
+    if (!retryable) throw err;
+  }
+
+  // ── 2. Fallback: direct xAI Chat Completions API ────────────────────────
+  if (!GROK_KEY) {
+    throw new Error(
+      `[${opts.label}] Vercel gateway returned 403/429/5xx and GROK_API_KEY is not set — cannot fall back to direct xAI API`,
+    );
+  }
+
+  console.log(`[${opts.label}] Attempting direct xAI API (${XAI_DIRECT_URL})…`);
+  const body: Record<string, unknown> = {
+    model: 'grok-4.3',
+    max_tokens: opts.maxTokens,
+    temperature: opts.temperature,
+    messages: [
+      { role: 'system', content: opts.systemContent },
+      { role: 'user',   content: opts.userContent },
+    ],
+  };
+  // Note: tools (web_search) are Vercel-gateway-specific; the direct API
+  // does not support the same format, so Grok falls back to training data.
+
+  const resp = await axios.post(XAI_DIRECT_URL, body, {
+    headers: { Authorization: `Bearer ${GROK_KEY}`, 'Content-Type': 'application/json' },
+    timeout: opts.timeout,
+  });
+  console.log(`[${opts.label}] Direct xAI API succeeded.`);
+  return resp.data;
 }
 
 const RESTRICTED_DOMAINS = [
@@ -1901,20 +1976,15 @@ export async function checkClaudeResponse(claudeResp: unknown, promptData: Promp
 // ── 12. generateWithGrok (n8n: "Grok - Generate Article (Fallback)") ──────────
 
 export async function generateWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
-  const resp = await axios.post(
-    VERCEL_GATEWAY_URL,
-    {
-      model: 'xai/grok-4.3',
-      max_output_tokens: 7000,
-      temperature: 0.3,
-      input: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-    },
-    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 300_000 },
-  );
-  return extractGrokResponseText(resp.data);
+  const data = await callGrokWithFallback({
+    systemContent: systemPrompt,
+    userContent:   userPrompt,
+    maxTokens:     7000,
+    temperature:   0.3,
+    timeout:       300_000,
+    label:         'generateWithGrok',
+  });
+  return extractGrokResponseText(data);
 }
 
 // ── 13. validateStructure (n8n: "Structural Validator") ──────────────────────
@@ -2211,7 +2281,8 @@ CLAIM 1: "[exact claim text from article]"
   METHOD: TRAINING | WEB_SEARCH
   FOUND: [one short line — what your training or search shows]
   SOURCE: [URL if METHOD=WEB_SEARCH, else "training_data"]
-  CORRECTION: [only if INCORRECT — what the article should say instead]
+  CORRECTION_FIND: [only if INCORRECT — copy the EXACT substring from the article that is wrong]
+  CORRECTION_REPLACE: [only if INCORRECT — the corrected text that should replace it]
 
 CLAIM 2: ...
 
@@ -2227,30 +2298,38 @@ Verification rate: [X]%
 
 === END FACT CHECK ===
 
+SURGICAL CORRECTION FORMAT — READ CAREFULLY:
+When STATUS is INCORRECT, you MUST provide BOTH correction fields:
+  CORRECTION_FIND:    Copy the EXACT phrase/sentence from the article that contains the error.
+                      This must be a verbatim substring that appears in the article text above.
+                      Include enough surrounding words for unique identification (10-40 words).
+                      Example: "Korda posted back-to-back 67s"
+  CORRECTION_REPLACE: The corrected version of that same phrase, with ONLY the factual error fixed.
+                      Keep all surrounding text identical. Same length, same structure.
+                      Example: "Korda posted back-to-back 65s"
+
+DO NOT paraphrase, rewrite, or restructure. The FIND text must be copy-pasted from the article.
+If you cannot locate the exact text to fix, set STATUS to UNVERIFIABLE instead.
+
 HARD RULES:
 - NEVER reproduce slides or the full article in your output.
-- For factual corrections, use the CORRECTION field — the pipeline applies it automatically.
+- For factual corrections, use the CORRECTION_FIND/CORRECTION_REPLACE fields — the pipeline applies them as surgical find-and-replace automatically.
 - DO NOT emit style patches, em-dash fixes, or banned-phrase corrections — the audit step handles those.
 - Start output with === FACT CHECK ===.
 - Default to TRAINING for stable historical facts. Reserve WEB_SEARCH for time-sensitive
   or low-confidence claims. Aim to keep web searches well under the 8-call cap.`;
   const userContent = `Fact-check this MSN slideshow using the two-phase protocol.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nLast completed season: ${tc.lastSeason}\nCurrent/ongoing season: ${tc.currentSeason}\n\nPrimary Source URL: ${data.primarySourceUrl || 'Not provided'}\n\nARTICLE TO VERIFY\n\n${data.articleText}\n\nRun PHASE 1 first (training-data triage). ONLY call web_search for claims classified NEEDS_SEARCH, hard-capped at 8 calls. Output in the exact format specified, starting with === FACT CHECK ===.`;
 
-  const resp = await axios.post(
-    VERCEL_GATEWAY_URL,
-    {
-      model: 'xai/grok-4.3',
-      tools: [{ type: 'web_search' }],
-      max_output_tokens: 7000,
-      temperature: 0.0,
-      input: [
-        { role: 'system', content: systemContent },
-        { role: 'user', content: userContent },
-      ],
-    },
-    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 300_000 },
-  );
-  return resp.data;
+  const grokResp = await callGrokWithFallback({
+    systemContent,
+    userContent,
+    maxTokens:   7000,
+    temperature: 0.0,
+    timeout:     300_000,
+    tools:       [{ type: 'web_search' }],
+    label:       'grokFactCheck',
+  });
+  return grokResp;
 }
 
 // ── 16. processVerification (n8n: "Process Fact Check Results") ──────────────
@@ -2282,42 +2361,96 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
   const urlMatches = [...text.matchAll(/https?:\/\/[^\s)>\"\]]+/g)];
   const citations = [...new Set(urlMatches.map(m => m[0]))].slice(0, 10);
 
-  // ── Parse fact-check section (CLAIM/STATUS/CORRECTION) ─────────────────────
+  // ── Parse fact-check section (CLAIM/STATUS/CORRECTION_FIND/CORRECTION_REPLACE) ──
   // Style patches now happen in the audit step, not here.
   const factSection = (text.match(/=== FACT CHECK ===([\s\S]*?)=== END FACT CHECK ===/i)?.[1]) ?? text;
 
   let articleText = data.articleText;
   const results: VerifiedData['perplexityVerification']['results'] = [];
-  // Regex tolerates the optional METHOD: TRAINING|WEB_SEARCH line emitted by the
-  // two-phase protocol. Older outputs without METHOD: still parse correctly.
-  const claimPattern = /CLAIM\s*\d+:\s*"([^"]+)"\s*\n\s*STATUS:\s*(VERIFIED|INCORRECT|UNVERIFIABLE)\s*\n(?:\s*METHOD:\s*([A-Z_]+)\s*\n)?\s*FOUND:\s*([^\n]+)\s*\n\s*SOURCE:\s*([^\n]+)(?:\s*\n\s*CORRECTION:\s*([^\n]+))?/gi;
+
+  // New regex: supports CORRECTION_FIND / CORRECTION_REPLACE pair (preferred)
+  // as well as legacy single CORRECTION: line (backward compat).
+  // METHOD: line is optional for backward compatibility.
+  const claimPattern = /CLAIM\s*\d+:\s*"([^"]+)"\s*\n\s*STATUS:\s*(VERIFIED|INCORRECT|UNVERIFIABLE)\s*\n(?:\s*METHOD:\s*([A-Z_]+)\s*\n)?\s*FOUND:\s*([^\n]+)\s*\n\s*SOURCE:\s*([^\n]+)(?:\s*\n\s*CORRECTION_FIND:\s*([^\n]+)\s*\n\s*CORRECTION_REPLACE:\s*([^\n]+))?(?:\s*\n\s*CORRECTION:\s*([^\n]+))?/gi;
   let m: RegExpExecArray | null;
   let claimIdx = 0;
   let trainingCount = 0;
   let webSearchCount = 0;
+  let correctionsApplied = 0;
+  let correctionsSkipped = 0;
+  const correctionLog: string[] = [];
+
   while ((m = claimPattern.exec(factSection)) !== null) {
     const claim = m[1].trim();
     const status = m[2].toUpperCase();
     const method = (m[3] ?? '').toUpperCase();
     const found = m[4].trim();
     const source = m[5].trim();
-    const correction = m[6]?.trim() ?? null;
+    const corrFind = m[6]?.trim() ?? null;     // new CORRECTION_FIND field
+    const corrReplace = m[7]?.trim() ?? null;   // new CORRECTION_REPLACE field
+    const legacyCorr = m[8]?.trim() ?? null;    // legacy CORRECTION field
     results.push({ claimIndex: claimIdx++, claim, status, finding: found, source });
 
     if (method === 'TRAINING') trainingCount++;
     else if (method === 'WEB_SEARCH') webSearchCount++;
 
-    // Auto-correct numeric facts marked INCORRECT when a correction is provided.
-    if (status === 'INCORRECT' && correction) {
-      const claimNums = claim.match(/[\d,]+(?:\.\d+)?/g);
-      const corrNums = correction.match(/[\d,]+(?:\.\d+)?/g);
-      if (claimNums && corrNums && claimNums[0] && corrNums[0]) {
-        articleText = articleText.replace(claimNums[0], corrNums[0]);
+    // ── Apply surgical fact corrections for INCORRECT claims ──────────────
+    if (status === 'INCORRECT') {
+      // Path A: structured CORRECTION_FIND / CORRECTION_REPLACE (preferred)
+      if (corrFind && corrReplace) {
+        const beforeText = articleText;
+        // Strip surrounding quotes that Grok sometimes adds
+        const cleanFind = corrFind.replace(/^["'"']+|["'"']+$/g, '');
+        const cleanReplace = corrReplace.replace(/^["'"']+|["'"']+$/g, '');
+
+        if (!cleanFind.trim()) {
+          correctionsSkipped++;
+          correctionLog.push(`SKIP claim ${claimIdx - 1}: empty CORRECTION_FIND`);
+        } else {
+          // Try 1: exact substring match
+          if (articleText.includes(cleanFind)) {
+            articleText = articleText.replace(cleanFind, cleanReplace);
+          } else {
+            // Try 2: whitespace-normalized match (handles line breaks, extra spaces)
+            const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+            const escaped = cleanFind.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
+            const rx = new RegExp(escaped);
+            if (rx.test(articleText)) {
+              articleText = articleText.replace(rx, cleanReplace);
+            } else {
+              // Try 3: case-insensitive match (Grok sometimes changes case)
+              const rxI = new RegExp(escaped, 'i');
+              if (rxI.test(articleText)) {
+                articleText = articleText.replace(rxI, cleanReplace);
+              }
+            }
+          }
+
+          if (articleText !== beforeText) {
+            correctionsApplied++;
+            correctionLog.push(`APPLY claim ${claimIdx - 1}: "${cleanFind.slice(0, 60)}" → "${cleanReplace.slice(0, 60)}"`);
+          } else {
+            correctionsSkipped++;
+            correctionLog.push(`SKIP claim ${claimIdx - 1}: FIND text not located in article: "${cleanFind.slice(0, 80)}"`);
+          }
+        }
+      }
+      // Path B: legacy freeform CORRECTION field — do NOT attempt naive number swaps.
+      // Just log it. The downstream audit step can catch remaining issues.
+      else if (legacyCorr) {
+        correctionsSkipped++;
+        correctionLog.push(`SKIP claim ${claimIdx - 1}: legacy CORRECTION format (no FIND/REPLACE) — "${legacyCorr.slice(0, 80)}"`);
+      } else {
+        correctionsSkipped++;
+        correctionLog.push(`SKIP claim ${claimIdx - 1}: INCORRECT but no correction provided`);
       }
     }
   }
 
-  console.log(`[processVerification] fact-corrections: ${results.filter(r => r.status === 'INCORRECT').length} incorrect / ${results.length} total · method: ${trainingCount} training, ${webSearchCount} web_search`);
+  console.log(`[processVerification] fact-corrections: ${results.filter(r => r.status === 'INCORRECT').length} incorrect / ${results.length} total · applied: ${correctionsApplied}, skipped: ${correctionsSkipped} · method: ${trainingCount} training, ${webSearchCount} web_search`);
+  if (correctionLog.length > 0) {
+    console.log(`[processVerification] correction detail:\n  ${correctionLog.join('\n  ')}`);
+  }
 
   const verified     = results.filter(r => r.status === 'VERIFIED').length;
   const incorrect    = results.filter(r => r.status === 'INCORRECT').length;
@@ -2493,20 +2626,15 @@ HARD RULES
 
   const userContent = `Audit this MSN slideshow for compliance AND emit style patches for any mechanical violations.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nExpected content slides: ${data.slideCount}\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE\n\n${data.articleText}\n\nEmit the AUDIT REPORT, SUMMARY, and STYLE PATCHES blocks in that order. Do not regenerate the article.`;
 
-  const resp = await axios.post(
-    VERCEL_GATEWAY_URL,
-    {
-      model: 'xai/grok-4.3',
-      max_output_tokens: 3500,
-      temperature: 0.0,
-      input: [
-        { role: 'system', content: systemContent },
-        { role: 'user',   content: userContent },
-      ],
-    },
-    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 180_000 },
-  );
-  return extractGrokResponseText(resp.data);
+  const grokResp = await callGrokWithFallback({
+    systemContent,
+    userContent,
+    maxTokens:   3500,
+    temperature: 0.0,
+    timeout:     180_000,
+    label:       'grokAuditAndVerify',
+  });
+  return extractGrokResponseText(grokResp);
 }
 
 // ── 18. extractAuditResults (n8n: "Extract Audit Results") ───────────────────
@@ -3297,20 +3425,15 @@ export async function checkSubjectiveClaudeResponse(claudeResp: unknown, promptD
 // ── S7. generateSubjectiveWithGrok (n8n: "Grok - Generate Article (Fallback)") ──
 
 export async function generateSubjectiveWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
-  const resp = await axios.post(
-    VERCEL_GATEWAY_URL,
-    {
-      model: 'xai/grok-4.3',
-      max_output_tokens: 5000,
-      temperature: 0.4,
-      input: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user',   content: userPrompt },
-      ],
-    },
-    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 120_000 },
-  );
-  return extractGrokResponseText(resp.data);
+  const data = await callGrokWithFallback({
+    systemContent: systemPrompt,
+    userContent:   userPrompt,
+    maxTokens:     5000,
+    temperature:   0.4,
+    timeout:       120_000,
+    label:         'generateSubjectiveWithGrok',
+  });
+  return extractGrokResponseText(data);
 }
 
 // ── S8. validateSubjective (n8n: "Validate Output - Subjective") ──────────────
@@ -3530,27 +3653,15 @@ HARD RULES FOR PATCHES
 
   const userContent = `AUDIT THIS MSN SUBJECTIVE SLIDESHOW. Emit surgical patches only.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}\nPrimary Source URL: ${data.primarySourceUrl || 'None'}\n\nARTICLE TO AUDIT:\n${data.articleText}\n\nMANDATORY ITEMS THAT MUST APPEAR IN THE ARTICLE:\n${data.hasMustInclude ? data.mustIncludeItems.map((item, i) => (i + 1) + '. ' + item).join('\n') : 'None specified.'}\n\nOutput patches in the exact PATCHES format. Never reproduce the article.`;
 
-  try {
-    const resp = await axios.post(
-      VERCEL_GATEWAY_URL,
-      {
-        model: 'xai/grok-4.3',
-        max_output_tokens: 8000,
-        temperature: 0.0,
-        input: [
-          { role: 'system', content: systemContent },
-          { role: 'user',   content: userContent },
-        ],
-      },
-      { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: 240_000 },
-    );
-    return extractGrokResponseText(resp.data);
-  } catch (err: unknown) {
-    if (axios.isAxiosError(err)) {
-      console.error(`[grokSubjectiveStyleAudit] HTTP ${err.response?.status}: ${JSON.stringify(err.response?.data ?? err.message)}`);
-    }
-    throw err;
-  }
+  const grokResp = await callGrokWithFallback({
+    systemContent,
+    userContent,
+    maxTokens:   8000,
+    temperature: 0.0,
+    timeout:     240_000,
+    label:       'grokSubjectiveStyleAudit',
+  });
+  return extractGrokResponseText(grokResp);
 }
 
 // ── S10. extractSubjectiveAudit (n8n: "Extract Audited Article - Subjective") ──
