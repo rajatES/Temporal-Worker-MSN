@@ -13,14 +13,14 @@ import {
 
 dotenv.config();
 
-const FIRECRAWL_KEY  = process.env.FIRECRAWL_API_KEY!;
+const FIRECRAWL_KEY = process.env.FIRECRAWL_API_KEY!;
 const PERPLEXITY_KEY = process.env.PERPLEXITY_API_KEY!;
-const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY!;
-const GROK_KEY       = process.env.GROK_API_KEY!;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!;
+const GROK_KEY = process.env.GROK_API_KEY!;
 const VERCEL_GATEWAY_KEY = process.env.VERCEL_AI_GATEWAY_KEY!;
 
 const VERCEL_GATEWAY_URL = 'https://ai-gateway.vercel.sh/v1/responses';
-const XAI_DIRECT_URL     = 'https://api.x.ai/v1/chat/completions';
+const XAI_DIRECT_URL = 'https://api.x.ai/v1/chat/completions';
 
 function extractGrokResponseText(data: unknown): string {
   const d = data as Record<string, unknown>;
@@ -60,7 +60,7 @@ async function callGrokWithFallback(opts: {
       temperature: opts.temperature,
       input: [
         { role: 'system', content: opts.systemContent },
-        { role: 'user',   content: opts.userContent },
+        { role: 'user', content: opts.userContent },
       ],
     };
     if (opts.tools) body.tools = opts.tools;
@@ -97,7 +97,7 @@ async function callGrokWithFallback(opts: {
     temperature: opts.temperature,
     messages: [
       { role: 'system', content: opts.systemContent },
-      { role: 'user',   content: opts.userContent },
+      { role: 'user', content: opts.userContent },
     ],
   };
   // Note: tools (web_search) are Vercel-gateway-specific; the direct API
@@ -147,10 +147,10 @@ export interface AuditPatch {
 //   REASON: brief
 //   <<<END>>>
 const PATCH_BLOCK_RE = /<<<PATCH>>>([\s\S]*?)<<<END>>>/gi;
-const PATCH_SCOPE_RE   = /SCOPE:\s*([^\n]+)/i;
-const PATCH_FIND_RE    = /FIND:\s*\n([\s\S]*?)\nEND_FIND/i;
+const PATCH_SCOPE_RE = /SCOPE:\s*([^\n]+)/i;
+const PATCH_FIND_RE = /FIND:\s*\n([\s\S]*?)\nEND_FIND/i;
 const PATCH_REPLACE_RE = /REPLACE:\s*\n?([\s\S]*?)\nEND_REPLACE/i;
-const PATCH_REASON_RE  = /REASON:\s*([^\n]+)/i;
+const PATCH_REASON_RE = /REASON:\s*([^\n]+)/i;
 
 export function parseAuditPatches(auditText: string): AuditPatch[] {
   const patches: AuditPatch[] = [];
@@ -158,15 +158,15 @@ export function parseAuditPatches(auditText: string): AuditPatch[] {
   PATCH_BLOCK_RE.lastIndex = 0;
   while ((m = PATCH_BLOCK_RE.exec(auditText)) !== null) {
     const block = m[1];
-    const scope   = block.match(PATCH_SCOPE_RE)?.[1]?.trim();
-    const find    = block.match(PATCH_FIND_RE)?.[1];
+    const scope = block.match(PATCH_SCOPE_RE)?.[1]?.trim();
+    const find = block.match(PATCH_FIND_RE)?.[1];
     const replace = block.match(PATCH_REPLACE_RE)?.[1];
     if (!scope || find == null || replace == null) continue;
     patches.push({
       scope,
-      find:    find.replace(/\r/g, ''),
+      find: find.replace(/\r/g, ''),
       replace: replace.replace(/\r/g, ''),
-      reason:  block.match(PATCH_REASON_RE)?.[1]?.trim() ?? '',
+      reason: block.match(PATCH_REASON_RE)?.[1]?.trim() ?? '',
     });
   }
   return patches;
@@ -350,7 +350,7 @@ function parseMustIncludeItems(raw: string): string[] {
       // (avoids false splits like "Game Title, 2025").
       const commaParts = cleaned.split(/,(?!\d{3}(?:\D|$))(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
       if (commaParts.length >= 3 ||
-          (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2))) {
+        (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2))) {
         for (const part of commaParts) {
           if (part.length > 2) extracted.push(stripLeadingRank(part));
         }
@@ -362,11 +362,34 @@ function parseMustIncludeItems(raw: string): string[] {
     }
   }
 
-  // Deduplicate by normalised form (lowercase, stripped of parenthetical aliases)
+  // Deduplicate by normalised form (preserves first-occurrence order).
+  //
+  // We strip parentheticals that are ALIASES (no digits) — e.g. "Player (QB)" vs
+  // "Player (Quarterback)" should merge. But we KEEP parentheticals that contain
+  // DIGITS — e.g. "Mark McGwire (70 HR, 1998)" vs "Mark McGwire (65 HR, 1999)" are
+  // distinct rows in an "every season" list and must NOT collapse. Same entity,
+  // different qualifying year/stat = different item.
+  //
+  // We also fold trailing digit-bearing context that sits OUTSIDE parentheses
+  // into the key (e.g. "Mark Martin — 49 wins" vs "Mark Martin — 1 win"), so
+  // dash/colon-delimited stat suffixes keep otherwise-identical names separate.
+  const normalizeForDedup = (raw: string): string => {
+    let s = raw.toLowerCase();
+    // Strip ONLY digit-free parentheticals (true aliases); keep digit-bearing ones.
+    s = s.replace(/\s*\(([^()]*)\)\s*/g, (full, inner) =>
+      /\d/.test(inner) ? ` (${String(inner).trim()}) ` : ' ',
+    );
+    // Normalise dash variants and whitespace so spacing/punctuation don't create
+    // false distinctions.
+    s = s.replace(/[—–-]/g, '-').replace(/\s+/g, ' ').trim();
+    return s;
+  };
+
   const seen = new Set<string>();
   const deduped: string[] = [];
   for (const item of extracted) {
-    const norm = item.toLowerCase().replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    const norm = normalizeForDedup(item);
+    if (norm.length === 0) continue;            // nothing meaningful left → skip
     if (!seen.has(norm)) {
       seen.add(norm);
       deduped.push(item);
@@ -376,21 +399,13 @@ function parseMustIncludeItems(raw: string): string[] {
   return deduped;
 }
 
-// Strip a leading rank number that may survive from non-table formats
-// e.g. "40 Dr. Jack Griffin — The Invisible Man" → "Dr. Jack Griffin — The Invisible Man"
-// but preserve names that start with a number: "50 Cent", "21 Savage"
 function stripLeadingRank(s: string): string {
-  // Match: digits at start, followed by a period/colon/dash/whitespace, then a
-  // word that starts with uppercase (indicating a name follows the rank).
-  // Don't strip if the digits are part of the name (no separator between rank and name).
   const m = s.match(/^(\d{1,3})\s*[.):\-–—]?\s+([A-Z])/);
   if (m) {
-    return s.slice(m.index! + m[0].length - 1).trim(); // start at the uppercase letter
+    return s.slice(m.index! + m[0].length - 1).trim();
   }
   return s;
 }
-
-// ── 1. prepareInputAndAnalyze (n8n: "Prepare Input & Analyze") ────────────────
 
 export async function prepareInputAndAnalyze(input: FormInput): Promise<PreparedData> {
   const {
@@ -398,59 +413,59 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
     slidesPerEntityRaw, sourcesRaw, mustIncludeRaw, userContext, writingStyle,
   } = input;
 
-  const title    = rawTitle.trim();
+  const title = rawTitle.trim();
   const category = rawCategory.trim();
   const slideCount = typeof rawSlides === 'string' ? parseInt(rawSlides, 10) || 20 : (rawSlides || 20);
 
-  if (!title)    throw new Error('Slideshow Title is required');
+  if (!title) throw new Error('Slideshow Title is required');
   if (!category) throw new Error('Topic Category is required');
 
   // Temporal context
-  const now          = new Date();
-  const currentYear  = now.getFullYear();
+  const now = new Date();
+  const currentYear = now.getFullYear();
   const currentMonth = now.getMonth() + 1;
 
   type SeasonDef = { currentSeason: string; lastSeason: string; seasonFormat: string };
   const sportSeasons: Record<string, SeasonDef> = {
-    NFL:    { currentSeason: currentMonth >= 9 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 9 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
-    NBA:    { currentSeason: currentMonth >= 10 ? `${currentYear}-${String(currentYear + 1).slice(2)}` : `${currentYear - 1}-${String(currentYear).slice(2)}`, lastSeason: currentMonth >= 10 ? `${currentYear - 1}-${String(currentYear).slice(2)}` : `${currentYear - 2}-${String(currentYear - 1).slice(2)}`, seasonFormat: 'split_year' },
-    WNBA:   { currentSeason: currentMonth >= 5 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 5 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
-    GOLF:   { currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
-    DEFAULT:{ currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
+    NFL: { currentSeason: currentMonth >= 9 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 9 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
+    NBA: { currentSeason: currentMonth >= 10 ? `${currentYear}-${String(currentYear + 1).slice(2)}` : `${currentYear - 1}-${String(currentYear).slice(2)}`, lastSeason: currentMonth >= 10 ? `${currentYear - 1}-${String(currentYear).slice(2)}` : `${currentYear - 2}-${String(currentYear - 1).slice(2)}`, seasonFormat: 'split_year' },
+    WNBA: { currentSeason: currentMonth >= 5 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 5 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
+    GOLF: { currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
+    DEFAULT: { currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
   };
 
-  const sportKey    = category.replace('Sports - ', '').toUpperCase();
-  const seasonCtx   = sportSeasons[sportKey] ?? sportSeasons.DEFAULT;
+  const sportKey = category.replace('Sports - ', '').toUpperCase();
+  const seasonCtx = sportSeasons[sportKey] ?? sportSeasons.DEFAULT;
 
   const temporalContext: TemporalCtx = {
     today: now.toISOString().split('T')[0],
     currentYear, currentMonth,
     ...seasonCtx,
-    dateAnchor:   `Today is ${now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
+    dateAnchor: `Today is ${now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
     seasonAnchor: `The most recent completed ${sportKey || 'sports'} season is ${seasonCtx.lastSeason}. Current/ongoing season is ${seasonCtx.currentSeason}.`,
   };
 
   // Format config
   const slidesPerEntity = slidesPerEntityRaw.startsWith('2') ? 2 : 1;
-  const entityCount     = Math.floor(slideCount / slidesPerEntity);
+  const entityCount = Math.floor(slideCount / slidesPerEntity);
 
   let continuationStyle = 'same_name';
-  if (/\(cont\.?\)/i.test(userContext))     continuationStyle = 'cont';
-  else if (/continued/i.test(userContext))  continuationStyle = 'continued';
-  else if (/part\s*2/i.test(userContext))   continuationStyle = 'part2';
+  if (/\(cont\.?\)/i.test(userContext)) continuationStyle = 'cont';
+  else if (/continued/i.test(userContext)) continuationStyle = 'continued';
+  else if (/part\s*2/i.test(userContext)) continuationStyle = 'part2';
 
   const formatConfig: FormatConfig = { slidesPerEntity, entityCount, isMultiSlideFormat: slidesPerEntity > 1, continuationStyle };
 
   // Title analysis
-  const numberMatch  = title.match(/(\d+)\s+/);
+  const numberMatch = title.match(/(\d+)\s+/);
   const promisedCount = numberMatch ? parseInt(numberMatch[1]) : entityCount;
-  const isRanking    = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
-  const isListicle   = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
-  const isTimeBased  = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
+  const isRanking = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
+  const isListicle = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
+  const isTimeBased = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
   const emotionMatch = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
 
-  const colonSplit     = title.split(/[:–—-]/);
-  const mainAngle      = colonSplit[0].trim();
+  const colonSplit = title.split(/[:–—-]/);
+  const mainAngle = colonSplit[0].trim();
   const secondaryAngle = colonSplit.length > 1 ? colonSplit.slice(1).join(' ').trim() : null;
   const requiresCorrelation = /mock draft|fit\s+(?:with|for)|compare|vs\.?|versus|how\s+\w+\s+(?:helps?|improves?)/i.test(title);
 
@@ -472,11 +487,11 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
     .filter((url, i, arr) => arr.findIndex(u => u.replace(/\/+$/, '') === url.replace(/\/+$/, '')) === i)
     .slice(0, 5);
 
-  const userPrimaryUrl      = allUrls[0] ?? '';
-  const userSecondaryUrls   = allUrls.slice(1);                // up to 4 extras (5 total)
+  const userPrimaryUrl = allUrls[0] ?? '';
+  const userSecondaryUrls = allUrls.slice(1);                // up to 4 extras (5 total)
   const isUserUrlRestricted = userPrimaryUrl ? isRestricted(userPrimaryUrl) : false;
-  const hasValidUserSource  = !!userPrimaryUrl && !isUserUrlRestricted;
-  const mustIncludeItems    = parseMustIncludeItems(mustIncludeRaw ?? '');
+  const hasValidUserSource = !!userPrimaryUrl && !isUserUrlRestricted;
+  const mustIncludeItems = parseMustIncludeItems(mustIncludeRaw ?? '');
   const userWordCountOverride = parseWordCountOverride(userContext);
 
   return {
@@ -492,23 +507,6 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   };
 }
 
-// ── 2. firecrawlScrape (n8n: Firecrawl nodes) ────────────────────────────────
-//
-// Uses Firecrawl v2 with markdown output (matches n8n) plus three tuning knobs
-// n8n doesn't pass:
-//   - waitFor: 2000        → JS-heavy sites (givemesport, sportskeeda) render
-//                             their article DOM after a delay; without waiting
-//                             Firecrawl reads only the initial video-player
-//                             skeleton
-//   - blockAds: true       → strips ad-iframe content before markdown convert
-//   - excludeTags expanded → also strips video/audio/iframe/figure/dialog/form
-//                             which on modern sites produce nav-menu garbage
-//
-// The result always passes through cleanFirecrawlMarkdown() — see comment
-// below. Content is ALWAYS returned; an unusable scrape would still be passed
-// downstream where the alignment scorer + atomizer + Perplexity fallback
-// already handle thin sources gracefully.
-
 const FIRECRAWL_EXCLUDE_TAGS = [
   // n8n's original set
   'nav', 'footer', 'aside', 'header', 'script', 'style', 'ads', 'comments',
@@ -518,24 +516,6 @@ const FIRECRAWL_EXCLUDE_TAGS = [
   'form', 'button', 'input', 'select', 'option', 'dialog', 'noscript',
 ];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// cleanFirecrawlMarkdown — dedicated parser/cleaner step.
-//
-// This is the equivalent of an n8n "Code node" that processes the Firecrawl
-// output before it feeds the AI prompts. It is NON-DESTRUCTIVE to article
-// prose — only well-known UI noise patterns are removed.
-//
-// Patterns stripped:
-//   - Video-player chrome (Now Playing, Play, Mute, Fullscreen, Loaded: 0%,
-//     Stream Type LIVE, Picture-in-Picture, This is a modal window, etc.)
-//   - Ad widget labels (✕ Remove Ads, Skip Ad, Advertisement, WATCH NEXT)
-//   - Cookie/consent banners (We use cookies, Accept All, Manage Settings)
-//   - Newsletter signup widgets (Subscribe, Sign up for our newsletter)
-//   - Image-only lines with no alt text ([](url) → drops)
-//   - Excessive blank lines collapsed to one
-//
-// Any line with substantive prose (>40 chars, sentence-shaped) is always kept.
-// ─────────────────────────────────────────────────────────────────────────────
 
 const NOISE_LINE_PATTERNS: RegExp[] = [
   // Video player UI
@@ -677,9 +657,9 @@ export async function analyzeSourceAlignment(
     return { ...prepData, sourceAnalysis: { status: 'SCRAPE_FAILED', alignmentScore: 0, recommendation: 'SEARCH_FOR_SOURCES', scrapedContent: '', sourceCount: 0 } };
   }
 
-  const sourceLower     = allSourceContent.toLowerCase();
-  const titleWords      = prepData.title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
-  const keywordMatches  = titleWords.filter(w => sourceLower.includes(w));
+  const sourceLower = allSourceContent.toLowerCase();
+  const titleWords = prepData.title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  const keywordMatches = titleWords.filter(w => sourceLower.includes(w));
   const keywordMatchRate = titleWords.length > 0 ? keywordMatches.length / titleWords.length : 0;
 
   const listPatterns = [/^\d+[.):\s]+/gm, /^#+\s+\d+/gm, /^\*\*\d+/gm];
@@ -690,13 +670,13 @@ export async function analyzeSourceAlignment(
   }
 
   const factTypeChecks = {
-    has_stats:  /\d+(?:\.\d+)?(?:\s*%|\s+yards?|\s+points?|\s+goals?)/i.test(allSourceContent),
-    has_dates:  /\b(19|20)\d{2}\b/.test(allSourceContent),
-    has_names:  /\b[A-Z][a-z]+\s+[A-Z][a-z]+\b/.test(allSourceContent),
+    has_stats: /\d+(?:\.\d+)?(?:\s*%|\s+yards?|\s+points?|\s+goals?)/i.test(allSourceContent),
+    has_dates: /\b(19|20)\d{2}\b/.test(allSourceContent),
+    has_names: /\b[A-Z][a-z]+\s+[A-Z][a-z]+\b/.test(allSourceContent),
   };
 
   const multiSourceBonus = prepData.sourceCount > 1 ? 10 : 0;
-  const alignmentScore   = Math.min(100, Math.round(
+  const alignmentScore = Math.min(100, Math.round(
     (keywordMatchRate * 40)
     + (Math.min(estimatedItems / prepData.formatConfig.entityCount, 1) * 30)
     + (factTypeChecks.has_stats ? 10 : 0)
@@ -706,9 +686,9 @@ export async function analyzeSourceAlignment(
   ));
 
   let status: string, recommendation: string;
-  if (alignmentScore >= 60)      { status = 'GOOD_MATCH';    recommendation = 'USE_SOURCE'; }
+  if (alignmentScore >= 60) { status = 'GOOD_MATCH'; recommendation = 'USE_SOURCE'; }
   else if (alignmentScore >= 35) { status = 'PARTIAL_MATCH'; recommendation = 'USE_WITH_SUPPLEMENTS'; }
-  else                           { status = 'POOR_MATCH';    recommendation = 'SEARCH_FOR_SOURCES'; }
+  else { status = 'POOR_MATCH'; recommendation = 'SEARCH_FOR_SOURCES'; }
 
   let researchMode: string;
   if (alignmentScore >= 70 && estimatedItems >= prepData.formatConfig.entityCount * 0.9) {
@@ -725,7 +705,7 @@ export async function analyzeSourceAlignment(
       status, recommendation, alignmentScore, estimatedItems, factTypeChecks,
       scrapedContent: allSourceContent,
       scrapedSources,
-      sourceCount:   prepData.sourceCount,
+      sourceCount: prepData.sourceCount,
       primaryLength: primaryMarkdown.length,
       secondaryLength: additionalMarkdowns.reduce((s, m) => s + m.length, 0),
       researchMode,
@@ -737,15 +717,15 @@ export async function analyzeSourceAlignment(
 
 export async function buildResearchStrategy(prepData: PreparedData): Promise<SourcedData> {
   const authoritativeDomains: Record<string, string[]> = {
-    'NFL':       ['espn.com','nfl.com','pro-football-reference.com'],
-    'NBA':       ['espn.com','nba.com','basketball-reference.com'],
-    'GOLF':      ['pga.com','golfdigest.com','golf.com'],
-    'MOVIES & TV':['imdb.com','rottentomatoes.com','boxofficemojo.com'],
-    'POP CULTURE':['people.com','eonline.com','imdb.com'],
-    'DEFAULT':   ['espn.com','wikipedia.org'],
+    'NFL': ['espn.com', 'nfl.com', 'pro-football-reference.com'],
+    'NBA': ['espn.com', 'nba.com', 'basketball-reference.com'],
+    'GOLF': ['pga.com', 'golfdigest.com', 'golf.com'],
+    'MOVIES & TV': ['imdb.com', 'rottentomatoes.com', 'boxofficemojo.com'],
+    'POP CULTURE': ['people.com', 'eonline.com', 'imdb.com'],
+    'DEFAULT': ['espn.com', 'wikipedia.org'],
   };
 
-  const sportKey       = prepData.category.replace('Sports - ', '').toUpperCase();
+  const sportKey = prepData.category.replace('Sports - ', '').toUpperCase();
   const preferredDomains = authoritativeDomains[sportKey] ?? authoritativeDomains[prepData.category.toUpperCase()] ?? authoritativeDomains.DEFAULT;
 
   return {
@@ -837,227 +817,227 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
   }
 
   const rawItems: AtomizedFact[] = [];
-  const sourceSignatures: string[]    = [];
+  const sourceSignatures: string[] = [];
 
   // Atomize each source independently — equal Tier 1A authority across all.
   for (const sourceContent of sourcesToAtomize) {
     if (!sourceContent || sourceContent.length < 50) continue;
 
-  // Try multiple section-splitting strategies in priority order.
-  // Order matters: numbered per-item splits run BEFORE the entity-prefix split,
-  // because the entity-prefix split would otherwise greedily grab top-level
-  // section headers (## AFC North) and miss the per-team ### sub-items inside.
-  let sections: string[] = [];
-  if (sourceContent) {
-    // Strategy 1: "N of M" slideshow format (Yardbarker, Bleacher Report, etc.)
-    // Splits on lines like "1 of 32", "2 of 32" that precede ## headings
-    const nOfMSections = sourceContent.split(/(?=\n\d{1,3}\s+of\s+\d{1,3}\s*\n)/);
-    if (nOfMSections.length >= 3) {
-      sections = nOfMSections;
-    }
-
-    // Strategy 2: Numbered headers — `## 1. Title`, `### 1\. Title`, `# 2: Title`.
-    // `\\?` allows the markdown-escaped period (`1\.`) used by SB Nation etc.
-    // `{1,3}` covers h1/h2/h3 — h3 sub-headers are how SB Nation lists per-team
-    // entries inside larger `## AFC North` division blocks. We attempt this BEFORE
-    // the entity-prefix split so per-item separation wins over per-division grouping.
-    if (sections.length < 3) {
-      const numberedSections = sourceContent.split(/\n(?=[ \t]*#{1,3}[ \t]+\d{1,3}\\?[.):][ \t]+)/);
-      if (numberedSections.length >= 3) {
-        sections = numberedSections;
+    // Try multiple section-splitting strategies in priority order.
+    // Order matters: numbered per-item splits run BEFORE the entity-prefix split,
+    // because the entity-prefix split would otherwise greedily grab top-level
+    // section headers (## AFC North) and miss the per-team ### sub-items inside.
+    let sections: string[] = [];
+    if (sourceContent) {
+      // Strategy 1: "N of M" slideshow format (Yardbarker, Bleacher Report, etc.)
+      // Splits on lines like "1 of 32", "2 of 32" that precede ## headings
+      const nOfMSections = sourceContent.split(/(?=\n\d{1,3}\s+of\s+\d{1,3}\s*\n)/);
+      if (nOfMSections.length >= 3) {
+        sections = nOfMSections;
       }
-    }
 
-    // Strategy 3: ## headers with linked or plain "Entity: Subject" format
-    // e.g. "## [Arizona Cardinals](url): Karlos Dansby" or "## Arizona Cardinals: Karlos Dansby"
-    if (sections.length < 3) {
-      const entitySections = sourceContent.split(/(?=##\s*\[?[A-Z])/);
-      if (entitySections.length >= 3) {
-        sections = entitySections;
+      // Strategy 2: Numbered headers — `## 1. Title`, `### 1\. Title`, `# 2: Title`.
+      // `\\?` allows the markdown-escaped period (`1\.`) used by SB Nation etc.
+      // `{1,3}` covers h1/h2/h3 — h3 sub-headers are how SB Nation lists per-team
+      // entries inside larger `## AFC North` division blocks. We attempt this BEFORE
+      // the entity-prefix split so per-item separation wins over per-division grouping.
+      if (sections.length < 3) {
+        const numberedSections = sourceContent.split(/\n(?=[ \t]*#{1,3}[ \t]+\d{1,3}\\?[.):][ \t]+)/);
+        if (numberedSections.length >= 3) {
+          sections = numberedSections;
+        }
       }
-    }
-  }
 
-  sections.forEach((section, sectionIdx) => {
-    if (section.trim().length < 30) return;
-
-    // Extract item number and name with multiple patterns
-    let itemNumber = sectionIdx + 1;
-    let itemName   = `Item ${sectionIdx + 1}`;
-    let content    = section;
-
-    // Pattern A: "N of M" counter line followed by ## heading
-    const nOfMMatch = section.match(/(\d{1,3})\s+of\s+\d{1,3}\s*\n+##\s*\[?([^\]\n]+)\]?(?:\([^)]*\))?[:\s]*(.+?)(?:\n|$)/);
-    if (nOfMMatch) {
-      itemNumber = parseInt(nOfMMatch[1]);
-      const team = nOfMMatch[2].trim();
-      const subject = nOfMMatch[3]?.trim().replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') ?? '';
-      itemName = subject ? `${team}: ${subject}` : team;
-      content = section.replace(/^[\s\S]*?\n##\s*[^\n]+\n/, '');
-    } else {
-      // Pattern B: ## [Team](url): Player or ## Team: Player
-      // Requires a literal `:` separator — without this it swallows the numbered
-      // format "## 1. Player — Team" by treating the whole heading as `team` and
-      // the first content line as `subject`.
-      const headingMatch = section.match(/^##\s*\[?([^\]\n]+?)\]?(?:\([^)]*\))?\s*:\s+\[?([^\]\n(]+?)\]?(?:\([^)]*\))?\s*(?:\n|$)/);
-      if (headingMatch) {
-        const team = headingMatch[1].trim();
-        const subject = headingMatch[2]?.trim().replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') ?? '';
-        itemName = subject ? `${team}: ${subject}` : team;
-        content = section.replace(/^##\s*[^\n]+\n/, '');
-      } else {
-        // Pattern C: Numbered format (## 1. Title, ### 1\. Title, # 2: Title) — must
-        // match the same shape the splitter accepted: line-start, space, separator
-        // required. `\\?` allows the markdown-escaped period (`1\.`) used by SB Nation.
-        // `{1,3}` covers h1/h2/h3 so per-team `###` entries are captured.
-        const numberedMatch = section.match(/^[ \t]*#{1,3}[ \t]+(\d{1,3})\\?[.):][ \t]+(.+?)(?:\n|$)/);
-        if (numberedMatch) {
-          itemNumber = parseInt(numberedMatch[1]);
-          itemName = numberedMatch[2].trim().replace(/\*\*/g, '');
-          content = section.replace(/^[ \t]*#{1,3}[ \t]+\d{1,3}\\?[.):][ \t]+.+?\n/, '');
+      // Strategy 3: ## headers with linked or plain "Entity: Subject" format
+      // e.g. "## [Arizona Cardinals](url): Karlos Dansby" or "## Arizona Cardinals: Karlos Dansby"
+      if (sections.length < 3) {
+        const entitySections = sourceContent.split(/(?=##\s*\[?[A-Z])/);
+        if (entitySections.length >= 3) {
+          sections = entitySections;
         }
       }
     }
 
-    // Strip markdown images, link markup, and image credit lines from content
-    content = content
-      .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-      .replace(/^[A-Z][\w. ]+(?:\/|-)?(?:Getty Images|Icon Sportswire|Imagn Images|USA TODAY Sports|Allsport|Getty|AP Photo|Icon SMI)[^\n]*\s*/gm, '')
-      .trim();
-    const facts: AtomizedFact['facts'] = [];
+    sections.forEach((section, sectionIdx) => {
+      if (section.trim().length < 30) return;
 
-    type StatDef = { pattern: RegExp; type: string };
-    const statPatterns: StatDef[] = [
-      { pattern: /(\d+(?:,\d{3})*(?:\.\d+)?)\s*(yards?|passing yards?|rushing yards?|touchdowns?|TDs?|points?|rebounds?|assists?)/gi, type: 'stat' },
-      { pattern: /\$(\d+(?:,\d{3})*(?:\.\d+)?)\s*(million|billion|[MBK])?/gi, type: 'money' },
-      { pattern: /(\d+(?:\.\d+)?)\s*%/g, type: 'percentage' },
-      { pattern: /(\d+)\s*(Pro Bowls?|All-Stars?|MVP|Emmy|Oscar|Grammy|championships?|titles?|rings?)/gi, type: 'achievement' },
-    ];
+      // Extract item number and name with multiple patterns
+      let itemNumber = sectionIdx + 1;
+      let itemName = `Item ${sectionIdx + 1}`;
+      let content = section;
 
-    for (const { pattern, type } of statPatterns) {
-      const rx = new RegExp(pattern.source, pattern.flags);
-      let m: RegExpExecArray | null;
-      while ((m = rx.exec(content)) !== null) facts.push({ type, value: m[0].trim() });
-    }
-
-    for (const m of content.matchAll(/\b((19|20)\d{2})\b/g)) facts.push({ type: 'date', value: m[1] });
-    for (const m of content.matchAll(/"([^"]{15,150})"/g))  facts.push({ type: 'quote', value: m[1], isExactQuote: true });
-
-    // ── Non-numeric fact patterns ───────────────────────────────────────────
-    // Capture team affiliations, draft picks, transactions, positions, status —
-    // the kinds of facts that change recently and don't survive a pure-numeric
-    // atomization. These let Claude write accurate, time-sensitive prose
-    // (current team, latest draft, recent trade) without relying on training.
-    const narrativePatterns: StatDef[] = [
-      // Draft picks: numeric ("drafted #1 overall by the Bears", "3rd by Chicago")
-      // OR word-ordinal ("selected first overall by the Bears", "picked second")
-      { pattern: /\b(?:drafted|selected|picked|chosen)\s+(?:(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:overall\s+)?)?(?:in\s+(?:the\s+)?\d+(?:st|nd|rd|th)\s+round\s+)?by\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|with|after))/gi, type: 'draft' },
-      // "picked Drake Maye third overall" — verb + 1-4-word name + ordinal + overall (optionally + "by team")
-      { pattern: /\b(?:drafted|selected|picked|chose|chosen)\s+[A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,3}\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall(?:\s+by\s+(?:the\s+)?[A-Z][a-zA-Z'.& -]{2,30})?\b/gi, type: 'draft' },
-      // "Commanders selected him second overall" — team + verb + pronoun + ordinal
-      { pattern: /\b[A-Z][a-zA-Z'.-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,2}\s+(?:drafted|selected|picked|chose|chosen)\s+(?:him|her|them)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\b/gi, type: 'draft' },
-      // "picked X overall" / "selected X overall" (no "by" required) — bare ordinal pick
-      { pattern: /\b(?:drafted|selected|picked|chosen)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\b/gi, type: 'draft_pick' },
-      { pattern: /\b(?:#|No\.?\s*)(\d{1,2})(?:st|nd|rd|th)?\s+(?:overall\s+(?:pick|selection)|pick|selection)\b/gi, type: 'draft_pick' },
-      { pattern: /\b\d+(?:st|nd|rd|th)\s+overall\s+(?:pick|selection)\b/gi, type: 'draft_pick' },
-      { pattern: /\b(?:going|went)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\s+to\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/gi, type: 'draft' },
-      // Big contract signings: "signed a four-year, $39.5 million [rookie] contract/deal/extension"
-      // Allows up to two intervening adjectives between the dollar amount and the contract noun.
-      { pattern: /\bsigned\s+(?:a\s+)?(?:\w+(?:-year)?(?:[,\s]+\w+)?[,\s]+)?\$\d+(?:\.\d+)?\s*(?:million|billion|M|B)?(?:\s+\w+){0,2}\s+(?:contract|deal|extension|agreement)/gi, type: 'contract' },
-      // Transactions: trades, signings, free-agent moves
-      { pattern: /\b(?:traded|sent|dealt|moved|transferred)\s+to\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|for|with))/g, type: 'transaction' },
-      { pattern: /\b(?:signed|inked|agreed)\s+(?:a\s+(?:contract|deal|extension)\s+)?with\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/g, type: 'transaction' },
-      { pattern: /\b(?:joined|joins|joining)\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|as|after))/g, type: 'transaction' },
-      // Current team affiliation
-      { pattern: /\b(?:plays?|currently plays|now plays|started|stars?)\s+for\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/g, type: 'affiliation' },
-      { pattern: /\bwith\s+(?:the\s+)?([A-Z][a-zA-Z][a-zA-Z0-9 .&'-]{3,40}?)(?=[,.\n]|\s+(?:since|after|in\s+\d))/g, type: 'affiliation' },
-      // Positions
-      { pattern: /\b(?:starting|veteran|rookie|backup|All-Pro|Pro Bowl)\s+(quarterback|QB|running back|RB|wide receiver|WR|tight end|TE|cornerback|CB|safety|linebacker|LB|defensive end|edge rusher|defensive tackle|center|guard|tackle|kicker|punter|point guard|shooting guard|small forward|power forward|center|striker|midfielder|defender|goalkeeper)\b/gi, type: 'position' },
-      // Status changes
-      { pattern: /\b(retired|retiring|injured|suspended|released|cut|waived|placed on IR|on injured reserve|inactive|active roster)\b/gi, type: 'status' },
-    ];
-
-    for (const { pattern, type } of narrativePatterns) {
-      const rx = new RegExp(pattern.source, pattern.flags);
-      let m: RegExpExecArray | null;
-      while ((m = rx.exec(content)) !== null) {
-        const value = m[0].trim().replace(/\s+/g, ' ');
-        // Skip generic / overlong matches
-        if (value.length < 4 || value.length > 80) continue;
-        facts.push({ type, value });
+      // Pattern A: "N of M" counter line followed by ## heading
+      const nOfMMatch = section.match(/(\d{1,3})\s+of\s+\d{1,3}\s*\n+##\s*\[?([^\]\n]+)\]?(?:\([^)]*\))?[:\s]*(.+?)(?:\n|$)/);
+      if (nOfMMatch) {
+        itemNumber = parseInt(nOfMMatch[1]);
+        const team = nOfMMatch[2].trim();
+        const subject = nOfMMatch[3]?.trim().replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') ?? '';
+        itemName = subject ? `${team}: ${subject}` : team;
+        content = section.replace(/^[\s\S]*?\n##\s*[^\n]+\n/, '');
+      } else {
+        // Pattern B: ## [Team](url): Player or ## Team: Player
+        // Requires a literal `:` separator — without this it swallows the numbered
+        // format "## 1. Player — Team" by treating the whole heading as `team` and
+        // the first content line as `subject`.
+        const headingMatch = section.match(/^##\s*\[?([^\]\n]+?)\]?(?:\([^)]*\))?\s*:\s+\[?([^\]\n(]+?)\]?(?:\([^)]*\))?\s*(?:\n|$)/);
+        if (headingMatch) {
+          const team = headingMatch[1].trim();
+          const subject = headingMatch[2]?.trim().replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') ?? '';
+          itemName = subject ? `${team}: ${subject}` : team;
+          content = section.replace(/^##\s*[^\n]+\n/, '');
+        } else {
+          // Pattern C: Numbered format (## 1. Title, ### 1\. Title, # 2: Title) — must
+          // match the same shape the splitter accepted: line-start, space, separator
+          // required. `\\?` allows the markdown-escaped period (`1\.`) used by SB Nation.
+          // `{1,3}` covers h1/h2/h3 so per-team `###` entries are captured.
+          const numberedMatch = section.match(/^[ \t]*#{1,3}[ \t]+(\d{1,3})\\?[.):][ \t]+(.+?)(?:\n|$)/);
+          if (numberedMatch) {
+            itemNumber = parseInt(numberedMatch[1]);
+            itemName = numberedMatch[2].trim().replace(/\*\*/g, '');
+            content = section.replace(/^[ \t]*#{1,3}[ \t]+\d{1,3}\\?[.):][ \t]+.+?\n/, '');
+          }
+        }
       }
-    }
 
-    // ── Smart narrative context: signal-scored selection + adaptive sizing ─────
-    // Sentences are scored by non-numeric-fact density (proper nouns, action
-    // verbs, time refs, positions) and penalized for noise (number-dominated
-    // lines, long quotes, markdown). Budget per item scales inversely with how
-    // many structured facts the regexes already captured — sparse items get
-    // up to 500 chars of CONTEXT, well-covered items get 200.
-    const ACTION_VERB_RE  = /\b(drafted|selected|picked|signed|inked|traded|sent|dealt|moved|joined|joins|retired|retiring|released|cut|waived|debut(?:ed)?|started|leads?|finished|won|broke|set|earned|named|hired|fired|coaches?|manages?|plays?|stars?|takes? over|stepped)\b/i;
-    const TIME_REF_RE     = /\b(last (?:season|year|month|week)|this (?:season|year|offseason)|currently|recently|since\s+\d{4}|in\s+(?:19|20)\d{2}|now|after)\b/i;
-    const POSITION_RE     = /\b(quarterback|QB|running back|RB|wide receiver|WR|tight end|TE|cornerback|CB|safety|linebacker|LB|defensive end|edge|center|guard|tackle|kicker|punter|point guard|shooting guard|forward|striker|midfielder|defender|goalkeeper|head coach|coach|GM|general manager|owner)\b/i;
-    const PROPER_NOUN_RE  = /\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b/;
-    const NUMBER_HEAVY_RE = /(?:\d[\d,.]*[\s,]+){3,}/;
-    const LONG_QUOTE_RE   = /"[^"]{20,}"/;
-    const MARKDOWN_RE     = /^(?:##|!\[|\[\[|\*\*)/;
+      // Strip markdown images, link markup, and image credit lines from content
+      content = content
+        .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+        .replace(/^[A-Z][\w. ]+(?:\/|-)?(?:Getty Images|Icon Sportswire|Imagn Images|USA TODAY Sports|Allsport|Getty|AP Photo|Icon SMI)[^\n]*\s*/gm, '')
+        .trim();
+      const facts: AtomizedFact['facts'] = [];
 
-    type ScoredSent = { text: string; originalIdx: number; score: number };
-    const rawSentences = content
-      .split(/(?<=[.!?])\s+/)
-      .map((s, i) => ({ text: s.trim(), originalIdx: i }))
-      .filter(s => s.text.length > 25 && s.text.length < 280);
+      type StatDef = { pattern: RegExp; type: string };
+      const statPatterns: StatDef[] = [
+        { pattern: /(\d+(?:,\d{3})*(?:\.\d+)?)\s*(yards?|passing yards?|rushing yards?|touchdowns?|TDs?|points?|rebounds?|assists?)/gi, type: 'stat' },
+        { pattern: /\$(\d+(?:,\d{3})*(?:\.\d+)?)\s*(million|billion|[MBK])?/gi, type: 'money' },
+        { pattern: /(\d+(?:\.\d+)?)\s*%/g, type: 'percentage' },
+        { pattern: /(\d+)\s*(Pro Bowls?|All-Stars?|MVP|Emmy|Oscar|Grammy|championships?|titles?|rings?)/gi, type: 'achievement' },
+      ];
 
-    const scored: ScoredSent[] = rawSentences.map(s => {
-      let score = 0;
-      if (PROPER_NOUN_RE.test(s.text))  score += 2;
-      if (ACTION_VERB_RE.test(s.text))  score += 1;
-      if (TIME_REF_RE.test(s.text))     score += 1;
-      if (POSITION_RE.test(s.text))     score += 1;
-      if (NUMBER_HEAVY_RE.test(s.text)) score -= 1;
-      if (LONG_QUOTE_RE.test(s.text))   score -= 2;
-      if (MARKDOWN_RE.test(s.text))     score -= 2;
-      return { ...s, score };
-    });
+      for (const { pattern, type } of statPatterns) {
+        const rx = new RegExp(pattern.source, pattern.flags);
+        let m: RegExpExecArray | null;
+        while ((m = rx.exec(content)) !== null) facts.push({ type, value: m[0].trim() });
+      }
 
-    // Adaptive char budget: more CONTEXT when structured fact extraction was sparse
-    const structuredFactCount = facts.length;
-    const charBudget = structuredFactCount >= 5 ? 200
-                     : structuredFactCount >= 2 ? 350
-                     :                            500;
+      for (const m of content.matchAll(/\b((19|20)\d{2})\b/g)) facts.push({ type: 'date', value: m[1] });
+      for (const m of content.matchAll(/"([^"]{15,150})"/g)) facts.push({ type: 'quote', value: m[1], isExactQuote: true });
 
-    // Greedy fill: take highest-scoring sentences until budget exhausted
-    const candidates = scored.filter(s => s.score >= 1).sort((a, b) => b.score - a.score);
-    const chosen: ScoredSent[] = [];
-    let runningLength = 0;
-    for (const s of candidates) {
-      if (runningLength + s.text.length + 1 > charBudget) continue;
-      chosen.push(s);
-      runningLength += s.text.length + 1;
-      if (chosen.length >= 5) break;
-    }
+      // ── Non-numeric fact patterns ───────────────────────────────────────────
+      // Capture team affiliations, draft picks, transactions, positions, status —
+      // the kinds of facts that change recently and don't survive a pure-numeric
+      // atomization. These let Claude write accurate, time-sensitive prose
+      // (current team, latest draft, recent trade) without relying on training.
+      const narrativePatterns: StatDef[] = [
+        // Draft picks: numeric ("drafted #1 overall by the Bears", "3rd by Chicago")
+        // OR word-ordinal ("selected first overall by the Bears", "picked second")
+        { pattern: /\b(?:drafted|selected|picked|chosen)\s+(?:(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:overall\s+)?)?(?:in\s+(?:the\s+)?\d+(?:st|nd|rd|th)\s+round\s+)?by\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|with|after))/gi, type: 'draft' },
+        // "picked Drake Maye third overall" — verb + 1-4-word name + ordinal + overall (optionally + "by team")
+        { pattern: /\b(?:drafted|selected|picked|chose|chosen)\s+[A-Z][a-zA-Z'-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,3}\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall(?:\s+by\s+(?:the\s+)?[A-Z][a-zA-Z'.& -]{2,30})?\b/gi, type: 'draft' },
+        // "Commanders selected him second overall" — team + verb + pronoun + ordinal
+        { pattern: /\b[A-Z][a-zA-Z'.-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,2}\s+(?:drafted|selected|picked|chose|chosen)\s+(?:him|her|them)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\b/gi, type: 'draft' },
+        // "picked X overall" / "selected X overall" (no "by" required) — bare ordinal pick
+        { pattern: /\b(?:drafted|selected|picked|chosen)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\b/gi, type: 'draft_pick' },
+        { pattern: /\b(?:#|No\.?\s*)(\d{1,2})(?:st|nd|rd|th)?\s+(?:overall\s+(?:pick|selection)|pick|selection)\b/gi, type: 'draft_pick' },
+        { pattern: /\b\d+(?:st|nd|rd|th)\s+overall\s+(?:pick|selection)\b/gi, type: 'draft_pick' },
+        { pattern: /\b(?:going|went)\s+(?:#?\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+overall\s+to\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/gi, type: 'draft' },
+        // Big contract signings: "signed a four-year, $39.5 million [rookie] contract/deal/extension"
+        // Allows up to two intervening adjectives between the dollar amount and the contract noun.
+        { pattern: /\bsigned\s+(?:a\s+)?(?:\w+(?:-year)?(?:[,\s]+\w+)?[,\s]+)?\$\d+(?:\.\d+)?\s*(?:million|billion|M|B)?(?:\s+\w+){0,2}\s+(?:contract|deal|extension|agreement)/gi, type: 'contract' },
+        // Transactions: trades, signings, free-agent moves
+        { pattern: /\b(?:traded|sent|dealt|moved|transferred)\s+to\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|for|with))/g, type: 'transaction' },
+        { pattern: /\b(?:signed|inked|agreed)\s+(?:a\s+(?:contract|deal|extension)\s+)?with\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/g, type: 'transaction' },
+        { pattern: /\b(?:joined|joins|joining)\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n]|\s+(?:in|as|after))/g, type: 'transaction' },
+        // Current team affiliation
+        { pattern: /\b(?:plays?|currently plays|now plays|started|stars?)\s+for\s+(?:the\s+)?([A-Z][a-zA-Z0-9 .&'-]{2,40}?)(?=[,.\n])/g, type: 'affiliation' },
+        { pattern: /\bwith\s+(?:the\s+)?([A-Z][a-zA-Z][a-zA-Z0-9 .&'-]{3,40}?)(?=[,.\n]|\s+(?:since|after|in\s+\d))/g, type: 'affiliation' },
+        // Positions
+        { pattern: /\b(?:starting|veteran|rookie|backup|All-Pro|Pro Bowl)\s+(quarterback|QB|running back|RB|wide receiver|WR|tight end|TE|cornerback|CB|safety|linebacker|LB|defensive end|edge rusher|defensive tackle|center|guard|tackle|kicker|punter|point guard|shooting guard|small forward|power forward|center|striker|midfielder|defender|goalkeeper)\b/gi, type: 'position' },
+        // Status changes
+        { pattern: /\b(retired|retiring|injured|suspended|released|cut|waived|placed on IR|on injured reserve|inactive|active roster)\b/gi, type: 'status' },
+      ];
 
-    // Restore original reading order so the context flows naturally for Claude
-    const narrativeContext = chosen
-      .sort((a, b) => a.originalIdx - b.originalIdx)
-      .map(s => s.text)
-      .join(' ')
-      .slice(0, charBudget);
+      for (const { pattern, type } of narrativePatterns) {
+        const rx = new RegExp(pattern.source, pattern.flags);
+        let m: RegExpExecArray | null;
+        while ((m = rx.exec(content)) !== null) {
+          const value = m[0].trim().replace(/\s+/g, ' ');
+          // Skip generic / overlong matches
+          if (value.length < 4 || value.length > 80) continue;
+          facts.push({ type, value });
+        }
+      }
 
-    const sentences = content.split(/[.!?]+/).filter(s => s.trim().length > 40);
-    sentences.forEach(sentence => {
-      const words = sentence.trim().split(/\s+/);
-      for (let i = 0; i < words.length - 5; i++) {
-        const phrase = words.slice(i, i + 6).join(' ').toLowerCase();
-        if (!/\d.*\d.*\d/.test(phrase)) sourceSignatures.push(phrase);
+      // ── Smart narrative context: signal-scored selection + adaptive sizing ─────
+      // Sentences are scored by non-numeric-fact density (proper nouns, action
+      // verbs, time refs, positions) and penalized for noise (number-dominated
+      // lines, long quotes, markdown). Budget per item scales inversely with how
+      // many structured facts the regexes already captured — sparse items get
+      // up to 500 chars of CONTEXT, well-covered items get 200.
+      const ACTION_VERB_RE = /\b(drafted|selected|picked|signed|inked|traded|sent|dealt|moved|joined|joins|retired|retiring|released|cut|waived|debut(?:ed)?|started|leads?|finished|won|broke|set|earned|named|hired|fired|coaches?|manages?|plays?|stars?|takes? over|stepped)\b/i;
+      const TIME_REF_RE = /\b(last (?:season|year|month|week)|this (?:season|year|offseason)|currently|recently|since\s+\d{4}|in\s+(?:19|20)\d{2}|now|after)\b/i;
+      const POSITION_RE = /\b(quarterback|QB|running back|RB|wide receiver|WR|tight end|TE|cornerback|CB|safety|linebacker|LB|defensive end|edge|center|guard|tackle|kicker|punter|point guard|shooting guard|forward|striker|midfielder|defender|goalkeeper|head coach|coach|GM|general manager|owner)\b/i;
+      const PROPER_NOUN_RE = /\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b/;
+      const NUMBER_HEAVY_RE = /(?:\d[\d,.]*[\s,]+){3,}/;
+      const LONG_QUOTE_RE = /"[^"]{20,}"/;
+      const MARKDOWN_RE = /^(?:##|!\[|\[\[|\*\*)/;
+
+      type ScoredSent = { text: string; originalIdx: number; score: number };
+      const rawSentences = content
+        .split(/(?<=[.!?])\s+/)
+        .map((s, i) => ({ text: s.trim(), originalIdx: i }))
+        .filter(s => s.text.length > 25 && s.text.length < 280);
+
+      const scored: ScoredSent[] = rawSentences.map(s => {
+        let score = 0;
+        if (PROPER_NOUN_RE.test(s.text)) score += 2;
+        if (ACTION_VERB_RE.test(s.text)) score += 1;
+        if (TIME_REF_RE.test(s.text)) score += 1;
+        if (POSITION_RE.test(s.text)) score += 1;
+        if (NUMBER_HEAVY_RE.test(s.text)) score -= 1;
+        if (LONG_QUOTE_RE.test(s.text)) score -= 2;
+        if (MARKDOWN_RE.test(s.text)) score -= 2;
+        return { ...s, score };
+      });
+
+      // Adaptive char budget: more CONTEXT when structured fact extraction was sparse
+      const structuredFactCount = facts.length;
+      const charBudget = structuredFactCount >= 5 ? 200
+        : structuredFactCount >= 2 ? 350
+          : 500;
+
+      // Greedy fill: take highest-scoring sentences until budget exhausted
+      const candidates = scored.filter(s => s.score >= 1).sort((a, b) => b.score - a.score);
+      const chosen: ScoredSent[] = [];
+      let runningLength = 0;
+      for (const s of candidates) {
+        if (runningLength + s.text.length + 1 > charBudget) continue;
+        chosen.push(s);
+        runningLength += s.text.length + 1;
+        if (chosen.length >= 5) break;
+      }
+
+      // Restore original reading order so the context flows naturally for Claude
+      const narrativeContext = chosen
+        .sort((a, b) => a.originalIdx - b.originalIdx)
+        .map(s => s.text)
+        .join(' ')
+        .slice(0, charBudget);
+
+      const sentences = content.split(/[.!?]+/).filter(s => s.trim().length > 40);
+      sentences.forEach(sentence => {
+        const words = sentence.trim().split(/\s+/);
+        for (let i = 0; i < words.length - 5; i++) {
+          const phrase = words.slice(i, i + 6).join(' ').toLowerCase();
+          if (!/\d.*\d.*\d/.test(phrase)) sourceSignatures.push(phrase);
+        }
+      });
+
+      if (facts.length > 0 || content.length > 100) {
+        rawItems.push({ itemNumber, itemName, facts: facts.slice(0, 18), rawContent: content.slice(0, 400), narrativeContext });
       }
     });
-
-    if (facts.length > 0 || content.length > 100) {
-      rawItems.push({ itemNumber, itemName, facts: facts.slice(0, 18), rawContent: content.slice(0, 400), narrativeContext });
-    }
-  });
   }  // ← end for-loop over sourcesToAtomize
 
   // Merge items that match across sources (same entity, different heading format)
@@ -1086,26 +1066,26 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
 
   const factOnlyRepresentation = atomizedFacts.map(item => {
     const lines = [item.itemName === 'USER_CONTEXT_DATA' ? 'USER CONTEXT DATA:' : `ITEM ${item.itemNumber}: ${item.itemName}`];
-    const stats        = item.facts.filter(f => ['stat','money','percentage'].includes(f.type));
+    const stats = item.facts.filter(f => ['stat', 'money', 'percentage'].includes(f.type));
     const achievements = item.facts.filter(f => f.type === 'achievement');
-    const dates        = item.facts.filter(f => f.type === 'date');
-    const quotes       = item.facts.filter(f => f.type === 'quote');
+    const dates = item.facts.filter(f => f.type === 'date');
+    const quotes = item.facts.filter(f => f.type === 'quote');
     const affiliations = item.facts.filter(f => f.type === 'affiliation');
-    const drafts       = item.facts.filter(f => f.type === 'draft' || f.type === 'draft_pick');
+    const drafts = item.facts.filter(f => f.type === 'draft' || f.type === 'draft_pick');
     const transactions = item.facts.filter(f => f.type === 'transaction');
-    const contracts    = item.facts.filter(f => f.type === 'contract');
-    const positions    = item.facts.filter(f => f.type === 'position');
-    const statuses     = item.facts.filter(f => f.type === 'status');
-    if (stats.length)        lines.push(`  STATS: ${stats.map(s => s.value).join(', ')}`);
+    const contracts = item.facts.filter(f => f.type === 'contract');
+    const positions = item.facts.filter(f => f.type === 'position');
+    const statuses = item.facts.filter(f => f.type === 'status');
+    if (stats.length) lines.push(`  STATS: ${stats.map(s => s.value).join(', ')}`);
     if (achievements.length) lines.push(`  ACHIEVEMENTS: ${achievements.map(a => a.value).join(', ')}`);
-    if (dates.length)        lines.push(`  DATES: ${[...new Set(dates.map(d => d.value))].join(', ')}`);
+    if (dates.length) lines.push(`  DATES: ${[...new Set(dates.map(d => d.value))].join(', ')}`);
     if (affiliations.length) lines.push(`  AFFILIATION: ${[...new Set(affiliations.map(a => a.value))].join('; ')}`);
-    if (drafts.length)       lines.push(`  DRAFT: ${[...new Set(drafts.map(d => d.value))].join('; ')}`);
+    if (drafts.length) lines.push(`  DRAFT: ${[...new Set(drafts.map(d => d.value))].join('; ')}`);
     if (transactions.length) lines.push(`  TRANSACTIONS: ${[...new Set(transactions.map(t => t.value))].join('; ')}`);
-    if (contracts.length)    lines.push(`  CONTRACT: ${[...new Set(contracts.map(c => c.value))].join('; ')}`);
-    if (positions.length)    lines.push(`  POSITION: ${[...new Set(positions.map(p => p.value))].join(', ')}`);
-    if (statuses.length)     lines.push(`  STATUS: ${[...new Set(statuses.map(s => s.value))].join(', ')}`);
-    if (quotes.length)       lines.push(`  QUOTES: ${quotes.map(q => `"${q.value}"`).join('; ')}`);
+    if (contracts.length) lines.push(`  CONTRACT: ${[...new Set(contracts.map(c => c.value))].join('; ')}`);
+    if (positions.length) lines.push(`  POSITION: ${[...new Set(positions.map(p => p.value))].join(', ')}`);
+    if (statuses.length) lines.push(`  STATUS: ${[...new Set(statuses.map(s => s.value))].join(', ')}`);
+    if (quotes.length) lines.push(`  QUOTES: ${quotes.map(q => `"${q.value}"`).join('; ')}`);
     if (item.narrativeContext) lines.push(`  CONTEXT (reference only — do NOT mirror phrasing): ${item.narrativeContext}`);
     return lines.join('\n');
   }).join('\n\n');
@@ -1148,9 +1128,9 @@ function buildPerplexitySystem(data: AtomizedData, deep: boolean): string {
 
 function buildPerplexityUser(data: AtomizedData, isDeep: boolean): string {
   const tc = data.temporalContext;
-  const mustBlock  = data.hasMustInclude
+  const mustBlock = data.hasMustInclude
     ? (isDeep ? `MANDATORY ITEMS - research each one individually:\n` : `MANDATORY ITEMS (must include):\n`)
-      + data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n') + '\n\n'
+    + data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n') + '\n\n'
     : '';
   const factsHeader = isDeep
     ? `EXISTING FACTS FROM USER SOURCE (DO NOT CONTRADICT. DO NOT ADD NEW STATS — provide background context only):\n`
@@ -1181,21 +1161,21 @@ export async function perplexityRetryResearch(data: AtomizedData): Promise<Perpl
 // ── 7. validateRetry (n8n: "Retry Validator") ────────────────────────────────
 
 export async function validateRetry(data: AtomizedData, perplexityResp: PerplexityRaw): Promise<ResearchedData> {
-  const answer    = perplexityResp?.choices?.[0]?.message?.content ?? '';
+  const answer = perplexityResp?.choices?.[0]?.message?.content ?? '';
   const citations = perplexityResp?.citations ?? [];
   const wordCount = answer.split(/\s+/).filter(Boolean).length;
 
-  const hardRefusals = ['cannot provide','knowledge was last updated','knowledge cutoff','unable to provide','has not taken place','future event'];
-  const softRefusals = ['has not yet occurred','not yet been announced','fragmented and incomplete','corrupted or partially-rendered'];
+  const hardRefusals = ['cannot provide', 'knowledge was last updated', 'knowledge cutoff', 'unable to provide', 'has not taken place', 'future event'];
+  const softRefusals = ['has not yet occurred', 'not yet been announced', 'fragmented and incomplete', 'corrupted or partially-rendered'];
   const lower = answer.toLowerCase();
 
   const hasHardRefusal = hardRefusals.some(p => lower.includes(p));
   const hasSoftRefusal = softRefusals.some(p => lower.includes(p));
-  const needsRetry     = hasHardRefusal || wordCount < 150;
+  const needsRetry = hasHardRefusal || wordCount < 150;
 
   return {
     ...data,
-    perplexityAnswer:    answer,
+    perplexityAnswer: answer,
     perplexityCitations: citations,
     perplexityWordCount: wordCount,
     needsRetry,
@@ -1478,25 +1458,25 @@ function prepareCleanSourceForPrompt(
 }
 
 export async function mergeResearch(data: ResearchedData, retryResp?: PerplexityRaw): Promise<MergedData> {
-  let answer    = data.perplexityAnswer;
+  let answer = data.perplexityAnswer;
   let citations = data.perplexityCitations;
 
   if (retryResp) {
-    const retryAnswer    = retryResp?.choices?.[0]?.message?.content ?? '';
+    const retryAnswer = retryResp?.choices?.[0]?.message?.content ?? '';
     const retryCitations = retryResp?.citations ?? [];
     if (retryAnswer.length > answer.length) {
-      answer    = retryAnswer;
+      answer = retryAnswer;
       citations = retryCitations.length > citations.length ? retryCitations : citations;
     }
   }
 
-  const primaryMatch      = answer.match(/PRIMARY SOURCE URL:\s*(https?:\/\/[^\s\n]+)/i);
+  const primaryMatch = answer.match(/PRIMARY SOURCE URL:\s*(https?:\/\/[^\s\n]+)/i);
   const perplexityPrimary = primaryMatch ? primaryMatch[1].trim() : '';
-  const primarySourceUrl  = data.userPrimaryUrl || perplexityPrimary || citations[0] || '';
+  const primarySourceUrl = data.userPrimaryUrl || perplexityPrimary || citations[0] || '';
 
-  const userSourceContent  = data.sourceAnalysis?.scrapedContent ?? '';
+  const userSourceContent = data.sourceAnalysis?.scrapedContent ?? '';
   const userContextContent = data.userContext ?? '';
-  const alignScore         = data.sourceAnalysis?.alignmentScore ?? 0;
+  const alignScore = data.sourceAnalysis?.alignmentScore ?? 0;
 
   // Determine source quality tier
   const combinedUserContent = [userSourceContent, userContextContent].filter(Boolean).join('\n');
@@ -1628,7 +1608,7 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
 
   return {
     ...data,
-    perplexityAnswer:    answer,
+    perplexityAnswer: answer,
     combinedFactRepresentation,
     primarySourceUrl,
     citations,
@@ -2067,8 +2047,8 @@ SOURCES:
   const sourceQualityBlock = data.sourceQuality === 'COMPREHENSIVE'
     ? '\nSOURCE QUALITY: COMPREHENSIVE — Your scraped source covers all items.\nABSOLUTE RULE: Base facts on TIER 1A. Enrich with TIER 1B (user context data). Follow TIER 1B instructions. Zero facts from TIER 2.\nIf you cannot find a fact in TIER 1A or 1B, the article does not have that fact.\n'
     : data.sourceQuality === 'PARTIAL'
-    ? '\nSOURCE QUALITY: PARTIAL — Your scraped source covers some items.\nFor items IN TIER 1A: use TIER 1A facts, enrich with TIER 1B data, follow TIER 1B instructions. For items NOT IN TIER 1A: use TIER 1B first, then TIER 2 marked with [P].\n'
-    : '\nSOURCE QUALITY: MINIMAL — Use TIER 1B (user context) as your primary fact source if available. Follow any TIER 1B instructions. Use Perplexity research as secondary.\n';
+      ? '\nSOURCE QUALITY: PARTIAL — Your scraped source covers some items.\nFor items IN TIER 1A: use TIER 1A facts, enrich with TIER 1B data, follow TIER 1B instructions. For items NOT IN TIER 1A: use TIER 1B first, then TIER 2 marked with [P].\n'
+      : '\nSOURCE QUALITY: MINIMAL — Use TIER 1B (user context) as your primary fact source if available. Follow any TIER 1B instructions. Use Perplexity research as secondary.\n';
 
   const claudeUserPrompt = `═══════════════════════════════════════════════════════════════
 TIER 1A + 1B FACT DATABASE — YOUR ONLY FACT SOURCES
@@ -2166,21 +2146,21 @@ export async function checkClaudeResponse(claudeResp: unknown, promptData: Promp
   else if (typeof resp?.content === 'string') articleText = resp.content as string;
 
   const isErrorResponse = resp?.type === 'error';
-  const hasErrorObject  = !!resp?.error;
-  const errorMsg        = ((resp?.error as Record<string, string>)?.message ?? '').toLowerCase();
-  const isOverloaded    = (resp?.error as Record<string, string>)?.type === 'overloaded_error' || errorMsg.includes('overloaded');
-  const isRateLimited   = (resp?.error as Record<string, string>)?.type === 'rate_limit_error' || errorMsg.includes('rate');
+  const hasErrorObject = !!resp?.error;
+  const errorMsg = ((resp?.error as Record<string, string>)?.message ?? '').toLowerCase();
+  const isOverloaded = (resp?.error as Record<string, string>)?.type === 'overloaded_error' || errorMsg.includes('overloaded');
+  const isRateLimited = (resp?.error as Record<string, string>)?.type === 'rate_limit_error' || errorMsg.includes('rate');
   const isCapacityError = errorMsg.includes('capacity');
 
   const hasValidContent = articleText.length > 200;
-  const hasActualError  = isErrorResponse || hasErrorObject || isOverloaded || isRateLimited || isCapacityError;
-  const claudeFailed    = hasActualError || !hasValidContent;
+  const hasActualError = isErrorResponse || hasErrorObject || isOverloaded || isRateLimited || isCapacityError;
+  const claudeFailed = hasActualError || !hasValidContent;
 
   return {
     ...promptData,
     articleText,
     originalArticleText: articleText,
-    generatedBy:  claudeFailed ? '' : 'Claude',
+    generatedBy: claudeFailed ? '' : 'Claude',
     claudeFailed,
     failureReason: claudeFailed
       ? ((resp?.error as Record<string, string>)?.message || (resp?.error as Record<string, string>)?.type || (!hasValidContent ? `Response too short: ${articleText.length} chars` : 'Unknown error'))
@@ -2193,11 +2173,11 @@ export async function checkClaudeResponse(claudeResp: unknown, promptData: Promp
 export async function generateWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
   const data = await callGrokWithFallback({
     systemContent: systemPrompt,
-    userContent:   userPrompt,
-    maxTokens:     7000,
-    temperature:   0.3,
-    timeout:       300_000,
-    label:         'generateWithGrok',
+    userContent: userPrompt,
+    maxTokens: 7000,
+    temperature: 0.3,
+    timeout: 300_000,
+    label: 'generateWithGrok',
   });
   return extractGrokResponseText(data);
 }
@@ -2214,7 +2194,7 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   let currentSlide: number | null = null, currentTitle = '', currentBody = '';
 
   for (const line of articleText.split('\n')) {
-    const trimmed    = line.trim().replace(/\*\*/g, '').trim();
+    const trimmed = line.trim().replace(/\*\*/g, '').trim();
     const slideMatch = trimmed.match(/^SLIDE\s*(\d+)/i);
     if (slideMatch) {
       if (currentSlide !== null) slides.push({ slideNum: currentSlide, title: currentTitle, body: currentBody.trim(), wordCount: currentBody.trim().split(/\s+/).filter(Boolean).length });
@@ -2244,7 +2224,7 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
 
   // Meta
   const metaMatch = articleText.match(/META:\s*([^\n]+)/i);
-  const metaText  = metaMatch ? metaMatch[1].trim() : '';
+  const metaText = metaMatch ? metaMatch[1].trim() : '';
   if (!metaText) {
     errors.push('No META description found');
   } else {
@@ -2253,12 +2233,12 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   }
 
   // Banned phrases
-  const bannedPhrases = ['delve','embark','foster','navigate','harness','unlock','elevate','empower','tapestry','landscape','journey','blueprint','pivotal','comprehensive','seamless','vibrant','dynamic','synergistic','multifaceted','robust','transformative','profound','moreover','furthermore','in conclusion','ultimately','game-changer',"in today's world",'since the dawn of','it is worth noting','at the end of the day','showcase','underscore','highlight','cement','solidify','storied','remarkable','notable','impressive','outstanding','exceptional','incredible','unparalleled','unprecedented','larger than life','household name','the rest is history'];
-  const lowerArticle  = articleText.toLowerCase();
-  const foundBanned   = bannedPhrases.filter(p => lowerArticle.includes(p));
+  const bannedPhrases = ['delve', 'embark', 'foster', 'navigate', 'harness', 'unlock', 'elevate', 'empower', 'tapestry', 'landscape', 'journey', 'blueprint', 'pivotal', 'comprehensive', 'seamless', 'vibrant', 'dynamic', 'synergistic', 'multifaceted', 'robust', 'transformative', 'profound', 'moreover', 'furthermore', 'in conclusion', 'ultimately', 'game-changer', "in today's world", 'since the dawn of', 'it is worth noting', 'at the end of the day', 'showcase', 'underscore', 'highlight', 'cement', 'solidify', 'storied', 'remarkable', 'notable', 'impressive', 'outstanding', 'exceptional', 'incredible', 'unparalleled', 'unprecedented', 'larger than life', 'household name', 'the rest is history'];
+  const lowerArticle = articleText.toLowerCase();
+  const foundBanned = bannedPhrases.filter(p => lowerArticle.includes(p));
   if (foundBanned.length) {
     warnings.push(`Banned phrases: ${foundBanned.join(', ')}`);
-    ['moreover','furthermore','ultimately','in conclusion','it is worth noting','at the end of the day'].forEach(p => {
+    ['moreover', 'furthermore', 'ultimately', 'in conclusion', 'it is worth noting', 'at the end of the day'].forEach(p => {
       if (lowerArticle.includes(p)) { articleText = articleText.replace(new RegExp(p, 'gi'), ''); autoFixes.push(`Removed "${p}"`); }
     });
   }
@@ -2273,16 +2253,16 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   // Unsafe content — start-anchored word-boundary check. `\bword` (no trailing
   // boundary) catches inflections like "killed", "raped", "assaulted" while
   // avoiding mid-word substring false positives like "scrapes" → "rape".
-  const unsafeWords = ['nude','suicide','kill','sex','sexual','harassment','cocaine','marijuana','assault','rape','porn','fuck','shit','dick','penis','vagina'];
+  const unsafeWords = ['nude', 'suicide', 'kill', 'sex', 'sexual', 'harassment', 'cocaine', 'marijuana', 'assault', 'rape', 'porn', 'fuck', 'shit', 'dick', 'penis', 'vagina'];
   const foundUnsafe = unsafeWords.filter(w => new RegExp(`\\b${w}`, 'i').test(lowerArticle));
   if (foundUnsafe.length) errors.push(`UNSAFE content: ${foundUnsafe.join(', ')}`);
 
   // Quality degradation
   const contentSlideArr = slides.filter(s => s.slideNum > 1);
   if (contentSlideArr.length >= 10) {
-    const third     = Math.ceil(contentSlideArr.length / 3);
-    const avgFirst  = contentSlideArr.slice(0, third).reduce((s, x) => s + x.wordCount, 0) / third;
-    const avgLast   = contentSlideArr.slice(-third).reduce((s, x) => s + x.wordCount, 0) / third;
+    const third = Math.ceil(contentSlideArr.length / 3);
+    const avgFirst = contentSlideArr.slice(0, third).reduce((s, x) => s + x.wordCount, 0) / third;
+    const avgLast = contentSlideArr.slice(-third).reduce((s, x) => s + x.wordCount, 0) / third;
     if (avgLast < avgFirst * 0.8) warnings.push(`Quality degradation: last third avg ${Math.round(avgLast)}w vs first third ${Math.round(avgFirst)}w`);
   }
 
@@ -2294,8 +2274,8 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   if (overused.length) warnings.push(`Repetitive openings: ${overused.join(', ')}`);
 
   // Plagiarism
-  const sigs     = data.sourceSignatures ?? [];
-  let plagScore  = 0;
+  const sigs = data.sourceSignatures ?? [];
+  let plagScore = 0;
   const plagMatches: string[] = [];
   if (sigs.length > 0) {
     const artWords = lowerArticle.split(/\s+/);
@@ -2360,10 +2340,10 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
 
   // Ranking order check — for ranking articles, slide 2 should be lowest rank
   if (data.titleAnalysis?.isRanking && contentSlideArr.length >= 3) {
-    const firstTitle  = contentSlideArr[0]?.title ?? '';
-    const lastTitle   = contentSlideArr[contentSlideArr.length - 1]?.title ?? '';
-    const firstNum    = firstTitle.match(/^(\d+)/)?.[1];
-    const lastNum     = lastTitle.match(/^(\d+)/)?.[1];
+    const firstTitle = contentSlideArr[0]?.title ?? '';
+    const lastTitle = contentSlideArr[contentSlideArr.length - 1]?.title ?? '';
+    const firstNum = firstTitle.match(/^(\d+)/)?.[1];
+    const lastNum = lastTitle.match(/^(\d+)/)?.[1];
     if (firstNum && lastNum && parseInt(firstNum) < parseInt(lastNum)) {
       warnings.push(`Ranking order may be ascending — slide 2 should start at highest rank number (lowest position)`);
     }
@@ -2375,8 +2355,8 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
     ...data,
     articleText,
     structuralValidation: { status: validationStatus, errors, warnings, autoFixes, slideCount: slides.length, metaLength: metaText.length },
-    plagiarismCheck:      { score: plagScore, matches: plagMatches.slice(0, 10), status: plagScore > 30 ? 'HIGH' : plagScore > 10 ? 'MEDIUM' : 'LOW' },
-    factProvenance:       { rate: provenanceRate, verified: verifiedStats.length, unverified: unverifiedStats.length, total: articleStatsRaw.length, unverifiedExamples: unverifiedStats.slice(0, 10) },
+    plagiarismCheck: { score: plagScore, matches: plagMatches.slice(0, 10), status: plagScore > 30 ? 'HIGH' : plagScore > 10 ? 'MEDIUM' : 'LOW' },
+    factProvenance: { rate: provenanceRate, verified: verifiedStats.length, unverified: unverifiedStats.length, total: articleStatsRaw.length, unverifiedExamples: unverifiedStats.slice(0, 10) },
     slides,
   };
 }
@@ -2404,13 +2384,13 @@ export async function extractClaims(data: ValidatedData): Promise<ClaimedData> {
     const numNorm = m[1].replace(/,/g, '');
     if (trustedNumbers.has(numNorm) || trustedNumbers.has(m[1])) { preFilteredStats++; continue; }
     const start = Math.max(0, m.index! - 40);
-    const end   = Math.min(articleText.length, m.index! + m[0].length + 40);
+    const end = Math.min(articleText.length, m.index! + m[0].length + 40);
     claims.push({ type: 'stat', claim: m[0], context: articleText.slice(start, end).replace(/\n/g, ' ') });
   }
   for (const m of articleText.matchAll(/\b((19|20)\d{2})\b/g)) {
     if (trustedNumbers.has(m[1])) { preFilteredDates++; continue; }
     const start = Math.max(0, m.index! - 40);
-    const end   = Math.min(articleText.length, m.index! + 4 + 40);
+    const end = Math.min(articleText.length, m.index! + 4 + 40);
     claims.push({ type: 'date', claim: m[1], context: articleText.slice(start, end).replace(/\n/g, ' ') });
   }
   // Superlatives have no numeric anchor — always send to Grok for triage.
@@ -2542,11 +2522,11 @@ HARD RULES:
   const grokResp = await callGrokWithFallback({
     systemContent,
     userContent,
-    maxTokens:   7000,
+    maxTokens: 7000,
     temperature: 0.0,
-    timeout:     300_000,
-    tools:       [{ type: 'web_search' }],
-    label:       'grokFactCheck',
+    timeout: 300_000,
+    tools: [{ type: 'web_search' }],
+    label: 'grokFactCheck',
   });
   return grokResp;
 }
@@ -2671,8 +2651,8 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
     console.log(`[processVerification] correction detail:\n  ${correctionLog.join('\n  ')}`);
   }
 
-  const verified     = results.filter(r => r.status === 'VERIFIED').length;
-  const incorrect    = results.filter(r => r.status === 'INCORRECT').length;
+  const verified = results.filter(r => r.status === 'VERIFIED').length;
+  const incorrect = results.filter(r => r.status === 'INCORRECT').length;
   const unverifiable = results.filter(r => r.status === 'UNVERIFIABLE').length;
 
   return {
@@ -2848,10 +2828,10 @@ HARD RULES
   const grokResp = await callGrokWithFallback({
     systemContent,
     userContent,
-    maxTokens:   3500,
+    maxTokens: 3500,
     temperature: 0.0,
-    timeout:     180_000,
-    label:       'grokAuditAndVerify',
+    timeout: 180_000,
+    label: 'grokAuditAndVerify',
   });
   return extractGrokResponseText(grokResp);
 }
@@ -2872,23 +2852,23 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
 
   // Parse audit report + summary + style patches blocks. Style patches are the
   // ONLY place the article can be modified at this stage — facts are frozen.
-  const reportMatch  = grokText.match(/=== AUDIT REPORT ===\s*([\s\S]*?)\s*=== END AUDIT REPORT ===/i);
+  const reportMatch = grokText.match(/=== AUDIT REPORT ===\s*([\s\S]*?)\s*=== END AUDIT REPORT ===/i);
   const summaryMatch = grokText.match(/=== SUMMARY ===\s*([\s\S]*?)\s*=== END SUMMARY ===/i);
-  const styleBlock   = grokText.match(/=== STYLE PATCHES ===([\s\S]*?)=== END STYLE PATCHES ===/i)?.[1] ?? '';
+  const styleBlock = grokText.match(/=== STYLE PATCHES ===([\s\S]*?)=== END STYLE PATCHES ===/i)?.[1] ?? '';
 
   // ── Apply style patches surgically ────────────────────────────────────────
   const stylePatches = styleBlock ? parseAuditPatches(styleBlock) : [];
   const patchApply = applyAuditPatches(articleText, stylePatches);
   // Safety: never lose slides via patch application
   const slidesBefore = (data.articleText.match(/SLIDE\s*\d+/gi) ?? []).length;
-  const slidesAfter  = (patchApply.result.match(/SLIDE\s*\d+/gi) ?? []).length;
+  const slidesAfter = (patchApply.result.match(/SLIDE\s*\d+/gi) ?? []).length;
   if (slidesAfter >= slidesBefore) {
     articleText = patchApply.result;
   } else {
     console.warn(`[extractAuditResults] Style patches lost slides (${slidesBefore} → ${slidesAfter}). Skipped patches.`);
   }
 
-  const reportBody  = reportMatch?.[1]?.trim() ?? grokText.trim();
+  const reportBody = reportMatch?.[1]?.trim() ?? grokText.trim();
   const summaryBody = summaryMatch?.[1]?.trim() ?? '';
 
   const passCount = (reportBody.match(/:\s*PASS\b/gi) ?? []).length;
@@ -2897,8 +2877,8 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
   const totalChecks = passCount + failCount + foundCount;
 
   const rulesPassedMatch = summaryBody.match(/Rules passed:\s*(\d+)\/(\d+)/i);
-  const violationsMatch  = summaryBody.match(/Violations found:\s*(\d+)/i);
-  const flagsMatch       = summaryBody.match(/Flags for writer review:\s*([^\n]+)/i);
+  const violationsMatch = summaryBody.match(/Violations found:\s*(\d+)/i);
+  const flagsMatch = summaryBody.match(/Flags for writer review:\s*([^\n]+)/i);
 
   // Build combined source list from fact-check citations (set upstream).
   const factCheckSources: SourceEntry[] = (data.perplexityVerification?.citations ?? []).map((url, i) => ({
@@ -2919,9 +2899,9 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
       summary: reportBody,
       stats: {
         rulesPassed: rulesPassedMatch ? `${rulesPassedMatch[1]}/${rulesPassedMatch[2]}` : `${passCount}/${totalChecks || 8}`,
-        violations:  violationsMatch ? parseInt(violationsMatch[1], 10) : (failCount + foundCount),
+        violations: violationsMatch ? parseInt(violationsMatch[1], 10) : (failCount + foundCount),
         corrections: patchApply.applied > 0 ? `${patchApply.applied} style patches applied` : 'None',
-        flags:       flagsMatch?.[1]?.trim() || (failCount + foundCount > 0 ? `${failCount + foundCount} rule(s) flagged` : 'None'),
+        flags: flagsMatch?.[1]?.trim() || (failCount + foundCount > 0 ? `${failCount + foundCount} rule(s) flagged` : 'None'),
       },
     },
     grokSources: [], combinedSourceList: factCheckSources, combinedSourceListText,
@@ -2932,18 +2912,18 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
 // ── 19. finalAssembly (n8n: "Final Assembly") ────────────────────────────────
 
 export async function finalAssembly(data: AuditedData): Promise<FinalOutput> {
-  const researchScore    = data.researchOk ? 80 : 50;
-  const factCheckScore   = data.perplexityVerification?.score ?? 50;
-  const structuralScore  = data.structuralValidation?.status === 'PASSED' ? 100 : data.structuralValidation?.status === 'WARNINGS' ? 70 : 40;
-  const plagiarismScore  = data.plagiarismCheck?.status === 'LOW' ? 100 : data.plagiarismCheck?.status === 'MEDIUM' ? 70 : 40;
-  const qualityScore     = Math.round((researchScore * 0.15) + (factCheckScore * 0.40) + (structuralScore * 0.20) + (plagiarismScore * 0.25));
+  const researchScore = data.researchOk ? 80 : 50;
+  const factCheckScore = data.perplexityVerification?.score ?? 50;
+  const structuralScore = data.structuralValidation?.status === 'PASSED' ? 100 : data.structuralValidation?.status === 'WARNINGS' ? 70 : 40;
+  const plagiarismScore = data.plagiarismCheck?.status === 'LOW' ? 100 : data.plagiarismCheck?.status === 'MEDIUM' ? 70 : 40;
+  const qualityScore = Math.round((researchScore * 0.15) + (factCheckScore * 0.40) + (structuralScore * 0.20) + (plagiarismScore * 0.25));
 
   const summaryParts: string[] = [];
-  if (data.structuralValidation?.errors?.length)  summaryParts.push(`Errors: ${data.structuralValidation.errors.join('; ')}`);
+  if (data.structuralValidation?.errors?.length) summaryParts.push(`Errors: ${data.structuralValidation.errors.join('; ')}`);
   if (data.structuralValidation?.warnings?.length) summaryParts.push(`Warnings: ${data.structuralValidation.warnings.length}`);
-  if (data.rewriteApplied)                         summaryParts.push('Grok corrections applied');
+  if (data.rewriteApplied) summaryParts.push('Grok corrections applied');
   if (data.grokAudit?.stats?.flags && data.grokAudit.stats.flags !== 'None') summaryParts.push(`Flags: ${data.grokAudit.stats.flags}`);
-  if (data.generatedBy)                            summaryParts.push(`Generated by: ${data.generatedBy}`);
+  if (data.generatedBy) summaryParts.push(`Generated by: ${data.generatedBy}`);
 
   const auditReport = `
 QUALITY AUDIT REPORT
@@ -2975,19 +2955,19 @@ Warnings: ${data.structuralValidation?.warnings?.join(', ') || 'None'}
 
   return {
     title: data.title, category: data.category, slideCount: data.slideCount, writerName: data.writerName,
-    articleText:         data.articleText,
+    articleText: data.articleText,
     originalArticleText: data.originalArticleText || data.articleText,
     auditReport, qualityScore, researchScore,
     verificationScore: factCheckScore, structuralScore, originalityScore: plagiarismScore,
-    primarySourceUrl:       data.primarySourceUrl,
+    primarySourceUrl: data.primarySourceUrl,
     combinedSourceListText: data.combinedSourceListText,
-    summaryComment:  summaryParts.length > 0 ? summaryParts.join('. ') : 'Article passed all checks.',
+    summaryComment: summaryParts.length > 0 ? summaryParts.join('. ') : 'Article passed all checks.',
     validationStatus: data.structuralValidation?.status ?? 'UNKNOWN',
-    factsVerified:     `${data.perplexityVerification?.stats?.verified ?? 0}/${data.perplexityVerification?.stats?.total ?? 0}`,
+    factsVerified: `${data.perplexityVerification?.stats?.verified ?? 0}/${data.perplexityVerification?.stats?.total ?? 0}`,
     grokRulesPassed: data.grokAudit?.stats?.rulesPassed ?? 'N/A',
-    flagsForReview:    data.grokAudit?.stats?.flags ?? 'None',
-    generatedBy:  data.generatedBy ?? 'Unknown',
-    generatedAt:  new Date().toISOString(),
+    flagsForReview: data.grokAudit?.stats?.flags ?? 'None',
+    generatedBy: data.generatedBy ?? 'Unknown',
+    generatedAt: new Date().toISOString(),
   };
 }
 
@@ -3002,76 +2982,76 @@ Warnings: ${data.structuralValidation?.warnings?.join(', ') || 'None'}
 // news. Originally n8n omitted youtube.com — we add it here because Firecrawl
 // against a YouTube watch URL returns 0 chars or nav-menu garbage.
 const SUBJECTIVE_RESTRICTED = [
-  'instagram.com','facebook.com','twitter.com','x.com','tiktok.com',
-  'linkedin.com','pinterest.com','nytimes.com','wsj.com','ft.com',
-  'bloomberg.com','theathletic.com','si.com','reddit.com','quora.com',
-  'youtube.com','youtu.be',
+  'instagram.com', 'facebook.com', 'twitter.com', 'x.com', 'tiktok.com',
+  'linkedin.com', 'pinterest.com', 'nytimes.com', 'wsj.com', 'ft.com',
+  'bloomberg.com', 'theathletic.com', 'si.com', 'reddit.com', 'quora.com',
+  'youtube.com', 'youtu.be',
 ];
 
 // ── S1. prepareInputSubjective (n8n: "Prepare Input - Subjective") ────────────
 
 export async function prepareInputSubjective(input: FormInput): Promise<SubjectivePreparedData> {
-  const writerName  = (input.writerName ?? '').trim();
-  const title       = (input.title ?? '').trim();
-  const category    = (input.category ?? '').trim();
+  const writerName = (input.writerName ?? '').trim();
+  const title = (input.title ?? '').trim();
+  const category = (input.category ?? '').trim();
   const articleType = (input.articleType ?? 'Opinion & Rankings').trim();
-  const toneDial    = (input.toneDial ?? 'Celebratory').trim();
-  const slideCount  = typeof input.slideCount === 'string' ? parseInt(input.slideCount, 10) || 20 : (input.slideCount || 20);
-  const sourcesRaw  = (input.sourcesRaw ?? '').trim();
+  const toneDial = (input.toneDial ?? 'Celebratory').trim();
+  const slideCount = typeof input.slideCount === 'string' ? parseInt(input.slideCount, 10) || 20 : (input.slideCount || 20);
+  const sourcesRaw = (input.sourcesRaw ?? '').trim();
   const mustIncludeRaw = (input.mustIncludeRaw ?? '').trim();
   const writingStyle = (input.writingStyle ?? '').trim();
-  const userContext  = (input.userContext ?? '').trim();
+  const userContext = (input.userContext ?? '').trim();
 
-  if (!title)    throw new Error('Slideshow Title is required.');
+  if (!title) throw new Error('Slideshow Title is required.');
   if (!category) throw new Error('Topic Category is required.');
   if (slideCount < 1 || slideCount > 50) throw new Error(`Slide count ${slideCount} out of range (1-50).`);
 
   // ── Temporal context (same logic as objective prepareInputAndAnalyze) ──────
-  const now          = new Date();
-  const currentYear  = now.getFullYear();
+  const now = new Date();
+  const currentYear = now.getFullYear();
   const currentMonth = now.getMonth() + 1;
 
   type SeasonDef = { currentSeason: string; lastSeason: string; seasonFormat: string };
   const sportSeasons: Record<string, SeasonDef> = {
-    NFL:    { currentSeason: currentMonth >= 9 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 9 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
-    NBA:    { currentSeason: currentMonth >= 10 ? `${currentYear}-${String(currentYear + 1).slice(2)}` : `${currentYear - 1}-${String(currentYear).slice(2)}`, lastSeason: currentMonth >= 10 ? `${currentYear - 1}-${String(currentYear).slice(2)}` : `${currentYear - 2}-${String(currentYear - 1).slice(2)}`, seasonFormat: 'split_year' },
-    WNBA:   { currentSeason: currentMonth >= 5 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 5 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
-    GOLF:   { currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
-    DEFAULT:{ currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
+    NFL: { currentSeason: currentMonth >= 9 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 9 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
+    NBA: { currentSeason: currentMonth >= 10 ? `${currentYear}-${String(currentYear + 1).slice(2)}` : `${currentYear - 1}-${String(currentYear).slice(2)}`, lastSeason: currentMonth >= 10 ? `${currentYear - 1}-${String(currentYear).slice(2)}` : `${currentYear - 2}-${String(currentYear - 1).slice(2)}`, seasonFormat: 'split_year' },
+    WNBA: { currentSeason: currentMonth >= 5 ? `${currentYear}` : `${currentYear - 1}`, lastSeason: currentMonth >= 5 ? `${currentYear - 1}` : `${currentYear - 2}`, seasonFormat: 'single_year' },
+    GOLF: { currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
+    DEFAULT: { currentSeason: `${currentYear}`, lastSeason: `${currentYear - 1}`, seasonFormat: 'single_year' },
   };
 
-  const sportKey    = category.replace('Sports - ', '').toUpperCase();
-  const seasonCtx   = sportSeasons[sportKey] ?? sportSeasons.DEFAULT;
+  const sportKey = category.replace('Sports - ', '').toUpperCase();
+  const seasonCtx = sportSeasons[sportKey] ?? sportSeasons.DEFAULT;
 
   const temporalContext: TemporalCtx = {
     today: now.toISOString().split('T')[0],
     currentYear, currentMonth,
     ...seasonCtx,
-    dateAnchor:   `Today is ${now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
+    dateAnchor: `Today is ${now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`,
     seasonAnchor: `The most recent completed ${sportKey || 'sports'} season is ${seasonCtx.lastSeason}. Current/ongoing season is ${seasonCtx.currentSeason}.`,
   };
 
   // ── Format config ─────────────────────────────────────────────────────────
   const slidesPerEntity = 1; // subjective is always 1 slide per item
-  const entityCount     = slideCount;
+  const entityCount = slideCount;
 
   let continuationStyle = 'same_name';
-  if (/\(cont\.?\)/i.test(userContext))     continuationStyle = 'cont';
-  else if (/continued/i.test(userContext))  continuationStyle = 'continued';
-  else if (/part\s*2/i.test(userContext))   continuationStyle = 'part2';
+  if (/\(cont\.?\)/i.test(userContext)) continuationStyle = 'cont';
+  else if (/continued/i.test(userContext)) continuationStyle = 'continued';
+  else if (/part\s*2/i.test(userContext)) continuationStyle = 'part2';
 
   const formatConfig: FormatConfig = { slidesPerEntity, entityCount, isMultiSlideFormat: false, continuationStyle };
 
   // ── Title analysis ────────────────────────────────────────────────────────
-  const numberMatch   = title.match(/(\d+)\s+/);
+  const numberMatch = title.match(/(\d+)\s+/);
   const promisedCount = numberMatch ? parseInt(numberMatch[1]) : entityCount;
-  const isRanking     = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
-  const isListicle    = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
-  const isTimeBased   = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
-  const emotionMatch  = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
+  const isRanking = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
+  const isListicle = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
+  const isTimeBased = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
+  const emotionMatch = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
 
-  const colonSplit     = title.split(/[:–—-]/);
-  const mainAngle      = colonSplit[0].trim();
+  const colonSplit = title.split(/[:–—-]/);
+  const mainAngle = colonSplit[0].trim();
   const secondaryAngle = colonSplit.length > 1 ? colonSplit.slice(1).join(' ').trim() : null;
   const requiresCorrelation = /mock draft|fit\s+(?:with|for)|compare|vs\.?|versus|how\s+\w+\s+(?:helps?|improves?)/i.test(title);
 
@@ -3084,22 +3064,22 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
   // ── URL parsing ───────────────────────────────────────────────────────────
   const preferred = sourcesRaw
     ? sourcesRaw
-        .split(/[\n\r,]+/)
-        .flatMap(chunk => chunk.trim().split(/\s+/))
-        .map(s => s.trim())
-        .filter(s => /^https?:\/\/.+\..+/.test(s))
-        .filter(s => !SUBJECTIVE_RESTRICTED.some(d => s.toLowerCase().includes(d)))
-        .filter((url, i, arr) => arr.findIndex(u => u.replace(/\/+$/, '') === url.replace(/\/+$/, '')) === i)
-        .slice(0, 5)
+      .split(/[\n\r,]+/)
+      .flatMap(chunk => chunk.trim().split(/\s+/))
+      .map(s => s.trim())
+      .filter(s => /^https?:\/\/.+\..+/.test(s))
+      .filter(s => !SUBJECTIVE_RESTRICTED.some(d => s.toLowerCase().includes(d)))
+      .filter((url, i, arr) => arr.findIndex(u => u.replace(/\/+$/, '') === url.replace(/\/+$/, '')) === i)
+      .slice(0, 5)
     : [];
 
-  const userPrimaryUrl    = preferred[0] ?? '';
+  const userPrimaryUrl = preferred[0] ?? '';
   const userSecondaryUrls = preferred.slice(1);
 
-  const isPrimaryRestricted  = false;
-  const shouldScrapePrimary  = !!userPrimaryUrl;
-  const hasValidUserSource   = !!userPrimaryUrl;
-  const isUserUrlRestricted  = false; // already filtered above
+  const isPrimaryRestricted = false;
+  const shouldScrapePrimary = !!userPrimaryUrl;
+  const hasValidUserSource = !!userPrimaryUrl;
+  const isUserUrlRestricted = false; // already filtered above
 
   const mustIncludeItems = parseMustIncludeItems(mustIncludeRaw);
   const hasMustInclude = mustIncludeItems.length > 0;
@@ -3146,25 +3126,25 @@ export async function mergeSubjectiveResearch(
   retryResp?: PerplexityRaw,
   primaryMarkdown?: string,
 ): Promise<SubjectiveMergedData> {
-  let answer    = data.perplexityAnswer;
+  let answer = data.perplexityAnswer;
   let citations = data.perplexityCitations;
 
   if (retryResp) {
-    const retryAnswer    = retryResp?.choices?.[0]?.message?.content ?? '';
+    const retryAnswer = retryResp?.choices?.[0]?.message?.content ?? '';
     const retryCitations = retryResp?.citations ?? [];
     if (retryAnswer.length > answer.length) {
-      answer    = retryAnswer;
+      answer = retryAnswer;
       citations = retryCitations.length > citations.length ? retryCitations : citations;
     }
   }
 
-  const primaryMatch      = answer.match(/PRIMARY SOURCE URL:\s*(https?:\/\/[^\s\n]+)/i);
+  const primaryMatch = answer.match(/PRIMARY SOURCE URL:\s*(https?:\/\/[^\s\n]+)/i);
   const perplexityPrimary = primaryMatch ? primaryMatch[1].trim() : '';
-  const primarySourceUrl  = data.userPrimaryUrl || perplexityPrimary || citations[0] || '';
+  const primarySourceUrl = data.userPrimaryUrl || perplexityPrimary || citations[0] || '';
 
-  const userSourceContent  = data.sourceAnalysis?.scrapedContent ?? '';
+  const userSourceContent = data.sourceAnalysis?.scrapedContent ?? '';
   const userContextContent = data.userContext ?? '';
-  const alignScore         = data.sourceAnalysis?.alignmentScore ?? 0;
+  const alignScore = data.sourceAnalysis?.alignmentScore ?? 0;
 
   let sourceQuality: string;
   if ([userSourceContent, userContextContent].filter(Boolean).join('\n').length > 2000 && alignScore >= 60) {
@@ -3269,18 +3249,18 @@ export async function mergeSubjectiveResearch(
   // Raw source excerpt for subjective voice/narrative context (2000-word cap)
   const rawSourceExcerpt = primaryMarkdown
     ? (() => {
-        const words = primaryMarkdown.split(/\s+/);
-        return words.length > 2000
-          ? words.slice(0, 2000).join(' ') + '\n[truncated]'
-          : primaryMarkdown;
-      })()
+      const words = primaryMarkdown.split(/\s+/);
+      return words.length > 2000
+        ? words.slice(0, 2000).join(' ') + '\n[truncated]'
+        : primaryMarkdown;
+    })()
     : '';
 
   console.log(`[mergeSubjectiveResearch] Perplexity sanitization: ${sanitizationStats.statPlaceholders} stats replaced, ${sanitizationStats.quotesRemoved} quotes removed, ${sanitizationStats.entitiesTracked} entities tracked`);
 
   return {
     ...data,
-    perplexityAnswer:    answer,
+    perplexityAnswer: answer,
     combinedFactRepresentation,
     primarySourceUrl,
     citations,
@@ -3571,14 +3551,14 @@ ABSOLUTE OUTPUT RULE
 ═══════════════════════════════════════════════════════════════
 
 Always produce the full slideshow. No exceptions. Never write 'I cannot' or any refusal. If source data is thin, write tighter slides using Tier 2/3. A complete article is always the correct output.${data.userWordCountOverride
-    ? `\n\n═══════════════════════════════════════════════════════════════
+      ? `\n\n═══════════════════════════════════════════════════════════════
 ⚠️ WRITER OVERRIDE — WORD COUNT ⚠️
 ═══════════════════════════════════════════════════════════════
 
 The writer EXPLICITLY requested ${data.userWordCountOverride.min}-${data.userWordCountOverride.max} words per content slide.
 This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
 Count every word before outputting each slide. Rewrite if out of range.`
-    : ''}`;
+      : ''}`;
 
   const mandatoryBlock = data.hasMustInclude
     ? `\n\nMANDATORY ITEMS — these override the scraped source's item list (non-negotiable):\n${data.mustIncludeItems.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nEvery mandatory item MUST get its own slide, even if it does not appear in TIER 1A. Do NOT substitute any with a different item from the source. Fill remaining slots (up to ${data.slideCount} total) with the best-fit entries.`
@@ -3629,7 +3609,7 @@ export async function generateSubjectiveWithClaude(systemPrompt: string, userPro
 export async function checkSubjectiveClaudeResponse(claudeResp: unknown, promptData: SubjectivePromptData): Promise<SubjectiveGeneratedData> {
   const resp = claudeResp as Record<string, unknown>;
   const contentArray = (resp?.content as Array<{ type: string; text: string }>) ?? [];
-  const first        = contentArray[0] ?? {};
+  const first = contentArray[0] ?? {};
 
   let articleText = '';
   if (first?.text) articleText = first.text;
@@ -3639,21 +3619,21 @@ export async function checkSubjectiveClaudeResponse(claudeResp: unknown, promptD
   }
 
   const isErrorResponse = resp?.type === 'error';
-  const hasErrorObject  = !!resp?.error;
-  const errorMsg        = ((resp?.error as Record<string, string>)?.message ?? '').toLowerCase();
-  const isOverloaded    = (resp?.error as Record<string, string>)?.type === 'overloaded_error' || errorMsg.includes('overloaded');
-  const isRateLimited   = (resp?.error as Record<string, string>)?.type === 'rate_limit_error' || errorMsg.includes('rate');
+  const hasErrorObject = !!resp?.error;
+  const errorMsg = ((resp?.error as Record<string, string>)?.message ?? '').toLowerCase();
+  const isOverloaded = (resp?.error as Record<string, string>)?.type === 'overloaded_error' || errorMsg.includes('overloaded');
+  const isRateLimited = (resp?.error as Record<string, string>)?.type === 'rate_limit_error' || errorMsg.includes('rate');
   const isCapacityError = errorMsg.includes('capacity');
 
   const hasValidContent = articleText.length > 200;
-  const hasActualError  = isErrorResponse || hasErrorObject || isOverloaded || isRateLimited || isCapacityError;
-  const claudeFailed    = hasActualError || !hasValidContent;
+  const hasActualError = isErrorResponse || hasErrorObject || isOverloaded || isRateLimited || isCapacityError;
+  const claudeFailed = hasActualError || !hasValidContent;
 
   return {
     ...promptData,
     articleText,
     originalArticleText: articleText,
-    generatedBy:  claudeFailed ? '' : 'Claude',
+    generatedBy: claudeFailed ? '' : 'Claude',
     claudeFailed,
     failureReason: claudeFailed
       ? ((resp?.error as Record<string, string>)?.message
@@ -3668,11 +3648,11 @@ export async function checkSubjectiveClaudeResponse(claudeResp: unknown, promptD
 export async function generateSubjectiveWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
   const data = await callGrokWithFallback({
     systemContent: systemPrompt,
-    userContent:   userPrompt,
-    maxTokens:     5000,
-    temperature:   0.4,
-    timeout:       120_000,
-    label:         'generateSubjectiveWithGrok',
+    userContent: userPrompt,
+    maxTokens: 5000,
+    temperature: 0.4,
+    timeout: 120_000,
+    label: 'generateSubjectiveWithGrok',
   });
   return extractGrokResponseText(data);
 }
@@ -3686,24 +3666,24 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
   const lowerArticle = articleText.toLowerCase();
 
   const bannedPhrases = [
-    'delve','embark','foster','navigate','harness','unlock','elevate','empower',
-    'catalyze','optimize','streamline','tapestry','landscape','journey','blueprint',
-    'gateway','realm','catalyst','paradigm shift','pivotal','comprehensive','seamless',
-    'vibrant','dynamic','synergistic','multifaceted','robust','transformative','profound',
-    'moreover','furthermore','additionally','consequently','conversely','nevertheless',
-    'in conclusion','ultimately','to wrap up','in summary','game-changer','ultimate guide',
-    'a testament to','it is worth noting','unparalleled','showcase','underscore',
-    'highlight','cement','solidify','storied','remarkable','notable','impressive',
-    'outstanding','exceptional','incredible','unprecedented','larger than life',
-    'household name','the rest is history',
+    'delve', 'embark', 'foster', 'navigate', 'harness', 'unlock', 'elevate', 'empower',
+    'catalyze', 'optimize', 'streamline', 'tapestry', 'landscape', 'journey', 'blueprint',
+    'gateway', 'realm', 'catalyst', 'paradigm shift', 'pivotal', 'comprehensive', 'seamless',
+    'vibrant', 'dynamic', 'synergistic', 'multifaceted', 'robust', 'transformative', 'profound',
+    'moreover', 'furthermore', 'additionally', 'consequently', 'conversely', 'nevertheless',
+    'in conclusion', 'ultimately', 'to wrap up', 'in summary', 'game-changer', 'ultimate guide',
+    'a testament to', 'it is worth noting', 'unparalleled', 'showcase', 'underscore',
+    'highlight', 'cement', 'solidify', 'storied', 'remarkable', 'notable', 'impressive',
+    'outstanding', 'exceptional', 'incredible', 'unprecedented', 'larger than life',
+    'household name', 'the rest is history',
   ];
   const foundBanned = bannedPhrases.filter(p => lowerArticle.includes(p));
   if (foundBanned.length) warnings.push(`Banned phrases: ${foundBanned.join(', ')}`);
 
   const unsafeWords = [
-    'nude','naked','suicide','kill','shot','stabbed','fake news','conspiracy',
-    'sex','sexual','sexy','harassment','marijuana','cocaine','assault','scam',
-    'drug','racism','vaccine','rape','molest','damn','porn','smoking','tobacco','wtf',
+    'nude', 'naked', 'suicide', 'kill', 'shot', 'stabbed', 'fake news', 'conspiracy',
+    'sex', 'sexual', 'sexy', 'harassment', 'marijuana', 'cocaine', 'assault', 'scam',
+    'drug', 'racism', 'vaccine', 'rape', 'molest', 'damn', 'porn', 'smoking', 'tobacco', 'wtf',
   ];
   // Start-anchored word-boundary check. `\bword` catches inflections like "killed",
   // "raped", "assaulted" while avoiding mid-word substring false positives like
@@ -3798,7 +3778,7 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
   if (contentSlides.length >= 10) {
     const thirdSize = Math.ceil(contentSlides.length / 3);
     const avgFirst = contentSlides.slice(0, thirdSize).reduce((s, x) => s + x.words, 0) / thirdSize;
-    const avgLast  = contentSlides.slice(-thirdSize).reduce((s, x) => s + x.words, 0) / thirdSize;
+    const avgLast = contentSlides.slice(-thirdSize).reduce((s, x) => s + x.words, 0) / thirdSize;
     if (avgLast < avgFirst * 0.8) warnings.push(`Quality degradation: last third avg ${Math.round(avgLast)}w vs first third ${Math.round(avgFirst)}w`);
   }
 
@@ -3904,10 +3884,10 @@ HARD RULES FOR PATCHES
   const grokResp = await callGrokWithFallback({
     systemContent,
     userContent,
-    maxTokens:   8000,
+    maxTokens: 8000,
     temperature: 0.0,
-    timeout:     240_000,
-    label:       'grokSubjectiveStyleAudit',
+    timeout: 240_000,
+    label: 'grokSubjectiveStyleAudit',
   });
   return extractGrokResponseText(grokResp);
 }
@@ -3966,7 +3946,7 @@ export async function extractSubjectiveAudit(data: SubjectiveValidatedData, grok
 
   // Safety: surgical patches can never lose slides, but verify anyway.
   const origSlides = (originalArticleText.match(/SLIDE\s*\d+/gi) ?? []).length;
-  const newSlides  = (auditedArticle.match(/SLIDE\s*\d+/gi) ?? []).length;
+  const newSlides = (auditedArticle.match(/SLIDE\s*\d+/gi) ?? []).length;
   const finalArticle = newSlides >= origSlides ? auditedArticle : originalArticleText;
   if (newSlides < origSlides) {
     console.warn(`[extractSubjectiveAudit] Patch application lost slides (${origSlides} → ${newSlides}). Reverted to original.`);
@@ -3988,16 +3968,16 @@ export async function extractSubjectiveAudit(data: SubjectiveValidatedData, grok
 export async function finalAssemblySubjective(data: SubjectiveAuditedData): Promise<FinalOutput> {
   // Subjective quality: research 25% + structural 35% + style audit 40%.
   // No fact-verification score (we don't fact-check subjective claims).
-  const researchScore   = data.researchOk ? 80 : 50;
+  const researchScore = data.researchOk ? 80 : 50;
   const structuralScore = data.validationStatus === 'PASSED' ? 100 : data.validationStatus === 'WARNINGS' ? 70 : 40;
-  const styleScore      = data.wasAudited && data.auditedArticle.length > 200 ? 90 : 60;
-  const qualityScore    = Math.round((researchScore * 0.25) + (structuralScore * 0.35) + (styleScore * 0.40));
+  const styleScore = data.wasAudited && data.auditedArticle.length > 200 ? 90 : 60;
+  const qualityScore = Math.round((researchScore * 0.25) + (structuralScore * 0.35) + (styleScore * 0.40));
 
   const summaryParts: string[] = [];
-  if (data.errors.length)   summaryParts.push(`Errors: ${data.errors.join('; ')}`);
+  if (data.errors.length) summaryParts.push(`Errors: ${data.errors.join('; ')}`);
   if (data.warnings.length) summaryParts.push(`Warnings: ${data.warnings.length}`);
-  if (data.summaryComment)  summaryParts.push(data.summaryComment);
-  if (data.generatedBy)     summaryParts.push(`Generated by: ${data.generatedBy}`);
+  if (data.summaryComment) summaryParts.push(data.summaryComment);
+  if (data.generatedBy) summaryParts.push(`Generated by: ${data.generatedBy}`);
 
   const auditReport = `
 QUALITY AUDIT REPORT (Subjective)
@@ -4022,19 +4002,19 @@ ${data.auditReport}
 
   return {
     title: data.title, category: data.category, slideCount: data.slideCount, writerName: data.writerName,
-    articleText:         data.articleText,
+    articleText: data.articleText,
     originalArticleText: data.originalArticleText || data.articleText,
     auditReport, qualityScore, researchScore,
     verificationScore: styleScore, structuralScore, originalityScore: styleScore,
-    primarySourceUrl:       data.primarySourceUrl,
+    primarySourceUrl: data.primarySourceUrl,
     combinedSourceListText: data.sourceList,
     summaryComment: summaryParts.length > 0 ? summaryParts.join('. ') : 'Subjective article passed all checks.',
     validationStatus: data.validationStatus,
-    factsVerified:    'N/A (subjective)',
-    grokRulesPassed:  data.wasAudited ? 'Audited' : 'Skipped',
-    flagsForReview:   data.errors.length > 0 ? data.errors.join('; ') : 'None',
-    generatedBy:      data.generatedBy || 'Unknown',
-    generatedAt:      new Date().toISOString(),
+    factsVerified: 'N/A (subjective)',
+    grokRulesPassed: data.wasAudited ? 'Audited' : 'Skipped',
+    flagsForReview: data.errors.length > 0 ? data.errors.join('; ') : 'None',
+    generatedBy: data.generatedBy || 'Unknown',
+    generatedAt: new Date().toISOString(),
   };
 }
 
@@ -4154,12 +4134,12 @@ export async function enrichSlides(
       const raw = parsed[i] ?? {};
       return {
         primarySubject: String(raw.primarySubject ?? ''),
-        otherSubjects:  Array.isArray(raw.otherSubjects) ? raw.otherSubjects.map(String).slice(0, 3) : [],
-        teamName:       String(raw.teamName ?? ''),
-        eventName:      String(raw.eventName ?? ''),
-        location:       String(raw.location ?? ''),
-        year:           String(raw.year ?? ''),
-        emotion:        String(raw.emotion ?? ''),
+        otherSubjects: Array.isArray(raw.otherSubjects) ? raw.otherSubjects.map(String).slice(0, 3) : [],
+        teamName: String(raw.teamName ?? ''),
+        eventName: String(raw.eventName ?? ''),
+        location: String(raw.location ?? ''),
+        year: String(raw.year ?? ''),
+        emotion: String(raw.emotion ?? ''),
       };
     });
 
