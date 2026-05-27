@@ -55,7 +55,7 @@ async function callGrokWithFallback(opts: {
   // ── 1. Try Vercel AI Gateway (Responses API format) ──────────────────────
   try {
     const body: Record<string, unknown> = {
-      model: 'xai/grok-4.3',
+      model: 'xai/grok-4.20-non-reasoning',
       max_output_tokens: opts.maxTokens,
       temperature: opts.temperature,
       input: [
@@ -92,7 +92,7 @@ async function callGrokWithFallback(opts: {
 
   console.log(`[${opts.label}] Attempting direct xAI API (${XAI_DIRECT_URL})…`);
   const body: Record<string, unknown> = {
-    model: 'grok-4.3',
+    model: 'grok-4.20-non-reasoning',
     max_tokens: opts.maxTokens,
     temperature: opts.temperature,
     messages: [
