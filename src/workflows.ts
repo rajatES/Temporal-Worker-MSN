@@ -300,6 +300,21 @@ function parseSlides(text: string): ParsedSlide[] {
   return result;
 }
 
+// Split parsed slides into intro + content POSITIONALLY — by where each block
+// appears, NOT by its numeric "SLIDE N" label. The first block is always the
+// intro; every block after it is content, kept in written order.
+//
+// Why: Claude sometimes numbers content slides by RANK for countdowns (e.g.
+// "SLIDE 9 … SLIDE 1"), which produces a second "SLIDE 1" that collides with the
+// intro. The old `find(slideNum===1)` / `filter(slideNum>1)` logic then treated
+// the rank-1 item as a duplicate intro and silently dropped it (and the sort
+// reversed the countdown order). Positional splitting is immune to whatever
+// numbering scheme the model uses.
+function splitIntroAndContent(parsed: ParsedSlide[]): { intro: ParsedSlide | undefined; content: ParsedSlide[] } {
+  if (parsed.length === 0) return { intro: undefined, content: [] };
+  return { intro: parsed[0], content: parsed.slice(1) };
+}
+
 interface EnrichmentResult {
   slides: EnrichedSlideFields[];
   status: string;
@@ -311,10 +326,7 @@ function buildWorkflowResult(
   enrichment?: EnrichmentResult | null,
 ): WorkflowResult {
   const parsedSlides = parseSlides(articleText);
-  const introSlide = parsedSlides.find(s => s.slideNum === 1);
-  const contentSlides = parsedSlides
-    .filter(s => s.slideNum > 1)
-    .sort((a, b) => a.slideNum - b.slideNum);
+  const { intro: introSlide, content: contentSlides } = splitIntroAndContent(parsedSlides);
 
   const enrichedContentSlides = contentSlides.map((s, i) => {
     const base = { title: s.title, description: s.body };
@@ -599,9 +611,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
     // Stage 12: Slide enrichment (Claude Haiku structured-field extraction)
     activate('enriching', 'Extracting image search fields…');
-    const parsedForEnrich = parseSlides(audited.articleText)
-      .filter(s => s.slideNum > 1)
-      .sort((a, b) => a.slideNum - b.slideNum)
+    const parsedForEnrich = splitIntroAndContent(parseSlides(audited.articleText)).content
       .map(s => ({ title: s.title, description: s.body }));
 
     let enrichment: EnrichmentResult | null = null;
@@ -977,9 +987,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
   // ── Stage 13: Slide enrichment (Claude Haiku structured-field extraction) ───
   activate('enriching', 'Extracting image search fields…');
-  const parsedForEnrich = parseSlides(auditedData.articleText)
-    .filter(s => s.slideNum > 1)
-    .sort((a, b) => a.slideNum - b.slideNum)
+  const parsedForEnrich = splitIntroAndContent(parseSlides(auditedData.articleText)).content
     .map(s => ({ title: s.title, description: s.body }));
 
   let enrichment: EnrichmentResult | null = null;

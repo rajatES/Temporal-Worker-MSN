@@ -2182,6 +2182,36 @@ export async function generateWithGrok(systemPrompt: string, userPrompt: string)
   return extractGrokResponseText(data);
 }
 
+// ── Em-dash enforcement (shared by objective + subjective validators) ─────────
+// MSN style bans the em-dash and Claude keeps emitting it despite the prompt
+// rule, so we auto-fix rather than warn. Replace em-dash (U+2014) and horizontal
+// bar (U+2015) with a comma, then tidy the surrounding punctuation. En-dash
+// (U+2013) is intentionally left alone — it appears in ranges/records like
+// "13–4" or "2001–02" where a comma would corrupt the data.
+function fixEmDashLine(s: string): string {
+  return s
+    .replace(/\s*[—―]\s*/g, ', ')
+    .replace(/\s+,/g, ',')        // no space before comma
+    .replace(/,\s*,/g, ',')       // collapse doubled commas
+    .replace(/,\s*\./g, '.')      // ", ." → "."
+    .replace(/,\s*$/g, '')        // drop trailing comma
+    .replace(/\s{2,}/g, ' ')      // collapse double spaces
+    .trim();
+}
+
+/** Apply the em-dash fix line-by-line across a full article, preserving the line
+ *  structure (so "SLIDE N" markers and blank lines stay intact). */
+function stripEmDashesFromArticle(articleText: string): { text: string; changed: boolean } {
+  if (!articleText.includes('—') && !articleText.includes('―')) {
+    return { text: articleText, changed: false };
+  }
+  const text = articleText
+    .split('\n')
+    .map(line => (line.includes('—') || line.includes('―')) ? fixEmDashLine(line) : line)
+    .join('\n');
+  return { text, changed: true };
+}
+
 // ── 13. validateStructure (n8n: "Structural Validator") ──────────────────────
 
 export async function validateStructure(data: GeneratedData): Promise<ValidatedData> {
@@ -2206,6 +2236,12 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
     }
   }
   if (currentSlide !== null) slides.push({ slideNum: currentSlide, title: currentTitle, body: currentBody.trim(), wordCount: currentBody.trim().split(/\s+/).filter(Boolean).length });
+
+  // Renumber slides POSITIONALLY (first block = 1 = intro, rest = 2..N = content).
+  // The "SLIDE N" labels in the article can be rank-based for countdowns (e.g.
+  // "SLIDE 9 … SLIDE 1"), producing a duplicate "SLIDE 1" that would otherwise
+  // misclassify the rank-1 item as a second intro. Position is authoritative.
+  slides.forEach((s, i) => { s.slideNum = i + 1; });
 
   // Word count
   slides.forEach(slide => {
@@ -2243,9 +2279,17 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
     });
   }
 
-  // Punctuation bans
+  // Punctuation bans — em-dash is AUTO-FIXED (replaced with comma), not just warned.
+  const emDashFix = stripEmDashesFromArticle(articleText);
+  if (emDashFix.changed) {
+    articleText = emDashFix.text;
+    // Keep the parsed slides in sync so downstream (Grok audit, final assembly)
+    // sees the corrected text in both the raw article AND the slide objects.
+    slides.forEach(s => { s.title = fixEmDashLine(s.title); s.body = fixEmDashLine(s.body); });
+    autoFixes.push('Replaced em-dashes with commas');
+  }
+
   slides.filter(s => s.slideNum > 0).forEach(slide => {
-    if (slide.body.includes('—')) warnings.push(`Slide ${slide.slideNum}: em-dash (banned)`);
     if (slide.body.includes(';')) warnings.push(`Slide ${slide.slideNum}: semicolon (banned)`);
     if (slide.body.includes('...') || slide.body.includes('…')) warnings.push(`Slide ${slide.slideNum}: ellipsis (banned)`);
   });
@@ -3660,9 +3704,13 @@ export async function generateSubjectiveWithGrok(systemPrompt: string, userPromp
 // ── S8. validateSubjective (n8n: "Validate Output - Subjective") ──────────────
 
 export async function validateSubjective(data: SubjectiveGeneratedData): Promise<SubjectiveValidatedData> {
-  const articleText = data.articleText;
+  let articleText = data.articleText;
   const errors: string[] = [];
   const warnings: string[] = [];
+  // Em-dash is AUTO-FIXED (replaced with comma) before any other check, so the
+  // corrected text flows into the Grok style audit and final output.
+  const emDashFix = stripEmDashesFromArticle(articleText);
+  if (emDashFix.changed) articleText = emDashFix.text;
   const lowerArticle = articleText.toLowerCase();
 
   const bannedPhrases = [
@@ -3694,14 +3742,7 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
   const metaMatch = articleText.match(/^META:\s*(.+)$/m);
   if (metaMatch && metaMatch[1].length > 120) warnings.push(`META too long: ${metaMatch[1].length} chars (max 120)`);
 
-  // Em-dash check (titles excluded)
-  if (articleText.includes('—')) {
-    const slideBlocks = articleText.match(/SLIDE\s*\d+[\s\S]*?(?=SLIDE\s*\d+|SOURCES:|$)/gi) ?? [];
-    slideBlocks.forEach((block, i) => {
-      const bodyLines = block.split('\n').slice(2).join(' ');
-      if (bodyLines.includes('—')) warnings.push(`Slide ${i + 1}: em-dash (banned)`);
-    });
-  }
+  // (Em-dash is auto-fixed above — no warning needed.)
 
   // Parse slides + word counts. Only treat explicit "SLIDE N" markers as slide
   // boundaries — a rank-number title like "21. Game Name" must NOT start a new
@@ -3731,7 +3772,11 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
     const m = line.match(/^SLIDE\s*(\d+)/i);
     if (m) {
       flushSlide();
-      slideNum = parseInt(m[1], 10);
+      // POSITIONAL numbering — first SLIDE block = 1 (intro), rest = 2..N.
+      // Ignore the marker's numeric label, which can be rank-based for
+      // countdowns ("SLIDE 9 … SLIDE 1") and would otherwise produce a
+      // duplicate "1" that misclassifies the rank-1 item as a second intro.
+      slideNum += 1;
     } else if (slideNum > 0 && line && !line.startsWith('SOURCES') && !line.startsWith('META:')) {
       if (!slideTitleSet) {
         // first non-empty line after the SLIDE marker is the title
@@ -3785,7 +3830,7 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
   const validationStatus: SubjectiveValidatedData['validationStatus'] =
     errors.length > 0 ? 'FAILED' : warnings.length > 0 ? 'WARNINGS' : 'PASSED';
 
-  return { ...data, validationStatus, errors, warnings, slideResults };
+  return { ...data, articleText, validationStatus, errors, warnings, slideResults };
 }
 
 // ── S9. grokSubjectiveStyleAudit (n8n: "Grok - Style Auditor") ────────────────
