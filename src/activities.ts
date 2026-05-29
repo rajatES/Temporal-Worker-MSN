@@ -331,6 +331,15 @@ function splitSlidesForScan(articleText: string): Array<{ num: number; title: st
   return slides;
 }
 
+// §2a overt violent / prohibited-theme words that should never headline an MSN
+// title. Defense-in-depth: the LLM moderation layer catches subtler context, this
+// catches blatant ones even if the LLM pass is skipped or degraded.
+const PROHIBITED_TITLE_THEME = [
+  'blood', 'bloody', 'bloodbath', 'violence', 'violent', 'gore', 'gory', 'carnage',
+  'massacre', 'slaughter', 'murder', 'killing', 'brutal', 'gruesome', 'savage',
+  'mutilation', 'torture', 'shooting',
+];
+
 function scanTitleDeterministic(title: string, out: ModerationFlag[]): void {
   if (!title) return;
 
@@ -369,6 +378,13 @@ function scanTitleDeterministic(title: string, out: ModerationFlag[]): void {
     source: 'code', severity: 'review', rule: '§3a Subjective descriptor', zone: 'title',
     excerpt: found.join(', '),
     detail: `Title uses subjective/unverifiable descriptor(s): ${found.join(', ')}. Remove unless objectively justified (e.g. "Major" only if a top-5 subject).`,
+  });
+  // §2a Prohibited / violent themes surfacing in the title
+  const themeHits = PROHIBITED_TITLE_THEME.filter(w => new RegExp(`\\b${w}\\b`, 'i').test(title));
+  if (themeHits.length) out.push({
+    source: 'code', severity: 'review', rule: '§2a Prohibited theme (title)', zone: 'title',
+    excerpt: themeHits.join(', '),
+    detail: `Title surfaces violent/prohibited theme word(s): ${themeHits.join(', ')}. MSN bans graphic/violent content — fails the 10-12 year-old test, review before publishing.`,
   });
 }
 
@@ -419,11 +435,61 @@ export function computeModerationVerdict(flags: ModerationFlag[]): ModerationVer
   return 'PASS';
 }
 
+// Shared MSN moderation ruleset (the CONTEXTUAL/subjective judgment layer). Used by
+// both the objective audit node (claudeAuditAndModerate PART C) and the standalone
+// claudeModerate node (objective + subjective), so the two pipelines never drift.
+const MSN_MODERATION_RULES = `A deterministic scanner ALREADY flags literal banned words (slurs, explicit sexual
+terms, hard drugs, profanity) and literal clickbait title patterns — DO NOT re-flag
+those. Your job is the CONTEXTUAL and SUBJECTIVE judgment the scanner cannot make.
+Inspect the TITLE and every SLIDE.
+
+Core test for everything: would a 10-12 year old reading this be fine, and can
+every word in the title be objectively proven?
+
+A. PROHIBITED THEMES / NO-GO AREAS (severity: fail)
+   - Sexual or violent-crime content, even mild; graphic gore, blood, or killing as
+     a theme; drugs/gambling/tobacco; suicide.
+   - Hate or negative framing on race, ethnicity, gender, sexual orientation,
+     religion, disability; bullying, harassment, body-shaming.
+   - Election or political content; LGBTQ as a topic; general lifestyle coverage.
+   - Hoax / fake news / misinformation; rumors, speculation, unverified reports.
+   - Content that does not directly impact the team, player, or their career.
+   - Context-prone banned terms used in a genuinely unsafe sense (e.g. "shot"
+     meaning gunfire, "assault" as a crime, "drug" abuse, "kill" literally,
+     "trans", "scandal", "allegation", "fraud", "gambling"). If the term is normal
+     sports usage ("game-winning shot", "killed it in the fourth"), DO NOT flag it.
+
+B. CLICKBAIT / FRAMING (severity: review)
+   - Exaggerated language / hype that overstates the story.
+   - Promise of a revelation the article cannot deliver.
+   - Purposeful omission / curiosity gap — withholding who/what to bait clicks.
+   - Bait-and-switch: title implies controversy or drama, the body is neutral.
+   - Numbered listicle whose items lack real substance.
+   - Title that does not clearly state WHO | WHAT | OUTCOME.
+   - "Major" used when the subject is NOT genuinely top-5.
+
+C. RANKINGS & SOURCING (severity: review)
+   - A ranking or ordering with no stated methodology, criteria, or credible basis.
+
+D. FEED SWIMLANE (severity: review)
+   - Content that falls OUTSIDE every MSN feed swimlane. Valid swimlanes are
+     specific sports teams/leagues, named athletes, gaming/esports, movies & TV,
+     and motorsport/racing. Flag clearly off-topic content (politics, general
+     lifestyle, unrelated subjects).
+
+SEVERITY GUIDE for flags:
+  absolute = a hard prohibited theme that can never publish
+  fail     = a clear MSN guideline violation (editor MUST act before publishing)
+  review   = a subjective / framing / judgment call for an editor to review`;
+
 // ── moderationScan — deterministic code node ─────────────────────────────────
-// Runs on the FINAL article text (after fact corrections + style patches) so
-// flags reflect exactly what ships. Adds its code-sourced flags to whatever the
-// Claude audit node already produced, dedupes, and recomputes the verdict.
-export async function moderationScan(data: AuditedData): Promise<AuditedData> {
+// Runs on the FINAL article text (after fact corrections + style patches) so flags
+// reflect exactly what ships. Pipeline-agnostic: takes the title + article + any
+// flags already produced by the LLM moderation pass, adds its code-sourced flags,
+// dedupes, and returns the merged flags + verdict. Used by BOTH pipelines.
+export async function moderationScan(
+  data: { title?: string; articleText?: string; moderationFlags?: ModerationFlag[] },
+): Promise<{ moderationFlags: ModerationFlag[]; moderationVerdict: ModerationVerdict }> {
   const codeFlags: ModerationFlag[] = [];
   const title = (data.title ?? '').trim();
   const articleText = data.articleText ?? '';
@@ -452,7 +518,74 @@ export async function moderationScan(data: AuditedData): Promise<AuditedData> {
   const merged = dedupeModerationFlags([...(data.moderationFlags ?? []), ...codeFlags]);
   const verdict = computeModerationVerdict(merged);
   console.log(`[moderationScan] code flags: ${codeFlags.length} · merged total: ${merged.length} · verdict: ${verdict}`);
-  return { ...data, moderationFlags: merged, moderationVerdict: verdict };
+  return { moderationFlags: merged, moderationVerdict: verdict };
+}
+
+// ── callClaudeMessages — shared Claude (Anthropic-format) call via Vercel gateway ─
+async function callClaudeMessages(model: string, systemContent: string, userContent: string, maxTokens: number, timeoutMs: number): Promise<string> {
+  const resp = await axios.post(
+    VERCEL_GATEWAY_MESSAGES_URL,
+    {
+      model,
+      max_tokens: maxTokens,
+      temperature: 0,
+      system: [{ type: 'text', text: systemContent, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: userContent }],
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'prompt-caching-2024-07-31',
+        Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`,
+      },
+      timeout: timeoutMs,
+    },
+  );
+  return (resp.data?.content as Array<{ type: string; text?: string }>)?.find(c => c.type === 'text')?.text ?? '';
+}
+
+// ── claudeModerate — standalone Haiku MSN moderation (CONTEXTUAL layer) ───────
+// Pipeline-agnostic moderation pass used by BOTH objective and subjective flows.
+// Flag-only (never rewrites). Returns the parsed contextual flags; the deterministic
+// moderationScan adds the literal banned-word/typography flags on top. Non-blocking:
+// returns [] on any error so the deterministic scan still runs.
+export async function claudeModerate(input: { title: string; articleText: string; category: string }): Promise<ModerationFlag[]> {
+  const systemContent = `You are an MSN Slideshow content MODERATOR with 20+ years in trust & safety. Read the TITLE and every SLIDE and FLAG (do not fix, do not rewrite) anything that violates the MSN Content Moderator ruleset. This is flag-only.
+
+${MSN_MODERATION_RULES}
+
+═══════════════════════════════════════════════════════════════
+OUTPUT FORMAT — EXACTLY THIS
+═══════════════════════════════════════════════════════════════
+
+=== MODERATION FLAGS ===
+
+<<<FLAG>>>
+SEVERITY: review
+RULE: §4f Bait-and-switch
+ZONE: title
+EXCERPT: <short verbatim snippet — ONE line>
+DETAIL: <one-line explanation of why it is flagged>
+<<<END>>>
+
+(emit one block per issue; emit ZERO blocks if there is nothing to flag. Keep
+EXCERPT and DETAIL each to a SINGLE line. ZONE is one of: title, meta, or "slide N".
+SEVERITY is one of: absolute, fail, review. Always inspect the TITLE first.)
+
+=== END MODERATION FLAGS ===`;
+
+  const userContent = `Moderate this MSN slideshow against the ruleset.\n\nTitle: "${input.title}"\nCategory / feed topic: ${input.category}\n\nARTICLE\n\n${input.articleText}\n\nEmit ONLY the MODERATION FLAGS block.`;
+
+  try {
+    const text = await callClaudeMessages('claude-haiku-4-5-20251001', systemContent, userContent, 2000, 120_000);
+    const flags = parseModerationFlags(text);
+    console.log(`[claudeModerate] ${flags.length} contextual moderation flags`);
+    return flags;
+  } catch (err: unknown) {
+    console.error('[claudeModerate] error (non-blocking):', err instanceof Error ? err.message : String(err));
+    return [];
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3346,48 +3479,9 @@ PART C — MSN MODERATION FLAGS (flag-only, NEVER patched)
 ═══════════════════════════════════════════════════════════════
 
 Separately FLAG (do not fix, do not patch) any content that violates the MSN
-Content Moderator ruleset below. A deterministic scanner ALREADY flags literal
-banned words (slurs, explicit sexual terms, hard drugs, profanity) and literal
-clickbait title patterns — DO NOT re-flag those. Your job is the CONTEXTUAL and
-SUBJECTIVE judgment the scanner cannot make. Inspect the TITLE and every SLIDE.
+Content Moderator ruleset below.
 
-Core test for everything: would a 10-12 year old reading this be fine, and can
-every word in the title be objectively proven?
-
-A. PROHIBITED THEMES / NO-GO AREAS (severity: fail)
-   - Sexual or violent-crime content, even mild; drugs/gambling/tobacco; suicide.
-   - Hate or negative framing on race, ethnicity, gender, sexual orientation,
-     religion, disability; bullying, harassment, body-shaming.
-   - Election or political content; LGBTQ as a topic; general lifestyle coverage.
-   - Hoax / fake news / misinformation; rumors, speculation, unverified reports.
-   - Content that does not directly impact the team, player, or their career.
-   - Context-prone banned terms used in a genuinely unsafe sense (e.g. "shot"
-     meaning gunfire, "assault" as a crime, "drug" abuse, "kill" literally,
-     "trans", "scandal", "allegation", "fraud", "gambling"). If the term is normal
-     sports usage ("game-winning shot", "killed it in the fourth"), DO NOT flag it.
-
-B. CLICKBAIT / FRAMING (severity: review)
-   - Exaggerated language / hype that overstates the story.
-   - Promise of a revelation the article cannot deliver.
-   - Purposeful omission / curiosity gap — withholding who/what to bait clicks.
-   - Bait-and-switch: title implies controversy or drama, the body is neutral.
-   - Numbered listicle whose items lack real substance.
-   - Title that does not clearly state WHO | WHAT | OUTCOME.
-   - "Major" used when the subject is NOT genuinely top-5.
-
-C. RANKINGS & SOURCING (severity: review)
-   - A ranking or ordering with no stated methodology, criteria, or credible basis.
-
-D. FEED SWIMLANE (severity: review)
-   - Content that falls OUTSIDE every MSN feed swimlane. Valid swimlanes are
-     specific sports teams/leagues, named athletes, gaming/esports, movies & TV,
-     and motorsport/racing. Flag clearly off-topic content (politics, general
-     lifestyle, unrelated subjects).
-
-SEVERITY GUIDE for flags:
-  absolute = a hard prohibited theme that can never publish
-  fail     = a clear MSN guideline violation (editor MUST act before publishing)
-  review   = a subjective / framing / judgment call for an editor to review
+${MSN_MODERATION_RULES}
 
 ═══════════════════════════════════════════════════════════════
 OUTPUT FORMAT — EXACTLY THIS, IN THIS ORDER
@@ -4738,10 +4832,22 @@ export async function finalAssemblySubjective(data: SubjectiveAuditedData): Prom
   const styleScore = data.wasAudited && data.auditedArticle.length > 200 ? 90 : 60;
   const qualityScore = Math.round((researchScore * 0.25) + (structuralScore * 0.35) + (styleScore * 0.40));
 
+  const moderationFlags = data.moderationFlags ?? [];
+  const moderationVerdict = data.moderationVerdict ?? 'PASS';
+  const modCounts = {
+    absolute: moderationFlags.filter(f => f.severity === 'absolute').length,
+    fail: moderationFlags.filter(f => f.severity === 'fail').length,
+    review: moderationFlags.filter(f => f.severity === 'review').length,
+  };
+  const moderationReport = moderationFlags.length > 0
+    ? moderationFlags.map((f, i) => `${i + 1}. [${f.severity.toUpperCase()}] (${f.source}) ${f.rule} · ${f.zone}\n   ${f.detail}${f.excerpt ? `\n   Excerpt: "${f.excerpt}"` : ''}${f.suggestion ? `\n   Suggested censor: ${f.suggestion}` : ''}`).join('\n')
+    : 'No moderation issues flagged.';
+
   const summaryParts: string[] = [];
   if (data.errors.length) summaryParts.push(`Errors: ${data.errors.join('; ')}`);
   if (data.warnings.length) summaryParts.push(`Warnings: ${data.warnings.length}`);
   if (data.summaryComment) summaryParts.push(data.summaryComment);
+  if (moderationVerdict !== 'PASS') summaryParts.push(`Moderation: ${moderationVerdict} (${moderationFlags.length} flag${moderationFlags.length === 1 ? '' : 's'})`);
   if (data.generatedBy) summaryParts.push(`Generated by: ${data.generatedBy}`);
 
   const auditReport = `
@@ -4763,6 +4869,11 @@ Warnings: ${data.warnings.join(', ') || 'None'}
 
 STYLE AUDIT (Grok)
 ${data.auditReport}
+
+MSN MODERATION
+Verdict: ${moderationVerdict}
+Flags: ${moderationFlags.length} (absolute ${modCounts.absolute} · fail ${modCounts.fail} · review ${modCounts.review})
+${moderationReport}
 `;
 
   return {
@@ -4780,10 +4891,8 @@ ${data.auditReport}
     flagsForReview: data.errors.length > 0 ? data.errors.join('; ') : 'None',
     generatedBy: data.generatedBy || 'Unknown',
     generatedAt: new Date().toISOString(),
-    // MSN moderation flagging is wired into the objective pipeline; subjective
-    // keeps its own style audit and reports an empty/PASS moderation result for now.
-    moderationFlags: [],
-    moderationVerdict: 'PASS',
+    moderationFlags,
+    moderationVerdict,
   };
 }
 

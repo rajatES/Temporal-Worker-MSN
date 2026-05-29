@@ -386,6 +386,9 @@ export interface SubjectiveAuditedData extends SubjectiveValidatedData {
   summaryComment: string;
   auditedArticle: string;
   wasAudited: boolean;
+  /** MSN moderation flags (claudeModerate + moderationScan), attached by the workflow. */
+  moderationFlags?: ModerationFlag[];
+  moderationVerdict?: ModerationVerdict;
 }
 
 export interface FinalOutput {

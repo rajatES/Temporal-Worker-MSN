@@ -39,6 +39,7 @@ const {
   extractClaims,
   processVerification,
   claudeAuditAndModerate,
+  claudeModerate,
   moderationScan,
   extractAuditResults,
   finalAssembly,
@@ -682,10 +683,22 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     }
     complete('auditing', audited.wasAudited ? 'Audited' : 'Skipped');
 
+    // Stage 10b: MSN moderation — parity with the objective pipeline. Haiku
+    // contextual pass (claudeModerate) + deterministic scan (moderationScan),
+    // merged into a verdict. Flag-only, non-blocking — this is what was missing
+    // for subjective articles (they previously shipped a hardcoded PASS).
+    try {
+      const claudeFlags = await claudeModerate({ title: audited.title, articleText: audited.articleText, category: audited.category });
+      const mod = await moderationScan({ title: audited.title, articleText: audited.articleText, moderationFlags: claudeFlags });
+      audited = { ...audited, moderationFlags: mod.moderationFlags, moderationVerdict: mod.moderationVerdict };
+    } catch {
+      warn('auditing', 'Moderation pass failed — continuing without moderation flags');
+    }
+
     // Stage 11: final assembly
     activate('creating_docs', 'Assembling output…');
     const final = await finalAssemblySubjective(audited);
-    complete('creating_docs', `score ${final.qualityScore}/100`);
+    complete('creating_docs', `score ${final.qualityScore}/100 · moderation ${audited.moderationVerdict ?? 'PASS'} (${(audited.moderationFlags ?? []).length} flags)`);
 
     // Stage 12: Slide enrichment (Claude Haiku structured-field extraction)
     activate('enriching', 'Extracting image search fields…');
@@ -1120,7 +1133,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   // Runs on the post-audit article so flags reflect what ships; merges with the
   // Claude moderation flags and recomputes the verdict. Never blocks the flow.
   try {
-    auditedData = await moderationScan(auditedData);
+    const mod = await moderationScan({ title: auditedData.title, articleText: auditedData.articleText, moderationFlags: auditedData.moderationFlags });
+    auditedData = { ...auditedData, moderationFlags: mod.moderationFlags, moderationVerdict: mod.moderationVerdict };
   } catch {
     warn('auditing', 'Moderation scan failed — keeping Claude flags only');
   }
