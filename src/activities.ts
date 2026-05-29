@@ -5,6 +5,7 @@ import {
   MergedData, PromptData, GeneratedData, ValidatedData, ClaimedData,
   VerifiedData, AuditedData, FinalOutput, TemporalCtx, BatchSpec,
   FormatConfig, TitleAnalysis, AtomizedFact, SourceEntry, FactProvenance,
+  ModerationFlag, ModerationSeverity, ModerationVerdict,
   SubjectivePreparedData, SubjectiveSourcedData, SubjectiveAtomizedData,
   SubjectiveResearchedData, SubjectiveMergedData,
   SubjectivePromptData, SubjectiveGeneratedData, SubjectiveValidatedData,
@@ -14,12 +15,21 @@ import {
 dotenv.config();
 
 const FIRECRAWL_KEY = process.env.FIRECRAWL_API_KEY!;
+// PERPLEXITY_KEY / ANTHROPIC_KEY are retained for reference only — Claude and
+// Perplexity now authenticate through the Vercel AI Gateway (VERCEL_GATEWAY_KEY),
+// the same key used for Grok. Direct-API auth is no longer used.
 const PERPLEXITY_KEY = process.env.PERPLEXITY_API_KEY!;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY!;
 const GROK_KEY = process.env.GROK_API_KEY!;
 const VERCEL_GATEWAY_KEY = process.env.VERCEL_AI_GATEWAY_KEY!;
+void PERPLEXITY_KEY; void ANTHROPIC_KEY;  // intentionally retained (see note above)
 
 const VERCEL_GATEWAY_URL = 'https://ai-gateway.vercel.sh/v1/responses';
+// Claude + Perplexity now route through the SAME Vercel AI Gateway (same key as Grok):
+//   - Claude     → /v1/messages       (Anthropic-native passthrough; model id unchanged)
+//   - Perplexity → /v1/chat/completions (OpenAI-format; model id prefixed "perplexity/")
+const VERCEL_GATEWAY_MESSAGES_URL = 'https://ai-gateway.vercel.sh/v1/messages';
+const VERCEL_GATEWAY_CHAT_URL = 'https://ai-gateway.vercel.sh/v1/chat/completions';
 const XAI_DIRECT_URL = 'https://api.x.ai/v1/chat/completions';
 
 function extractGrokResponseText(data: unknown): string {
@@ -208,6 +218,241 @@ export function applyAuditPatches(article: string, patches: AuditPatch[]): { res
     }
   }
   return { result, applied, skipped, log };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MSN MODERATION FLAGGING — robust, NON-BLOCKING audit of the generated article
+// against the MSN Content Moderator ruleset. Two producers:
+//   1. moderationScan (this file)         — deterministic code node
+//   2. claudeAuditAndModerate (Haiku)     — contextual/subjective judgment
+// Nothing is auto-censored or aborted; everything surfaces as ModerationFlag[].
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Tier A: UNAMBIGUOUS absolute bans ─────────────────────────────────────────
+// Only words whose presence is (essentially) always a real violation regardless
+// of context — slurs, explicit sexual terms, hard drugs, profanity. Context-prone
+// terms (shot, kill, drug, assault, major, trans, coke, weed, scandal, allegation,
+// gambling, prison, "dick" as a name, tobacco, vaccine, etc.) are deliberately
+// LEFT OUT — the Claude audit node judges those with surrounding context so we
+// don't false-positive on normal sports vocabulary ("game-winning shot").
+const BANNED_ABSOLUTE: string[] = [
+  // slurs
+  'nigger', 'nigga', 'faggot', 'fag', 'pedophile', 'pedo', 'pedos',
+  // explicit sexual
+  'porn', 'porn star', 'pornstar', 'nude', 'naked', 'masturbate', 'ejaculation',
+  'orgasm', 'genitals', 'testicle', 'testicles', 'schlong', 'spunk', 'striptease',
+  'dominatrix', 'onlyfans', 'nsfw', 'lovemaking', 'vibrator', 'dildo', 'rape',
+  'molest', 'sexy', 'nipple', 'nipples', 'hooters', 'vagina', 'penis',
+  'sex', 'sexual', 'sex toy',
+  // profanity
+  'fuck', 'pussy', 'bitch', 'shit', 'wtf', 'cum',
+  // hard drugs
+  'cocaine', 'heroin', 'opioids', 'marijuana', 'cannabis', 'ganja',
+  // safety
+  'suicide', 'terrorist',
+];
+
+// Known acronyms that are legitimately all-caps (so §4c typography doesn't flag them).
+const ACRONYM_ALLOW = new Set([
+  'NASCAR', 'WNBA', 'NCAA', 'ESPN', 'NBA', 'NFL', 'MLB', 'NHL', 'UFC', 'MVP',
+  'GOAT', 'USA', 'MLS', 'PGA', 'LPGA', 'FIFA', 'WWE', 'OT', 'TD', 'QB', 'RB', 'WR',
+]);
+
+// §2c / §7 literal banned clickbait title patterns (high-precision phrases only).
+const BANNED_TITLE_PATTERNS: Array<{ re: RegExp; label: string }> = [
+  { re: /\bshocking\b/i,                 label: '"shocking"' },
+  { re: /you\s*won'?t\s*believe/i,       label: '"you won\'t believe"' },
+  { re: /this\s+changes\s+everything/i,  label: '"this changes everything"' },
+  { re: /way\s+ahead\s+of\s+time/i,      label: '"way ahead of time"' },
+  { re: /big\s+update\s+for\s+fans/i,    label: '"big update for fans"' },
+  { re: /\bsuspiciously\b/i,             label: '"suspiciously"' },
+  { re: /\bgame[-\s]?chang(?:er|ing)\b/i,label: '"game-changer/game-changing"' },
+  { re: /fans\s+react\b/i,               label: '"fans react"' },
+  { re: /\bmind[-\s]?blowing\b/i,        label: '"mind-blowing"' },
+  { re: /\bjaw[-\s]?dropping\b/i,        label: '"jaw-dropping"' },
+];
+
+// §3a subjective/unverifiable descriptors banned from titles ("shocking" is
+// handled by BANNED_TITLE_PATTERNS, so it's omitted here to avoid double-flagging).
+const SUBJECTIVE_DESCRIPTORS = [
+  'stunning', 'massive', 'major', 'bold', 'strong', 'important',
+  'huge', 'incredible', 'unbelievable', 'epic', 'insane',
+];
+
+// Censor a banned word: first letter + asterisks (Shit → S***, Nigger → N*****).
+// INFORMATIONAL ONLY — never applied to the article text.
+function censorWord(w: string): string {
+  const letters = w.replace(/[^a-zA-Z]/g, '');
+  if (letters.length <= 1) return w;
+  return letters[0] + '*'.repeat(letters.length - 1);
+}
+
+function bannedWordRegex(term: string): RegExp {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  return new RegExp(`\\b${escaped}\\b`, 'i');
+}
+
+// Scan one text zone for Tier-A banned words. Title hits are 'absolute'
+// (cannot publish even censored); body/meta/slide hits are 'fail' (editor must censor).
+function scanBannedWords(text: string, zone: string, severity: ModerationSeverity, out: ModerationFlag[]): void {
+  if (!text) return;
+  for (const term of BANNED_ABSOLUTE) {
+    const m = text.match(bannedWordRegex(term));
+    if (m) {
+      out.push({
+        source: 'code',
+        severity,
+        rule: '§5 Banned word',
+        zone,
+        excerpt: m[0],
+        detail: severity === 'absolute'
+          ? `Banned word "${m[0]}" in the title — cannot be published even if censored.`
+          : `Banned word "${m[0]}" in ${zone} — editor must censor before publishing.`,
+        suggestion: censorWord(m[0]),
+      });
+    }
+  }
+}
+
+// Positional slide splitter (intro = slide 1, content = 2..N), mirrors validateStructure.
+function splitSlidesForScan(articleText: string): Array<{ num: number; title: string; body: string }> {
+  const slides: Array<{ num: number; title: string; body: string }> = [];
+  let cur: number | null = null, t = '', b = '';
+  const flush = () => { if (cur !== null) slides.push({ num: 0, title: t.trim(), body: b.trim() }); };
+  for (const line of articleText.split('\n')) {
+    const trimmed = line.trim().replace(/\*\*/g, '').trim();
+    const mm = trimmed.match(/^SLIDE\s*(\d+)/i);
+    if (mm) { flush(); cur = parseInt(mm[1], 10); t = ''; b = ''; }
+    else if (cur !== null && !t && trimmed && !trimmed.startsWith('META:')) t = trimmed;
+    else if (cur !== null && t && trimmed && !trimmed.startsWith('SOURCES')) b += ' ' + trimmed;
+  }
+  flush();
+  slides.forEach((s, i) => { s.num = i + 1; });
+  return slides;
+}
+
+function scanTitleDeterministic(title: string, out: ModerationFlag[]): void {
+  if (!title) return;
+
+  // §4c Excitable typography — exclamation / repeated punctuation
+  if (/!/.test(title) || /[!?]{2,}/.test(title)) {
+    out.push({
+      source: 'code', severity: 'review', rule: '§4c Excitable typography', zone: 'title',
+      excerpt: title, detail: 'Title uses exclamation marks or repeated punctuation to amplify urgency.',
+    });
+  }
+  // §4c All-caps hype words (length ≥ 4, not a known acronym)
+  const caps = (title.match(/\b[A-Z]{4,}\b/g) ?? []).filter(w => !ACRONYM_ALLOW.has(w));
+  if (caps.length) {
+    out.push({
+      source: 'code', severity: 'review', rule: '§4c Excitable typography', zone: 'title',
+      excerpt: caps.join(', '), detail: `All-caps word(s) used for emphasis: ${caps.join(', ')}.`,
+    });
+  }
+  // §2c / §7 literal banned clickbait patterns
+  for (const p of BANNED_TITLE_PATTERNS) {
+    const m = title.match(p.re);
+    if (m) out.push({
+      source: 'code', severity: 'fail', rule: '§2c/§7 Banned title pattern', zone: 'title',
+      excerpt: m[0], detail: `Title contains banned clickbait pattern ${p.label}.`,
+    });
+  }
+  // §2c Overuse of "this"
+  const thisCount = (title.match(/\bthis\b/gi) ?? []).length;
+  if (thisCount >= 2) out.push({
+    source: 'code', severity: 'review', rule: '§2c Overuse of "this"', zone: 'title',
+    excerpt: title, detail: `Title uses "this" ${thisCount} times (curiosity-gap / overuse pattern).`,
+  });
+  // §3a Subjective descriptors
+  const found = SUBJECTIVE_DESCRIPTORS.filter(w => new RegExp(`\\b${w}\\b`, 'i').test(title));
+  if (found.length) out.push({
+    source: 'code', severity: 'review', rule: '§3a Subjective descriptor', zone: 'title',
+    excerpt: found.join(', '),
+    detail: `Title uses subjective/unverifiable descriptor(s): ${found.join(', ')}. Remove unless objectively justified (e.g. "Major" only if a top-5 subject).`,
+  });
+}
+
+// Parse the Claude audit node's === MODERATION FLAGS === block into ModerationFlag[].
+const FLAG_BLOCK_RE = /<<<FLAG>>>([\s\S]*?)<<<END>>>/gi;
+export function parseModerationFlags(text: string): ModerationFlag[] {
+  const flags: ModerationFlag[] = [];
+  if (!text) return flags;
+  // Prefer the delimited section; if the model dropped the END marker, fall back
+  // to scanning the whole text. FLAG blocks (<<<FLAG>>>) never collide with style
+  // PATCH blocks (<<<PATCH>>>), so the fallback is safe.
+  const section = text.match(/=== MODERATION FLAGS ===([\s\S]*?)=== END MODERATION FLAGS ===/i)?.[1]
+    ?? (text.includes('<<<FLAG>>>') ? text.split(/=== MODERATION FLAGS ===/i).pop() ?? text : '');
+  if (!section) return flags;
+  let m: RegExpExecArray | null;
+  FLAG_BLOCK_RE.lastIndex = 0;
+  while ((m = FLAG_BLOCK_RE.exec(section)) !== null) {
+    const block = m[1];
+    const sevRaw = (block.match(/SEVERITY:\s*([^\n]+)/i)?.[1] ?? 'review').trim().toLowerCase();
+    const severity: ModerationSeverity = sevRaw === 'absolute' ? 'absolute' : sevRaw === 'fail' ? 'fail' : 'review';
+    const rule = block.match(/RULE:\s*([^\n]+)/i)?.[1]?.trim() || 'Moderation';
+    const zone = block.match(/ZONE:\s*([^\n]+)/i)?.[1]?.trim() || 'body';
+    const excerpt = block.match(/EXCERPT:\s*([^\n]+)/i)?.[1]?.trim() || '';
+    const detail = block.match(/DETAIL:\s*([^\n]+)/i)?.[1]?.trim() || '';
+    if (!detail && !excerpt) continue;
+    flags.push({ source: 'claude', severity, rule, zone, excerpt: excerpt.slice(0, 300), detail: detail.slice(0, 600) });
+  }
+  return flags;
+}
+
+export function dedupeModerationFlags(flags: ModerationFlag[]): ModerationFlag[] {
+  const seen = new Set<string>();
+  const out: ModerationFlag[] = [];
+  for (const f of flags) {
+    const k = `${f.zone.toLowerCase()}|${f.excerpt.toLowerCase().slice(0, 80)}|${f.rule.toLowerCase()}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(f);
+  }
+  return out;
+}
+
+// Verdict: any absolute/fail flag → FAIL; only soft/review flags → REVIEW; clean → PASS.
+// Informational only — the workflow never blocks on this.
+export function computeModerationVerdict(flags: ModerationFlag[]): ModerationVerdict {
+  if (flags.some(f => f.severity === 'absolute' || f.severity === 'fail')) return 'FAIL';
+  if (flags.some(f => f.severity === 'review')) return 'REVIEW';
+  return 'PASS';
+}
+
+// ── moderationScan — deterministic code node ─────────────────────────────────
+// Runs on the FINAL article text (after fact corrections + style patches) so
+// flags reflect exactly what ships. Adds its code-sourced flags to whatever the
+// Claude audit node already produced, dedupes, and recomputes the verdict.
+export async function moderationScan(data: AuditedData): Promise<AuditedData> {
+  const codeFlags: ModerationFlag[] = [];
+  const title = (data.title ?? '').trim();
+  const articleText = data.articleText ?? '';
+
+  // 1. Banned words — title (absolute) + meta + each slide (fail)
+  scanBannedWords(title, 'title', 'absolute', codeFlags);
+  const metaText = articleText.match(/META:\s*([^\n]+)/i)?.[1]?.trim() ?? '';
+  scanBannedWords(metaText, 'meta', 'fail', codeFlags);
+  const slides = splitSlidesForScan(articleText);
+  for (const s of slides) {
+    scanBannedWords(`${s.title}\n${s.body}`, `slide ${s.num}`, 'fail', codeFlags);
+  }
+
+  // 2. Title-only deterministic checks (typography, clickbait patterns, descriptors)
+  scanTitleDeterministic(title, codeFlags);
+
+  // 3. §2d Article length (≥450 chars of body text)
+  const bodyChars = slides.reduce((n, s) => n + s.body.length, 0);
+  if (bodyChars > 0 && bodyChars < 450) {
+    codeFlags.push({
+      source: 'code', severity: 'fail', rule: '§2d Article length', zone: 'body',
+      excerpt: `${bodyChars} chars`, detail: 'Article body is under the 450-character MSN minimum.',
+    });
+  }
+
+  const merged = dedupeModerationFlags([...(data.moderationFlags ?? []), ...codeFlags]);
+  const verdict = computeModerationVerdict(merged);
+  console.log(`[moderationScan] code flags: ${codeFlags.length} · merged total: ${merged.length} · verdict: ${verdict}`);
+  return { ...data, moderationFlags: merged, moderationVerdict: verdict };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1107,10 +1352,13 @@ interface PerplexityRaw {
 }
 
 async function callPerplexity(model: string, systemContent: string, userContent: string, maxTokens = 4000, timeoutMs = 120_000): Promise<PerplexityRaw> {
+  // Route through the Vercel AI Gateway (OpenAI-format /v1/chat/completions) using
+  // the shared gateway key. Gateway requires the "perplexity/" model prefix.
+  const gatewayModel = model.startsWith('perplexity/') ? model : `perplexity/${model}`;
   const resp = await axios.post(
-    'https://api.perplexity.ai/chat/completions',
-    { model, messages: [{ role: 'system', content: systemContent }, { role: 'user', content: userContent }], max_tokens: maxTokens, return_citations: true, return_related_questions: false, temperature: 0.1 },
-    { headers: { Authorization: `Bearer ${PERPLEXITY_KEY}`, 'Content-Type': 'application/json' }, timeout: timeoutMs },
+    VERCEL_GATEWAY_CHAT_URL,
+    { model: gatewayModel, messages: [{ role: 'system', content: systemContent }, { role: 'user', content: userContent }], max_tokens: maxTokens, return_citations: true, return_related_questions: false, temperature: 0.1 },
+    { headers: { Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`, 'Content-Type': 'application/json' }, timeout: timeoutMs },
   );
   return resp.data;
 }
@@ -2260,7 +2508,7 @@ async function callClaudeStreaming(model: string, systemPrompt: string, userProm
   let resp;
   try {
     resp = await axios.post(
-      'https://api.anthropic.com/v1/messages',
+      VERCEL_GATEWAY_MESSAGES_URL,
       {
         model,
         max_tokens: 8192,                  // headroom so a 30+ slide article never hits the cap
@@ -2274,7 +2522,7 @@ async function callClaudeStreaming(model: string, systemPrompt: string, userProm
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
           'anthropic-beta': 'prompt-caching-2024-07-31',
-          'x-api-key': ANTHROPIC_KEY,
+          Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`,
         },
         timeout: 300_000,                  // 5 min — streaming keeps the socket alive
         responseType: 'stream',
@@ -2347,7 +2595,7 @@ export async function generateWithClaude(systemPrompt: string, userPrompt: strin
       return await callClaudeStreaming(model, systemPrompt, userPrompt);
     }
     const resp = await axios.post(
-      'https://api.anthropic.com/v1/messages',
+      VERCEL_GATEWAY_MESSAGES_URL,
       {
         model,
         max_tokens: 7500,
@@ -2360,7 +2608,7 @@ export async function generateWithClaude(systemPrompt: string, userPrompt: strin
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
           'anthropic-beta': 'prompt-caching-2024-07-31',
-          'x-api-key': ANTHROPIC_KEY,
+          Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`,
         },
         timeout: 160_000,                    // bumped from 120s; kept under the 180s activity timeout so the axios timeout wins the race and falls back gracefully
       },
@@ -2996,19 +3244,25 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
   };
 }
 
-// ── 17. grokAuditAndVerify (n8n: "Grok - Audit & Verify") ────────────────────
+// ── 17. claudeAuditAndModerate (Claude Haiku — audit + style patches + MSN moderation) ─
+// Replaces the former Grok audit node. Runs on Claude Haiku (no web search needed):
+// cheaper, faster, and the large static MSN ruleset is prompt-cached. The fact-check
+// step (stage 10) stays on Grok. Emits THREE blocks: audit report, style patches, and
+// the new MSN moderation flags (flag-only — never patched, never blocks the flow).
 
-export async function grokAuditAndVerify(data: VerifiedData): Promise<string> {
+export async function claudeAuditAndModerate(data: VerifiedData): Promise<string> {
   const tc = data.temporalContext;
   const ta = data.titleAnalysis;
-  const systemContent = `You are an MSN Slideshow compliance auditor AND surgical style editor.
+  const systemContent = `You are an MSN Slideshow compliance auditor, surgical style editor, AND content moderator.
 
-Your job has TWO parts in ONE pass — NO web search needed:
+Your job has THREE parts in ONE pass — NO web search needed:
 
   PART A — AUDIT REPORT: read the article and produce a structured compliance report.
   PART B — STYLE PATCHES: emit surgical patches for mechanical style violations
            (em-dashes, semicolons, ellipsis, banned phrases, banned content words,
            META length/CTAs). The pipeline applies these patches surgically.
+  PART C — MODERATION FLAGS: FLAG (do not fix) any MSN moderation violations that
+           need contextual/subjective judgment. These are surfaced to editors.
 
 You do NOT regenerate the article. You do NOT touch numeric facts (those were
 already corrected upstream by the fact-check step). Style patches must preserve
@@ -3088,6 +3342,54 @@ Patches must:
 - Never == FIND
 
 ═══════════════════════════════════════════════════════════════
+PART C — MSN MODERATION FLAGS (flag-only, NEVER patched)
+═══════════════════════════════════════════════════════════════
+
+Separately FLAG (do not fix, do not patch) any content that violates the MSN
+Content Moderator ruleset below. A deterministic scanner ALREADY flags literal
+banned words (slurs, explicit sexual terms, hard drugs, profanity) and literal
+clickbait title patterns — DO NOT re-flag those. Your job is the CONTEXTUAL and
+SUBJECTIVE judgment the scanner cannot make. Inspect the TITLE and every SLIDE.
+
+Core test for everything: would a 10-12 year old reading this be fine, and can
+every word in the title be objectively proven?
+
+A. PROHIBITED THEMES / NO-GO AREAS (severity: fail)
+   - Sexual or violent-crime content, even mild; drugs/gambling/tobacco; suicide.
+   - Hate or negative framing on race, ethnicity, gender, sexual orientation,
+     religion, disability; bullying, harassment, body-shaming.
+   - Election or political content; LGBTQ as a topic; general lifestyle coverage.
+   - Hoax / fake news / misinformation; rumors, speculation, unverified reports.
+   - Content that does not directly impact the team, player, or their career.
+   - Context-prone banned terms used in a genuinely unsafe sense (e.g. "shot"
+     meaning gunfire, "assault" as a crime, "drug" abuse, "kill" literally,
+     "trans", "scandal", "allegation", "fraud", "gambling"). If the term is normal
+     sports usage ("game-winning shot", "killed it in the fourth"), DO NOT flag it.
+
+B. CLICKBAIT / FRAMING (severity: review)
+   - Exaggerated language / hype that overstates the story.
+   - Promise of a revelation the article cannot deliver.
+   - Purposeful omission / curiosity gap — withholding who/what to bait clicks.
+   - Bait-and-switch: title implies controversy or drama, the body is neutral.
+   - Numbered listicle whose items lack real substance.
+   - Title that does not clearly state WHO | WHAT | OUTCOME.
+   - "Major" used when the subject is NOT genuinely top-5.
+
+C. RANKINGS & SOURCING (severity: review)
+   - A ranking or ordering with no stated methodology, criteria, or credible basis.
+
+D. FEED SWIMLANE (severity: review)
+   - Content that falls OUTSIDE every MSN feed swimlane. Valid swimlanes are
+     specific sports teams/leagues, named athletes, gaming/esports, movies & TV,
+     and motorsport/racing. Flag clearly off-topic content (politics, general
+     lifestyle, unrelated subjects).
+
+SEVERITY GUIDE for flags:
+  absolute = a hard prohibited theme that can never publish
+  fail     = a clear MSN guideline violation (editor MUST act before publishing)
+  review   = a subjective / framing / judgment call for an editor to review
+
+═══════════════════════════════════════════════════════════════
 OUTPUT FORMAT — EXACTLY THIS, IN THIS ORDER
 ═══════════════════════════════════════════════════════════════
 
@@ -3142,6 +3444,22 @@ REASON: em-dash
 
 === END STYLE PATCHES ===
 
+=== MODERATION FLAGS ===
+
+<<<FLAG>>>
+SEVERITY: review
+RULE: §4f Bait-and-switch
+ZONE: title
+EXCERPT: <short verbatim snippet of the offending text — ONE line>
+DETAIL: <one-line explanation of why it is flagged>
+<<<END>>>
+
+(emit one block per moderation issue; emit ZERO blocks if there is nothing to
+flag. Keep EXCERPT and DETAIL each to a SINGLE line. ZONE is one of: title, meta,
+or "slide N". SEVERITY is one of: absolute, fail, review.)
+
+=== END MODERATION FLAGS ===
+
 ═══════════════════════════════════════════════════════════════
 HARD RULES
 ═══════════════════════════════════════════════════════════════
@@ -3150,19 +3468,45 @@ HARD RULES
 - DO NOT emit any block that would replace whole slides or sections.
 - DO NOT touch numeric stats or years — facts were already corrected upstream.
 - FIND text in each PATCH must appear VERBATIM in the article.
-- If a category passes, write "PASS" with no extra text.`;
+- If a category passes, write "PASS" with no extra text.
+- MODERATION FLAGS are flag-only: never patch a moderation issue, only flag it.
+- DO NOT re-flag literal banned words or literal clickbait title patterns — the
+  deterministic scanner already handles those. Focus on contextual judgment.`;
 
-  const userContent = `Audit this MSN slideshow for compliance AND emit style patches for any mechanical violations.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nExpected content slides: ${data.slideCount}\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE\n\n${data.articleText}\n\nEmit the AUDIT REPORT, SUMMARY, and STYLE PATCHES blocks in that order. Do not regenerate the article.`;
+  const userContent = `Audit this MSN slideshow for compliance, emit style patches for mechanical violations, AND flag MSN moderation issues.\n\nTitle: "${data.title}"\nCategory / feed topic: ${data.category}\nExpected content slides: ${data.slideCount}\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE\n\n${data.articleText}\n\nEmit the AUDIT REPORT, SUMMARY, STYLE PATCHES, and MODERATION FLAGS blocks in that order. Do not regenerate the article.`;
 
-  const grokResp = await callGrokWithFallback({
-    systemContent,
-    userContent,
-    maxTokens: 3500,
-    temperature: 0.0,
-    timeout: 180_000,
-    label: 'grokAuditAndVerify',
-  });
-  return extractGrokResponseText(grokResp);
+  const model = 'claude-haiku-4-5-20251001';
+  try {
+    const resp = await axios.post(
+      VERCEL_GATEWAY_MESSAGES_URL,
+      {
+        model,
+        max_tokens: 4000,
+        temperature: 0,
+        system: [{ type: 'text', text: systemContent, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: userContent }],
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'prompt-caching-2024-07-31',
+          Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`,
+        },
+        timeout: 150_000,                  // kept under the 180s activity timeout
+      },
+    );
+    const text = (resp.data?.content as Array<{ type: string; text?: string }>)?.find(c => c.type === 'text')?.text ?? '';
+    console.log(`[claudeAuditAndModerate] ${text.length} chars (model: ${model})`);
+    return text;
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      console.error(`[claudeAuditAndModerate] HTTP ${err.response?.status}: ${JSON.stringify(err.response?.data ?? err.message)}`);
+    } else {
+      console.error('[claudeAuditAndModerate] Error:', err);
+    }
+    throw err; // workflow try/catch falls back to a skipped audit
+  }
 }
 
 // ── 18. extractAuditResults (n8n: "Extract Audit Results") ───────────────────
@@ -3176,6 +3520,9 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
       grokAudit: { status: 'FAILED', rawResponse: '', summary: 'Audit unavailable.', stats: { rulesPassed: 'N/A', violations: 0, corrections: 'None', flags: 'None' } },
       grokSources: [], combinedSourceList: [], combinedSourceListText: '',
       rewriteApplied: false,
+      // moderationScan still runs after this and adds the deterministic code flags.
+      moderationFlags: [],
+      moderationVerdict: 'PASS',
     };
   }
 
@@ -3216,7 +3563,12 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
   }));
   const combinedSourceListText = factCheckSources.map((s, i) => `${i + 1}. ${s.url}\n   Verified by: ${s.verifiedBy}\n   Facts: ${s.factsVerified}`).join('\n\n');
 
-  console.log(`[extractAuditResults] rules ${passCount}/${totalChecks || 8} passed · violations ${failCount + foundCount} · style patches applied=${patchApply.applied} skipped=${patchApply.skipped}`);
+  // ── Parse the MSN moderation flags block (Claude judgment layer) ──────────
+  // These are merged with the deterministic code-node flags later by moderationScan.
+  const claudeFlags = parseModerationFlags(grokText);
+  const provisionalVerdict = computeModerationVerdict(claudeFlags);
+
+  console.log(`[extractAuditResults] rules ${passCount}/${totalChecks || 8} passed · violations ${failCount + foundCount} · style patches applied=${patchApply.applied} skipped=${patchApply.skipped} · moderation flags (claude)=${claudeFlags.length}`);
 
   return {
     ...data,
@@ -3235,6 +3587,8 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
     },
     grokSources: [], combinedSourceList: factCheckSources, combinedSourceListText,
     rewriteApplied: patchApply.applied > 0,
+    moderationFlags: claudeFlags,
+    moderationVerdict: provisionalVerdict,
   };
 }
 
@@ -3247,12 +3601,25 @@ export async function finalAssembly(data: AuditedData): Promise<FinalOutput> {
   const plagiarismScore = data.plagiarismCheck?.status === 'LOW' ? 100 : data.plagiarismCheck?.status === 'MEDIUM' ? 70 : 40;
   const qualityScore = Math.round((researchScore * 0.15) + (factCheckScore * 0.40) + (structuralScore * 0.20) + (plagiarismScore * 0.25));
 
+  const moderationFlags = data.moderationFlags ?? [];
+  const moderationVerdict = data.moderationVerdict ?? 'PASS';
+  const modCounts = {
+    absolute: moderationFlags.filter(f => f.severity === 'absolute').length,
+    fail: moderationFlags.filter(f => f.severity === 'fail').length,
+    review: moderationFlags.filter(f => f.severity === 'review').length,
+  };
+
   const summaryParts: string[] = [];
   if (data.structuralValidation?.errors?.length) summaryParts.push(`Errors: ${data.structuralValidation.errors.join('; ')}`);
   if (data.structuralValidation?.warnings?.length) summaryParts.push(`Warnings: ${data.structuralValidation.warnings.length}`);
   if (data.rewriteApplied) summaryParts.push('Grok corrections applied');
   if (data.grokAudit?.stats?.flags && data.grokAudit.stats.flags !== 'None') summaryParts.push(`Flags: ${data.grokAudit.stats.flags}`);
+  if (moderationVerdict !== 'PASS') summaryParts.push(`Moderation: ${moderationVerdict} (${moderationFlags.length} flag${moderationFlags.length === 1 ? '' : 's'})`);
   if (data.generatedBy) summaryParts.push(`Generated by: ${data.generatedBy}`);
+
+  const moderationReport = moderationFlags.length > 0
+    ? moderationFlags.map((f, i) => `${i + 1}. [${f.severity.toUpperCase()}] (${f.source}) ${f.rule} · ${f.zone}\n   ${f.detail}${f.excerpt ? `\n   Excerpt: "${f.excerpt}"` : ''}${f.suggestion ? `\n   Suggested censor: ${f.suggestion}` : ''}`).join('\n')
+    : 'No moderation issues flagged.';
 
   const auditReport = `
 QUALITY AUDIT REPORT
@@ -3280,6 +3647,11 @@ STRUCTURAL VALIDATION
 Status: ${data.structuralValidation?.status ?? 'N/A'}
 Errors: ${data.structuralValidation?.errors?.join(', ') || 'None'}
 Warnings: ${data.structuralValidation?.warnings?.join(', ') || 'None'}
+
+MSN MODERATION
+Verdict: ${moderationVerdict}
+Flags: ${moderationFlags.length} (absolute ${modCounts.absolute} · fail ${modCounts.fail} · review ${modCounts.review})
+${moderationReport}
 `;
 
   return {
@@ -3297,6 +3669,8 @@ Warnings: ${data.structuralValidation?.warnings?.join(', ') || 'None'}
     flagsForReview: data.grokAudit?.stats?.flags ?? 'None',
     generatedBy: data.generatedBy ?? 'Unknown',
     generatedAt: new Date().toISOString(),
+    moderationFlags,
+    moderationVerdict,
   };
 }
 
@@ -3966,7 +4340,7 @@ export async function generateSubjectiveWithClaude(systemPrompt: string, userPro
   console.log(`[generateSubjectiveWithClaude] Calling model: ${model}`);
   try {
     const resp = await axios.post(
-      'https://api.anthropic.com/v1/messages',
+      VERCEL_GATEWAY_MESSAGES_URL,
       {
         model,
         max_tokens: 5000,
@@ -3979,7 +4353,7 @@ export async function generateSubjectiveWithClaude(systemPrompt: string, userPro
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
           'anthropic-beta': 'prompt-caching-2024-07-31',
-          'x-api-key': ANTHROPIC_KEY,
+          Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`,
         },
         timeout: 120_000,
       },
@@ -4406,6 +4780,10 @@ ${data.auditReport}
     flagsForReview: data.errors.length > 0 ? data.errors.join('; ') : 'None',
     generatedBy: data.generatedBy || 'Unknown',
     generatedAt: new Date().toISOString(),
+    // MSN moderation flagging is wired into the objective pipeline; subjective
+    // keeps its own style audit and reports an empty/PASS moderation result for now.
+    moderationFlags: [],
+    moderationVerdict: 'PASS',
   };
 }
 
@@ -4477,8 +4855,8 @@ export async function enrichSlides(
   slideshowCategory: string,
 ): Promise<{ slides: EnrichedSlideFields[]; status: string }> {
   if (!slides.length) return { slides: [], status: 'no-slides' };
-  if (!ANTHROPIC_KEY) {
-    console.warn('[enrichSlides] No ANTHROPIC_API_KEY — returning empty fields');
+  if (!VERCEL_GATEWAY_KEY) {
+    console.warn('[enrichSlides] No VERCEL_AI_GATEWAY_KEY — returning empty fields');
     return { slides: slides.map(() => emptyEnrichmentFields()), status: 'no-api-key' };
   }
 
@@ -4490,7 +4868,7 @@ export async function enrichSlides(
 
   try {
     const resp = await axios.post(
-      'https://api.anthropic.com/v1/messages',
+      VERCEL_GATEWAY_MESSAGES_URL,
       {
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 3500,
@@ -4502,7 +4880,7 @@ export async function enrichSlides(
         headers: {
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
-          'x-api-key': ANTHROPIC_KEY,
+          Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`,
         },
         timeout: 60_000,
       },

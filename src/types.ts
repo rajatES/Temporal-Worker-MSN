@@ -253,7 +253,34 @@ export interface SourceEntry {
   verifiedBy: string;
 }
 
+// ── MSN moderation flagging ───────────────────────────────────────────────────
+// A robust, NON-BLOCKING flagging layer that audits the generated article (title
+// + meta + every slide) against the MSN Content Moderator ruleset. Issues are
+// surfaced at the end of generation — nothing is auto-censored or aborted.
+//
+// Two producers:
+//   - 'code'   → deterministic moderationScan activity (absolute banned words,
+//                excitable typography, literal banned title patterns, ≥450 chars)
+//   - 'claude' → the Haiku audit/moderation node (context/subjective rules the
+//                code node can't catch: clickbait framing, swimlane, "Major"
+//                justification, sensationalism, etc.)
+export type ModerationSeverity = 'absolute' | 'fail' | 'review';
+export type ModerationVerdict = 'PASS' | 'REVIEW' | 'FAIL';
+
+export interface ModerationFlag {
+  source: 'code' | 'claude';
+  severity: ModerationSeverity;   // absolute = would-block (e.g. banned word in title), fail = guideline breach, review = soft/contextual
+  rule: string;                   // which rule fired, e.g. "§5a Absolute Ban" / "§4f Bait-and-switch"
+  zone: string;                   // 'title' | 'meta' | 'slide 5' | 'body'
+  excerpt: string;                // the offending text
+  detail: string;                 // human-readable explanation
+  suggestion?: string;            // optional, informational only (e.g. censored form "S***") — NEVER auto-applied
+}
+
 export interface AuditedData extends VerifiedData {
+  // NOTE: `grokAudit` is a legacy field name — this audit is now produced by the
+  // Claude (Haiku) moderation node, not Grok. Kept for back-compat with
+  // finalAssembly / downstream readers.
   grokAudit: {
     status: string;
     rawResponse: string;
@@ -269,6 +296,10 @@ export interface AuditedData extends VerifiedData {
   combinedSourceList: SourceEntry[];
   combinedSourceListText: string;
   rewriteApplied: boolean;
+  /** All moderation issues from both the code node and the Claude audit node. */
+  moderationFlags: ModerationFlag[];
+  /** Overall verdict derived from the highest-severity flag. Informational — never blocks. */
+  moderationVerdict: ModerationVerdict;
 }
 
 // ── Subjective pipeline data types ────────────────────────────────────────────
@@ -379,6 +410,10 @@ export interface FinalOutput {
   flagsForReview: string;
   generatedBy: string;
   generatedAt: string;
+  /** Structured MSN moderation flags (code node + Claude audit), merged + deduped. */
+  moderationFlags: ModerationFlag[];
+  /** Overall moderation verdict (PASS/REVIEW/FAIL) — informational, never blocks. */
+  moderationVerdict: ModerationVerdict;
 }
 
 export interface SlideshowSlide {
@@ -409,6 +444,9 @@ export interface WorkflowResult {
   flagsForReview: string;
   generatedBy: string;
   enrichmentStatus?: string;
+  // MSN moderation flagging (non-blocking) — surfaced in the generator UI.
+  moderationFlags?: ModerationFlag[];
+  moderationVerdict?: ModerationVerdict;
 }
 
 // ── Progress tracking ─────────────────────────────────────────────────────────

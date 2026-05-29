@@ -38,7 +38,8 @@ const {
   validateStructure,
   extractClaims,
   processVerification,
-  grokAuditAndVerify,
+  claudeAuditAndModerate,
+  moderationScan,
   extractAuditResults,
   finalAssembly,
   enrichSlides,
@@ -63,7 +64,6 @@ const {
 });
 
 const {
-  grokAuditAndVerify: grokAuditLong,
   generateWithGrok: grokLong,
   generateWithClaude: generateWithClaudeLong,
   grokFactCheck: grokFactCheckLong,
@@ -326,7 +326,11 @@ interface EnrichmentResult {
 
 function buildWorkflowResult(
   articleText: string,
-  final: { title: string; category: string; writerName: string; qualityScore: number; summaryComment: string; flagsForReview: string; generatedBy: string },
+  final: {
+    title: string; category: string; writerName: string; qualityScore: number;
+    summaryComment: string; flagsForReview: string; generatedBy: string;
+    moderationFlags?: WorkflowResult['moderationFlags']; moderationVerdict?: WorkflowResult['moderationVerdict'];
+  },
   enrichment?: EnrichmentResult | null,
 ): WorkflowResult {
   const parsedSlides = parseSlides(articleText);
@@ -360,6 +364,8 @@ function buildWorkflowResult(
     flagsForReview: final.flagsForReview,
     generatedBy: final.generatedBy,
     enrichmentStatus: enrichment?.status ?? 'skipped',
+    moderationFlags: final.moderationFlags ?? [],
+    moderationVerdict: final.moderationVerdict ?? 'PASS',
   };
 }
 
@@ -1082,29 +1088,43 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     }
   }
 
-  // ── Stage 11: Grok audit ──────────────────────────────────────────────────────
-  activate('auditing', 'Running Grok rules audit…');
+  // ── Stage 11: Claude audit + MSN moderation ────────────────────────────────────
+  // Audit/style/moderation now run on Claude Haiku (cheaper, faster, cacheable
+  // ruleset). The fact-check above stays on Grok. A deterministic code node
+  // (moderationScan) then adds the literal banned-word / typography flags.
+  activate('auditing', 'Running Claude audit + moderation…');
   let auditedData;
   try {
-    const grokAuditText = await grokAuditLong(verifiedData);
-    auditedData = await extractAuditResults(verifiedData, grokAuditText);
+    const auditText = await claudeAuditAndModerate(verifiedData);
+    auditedData = await extractAuditResults(verifiedData, auditText);
   } catch {
-    warn('auditing', 'Grok audit failed — skipping rules audit');
+    warn('auditing', 'Claude audit failed — skipping rules audit');
     auditedData = {
       ...verifiedData,
       grokAudit: {
         status: 'skipped',
         rawResponse: '',
-        summary: 'Grok audit skipped due to API failure',
+        summary: 'Audit skipped due to API failure',
         stats: { rulesPassed: 'N/A', violations: 0, corrections: '0', flags: 'Audit skipped' },
       },
       grokSources: [],
       combinedSourceList: [],
       combinedSourceListText: '',
       rewriteApplied: false,
+      moderationFlags: [],
+      moderationVerdict: 'PASS' as const,
     };
   }
-  complete('auditing', `Rules: ${auditedData.grokAudit.stats.rulesPassed} · Violations: ${auditedData.grokAudit.stats.violations} · Rewrite: ${auditedData.rewriteApplied}`);
+
+  // Deterministic moderation scan (banned words, typography, title patterns, length).
+  // Runs on the post-audit article so flags reflect what ships; merges with the
+  // Claude moderation flags and recomputes the verdict. Never blocks the flow.
+  try {
+    auditedData = await moderationScan(auditedData);
+  } catch {
+    warn('auditing', 'Moderation scan failed — keeping Claude flags only');
+  }
+  complete('auditing', `Rules: ${auditedData.grokAudit.stats.rulesPassed} · Moderation: ${auditedData.moderationVerdict} (${auditedData.moderationFlags.length} flags)`);
 
   // ── Stage 12: Final assembly ──────────────────────────────────────────────────
   activate('creating_docs', 'Assembling output…');
