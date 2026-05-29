@@ -3,7 +3,7 @@ import * as dotenv from 'dotenv';
 import {
   FormInput, PreparedData, SourcedData, AtomizedData, ResearchedData,
   MergedData, PromptData, GeneratedData, ValidatedData, ClaimedData,
-  VerifiedData, AuditedData, FinalOutput, TemporalCtx,
+  VerifiedData, AuditedData, FinalOutput, TemporalCtx, BatchSpec,
   FormatConfig, TitleAnalysis, AtomizedFact, SourceEntry, FactProvenance,
   SubjectivePreparedData, SubjectiveSourcedData, SubjectiveAtomizedData,
   SubjectiveResearchedData, SubjectiveMergedData,
@@ -2063,13 +2063,15 @@ SOURCES:
       ? '\nSOURCE QUALITY: PARTIAL — Your scraped source covers some items.\nFor items IN TIER 1A: use TIER 1A facts, enrich with TIER 1B data, follow TIER 1B instructions. For items NOT IN TIER 1A: use TIER 1B first, then TIER 2 marked with [P].\n'
       : '\nSOURCE QUALITY: MINIMAL — Use TIER 1B (user context) as your primary fact source if available. Follow any TIER 1B instructions. Use Perplexity research as secondary.\n';
 
-  const claudeUserPrompt = `═══════════════════════════════════════════════════════════════
+  const factContextBlock = `═══════════════════════════════════════════════════════════════
 TIER 1A + 1B FACT DATABASE — YOUR ONLY FACT SOURCES
 ═══════════════════════════════════════════════════════════════
 
 ${data.combinedFactRepresentation}
 
-${citationContext}
+${citationContext}`;
+
+  const claudeUserPrompt = `${factContextBlock}
 
 ═══════════════════════════════════════════════════════════════
 ASSIGNMENT
@@ -2108,7 +2110,141 @@ ${wordCountOverrideBlock}
 
 Write the complete slideshow now.`;
 
-  return { ...data, claudeSystemPrompt, claudeUserPrompt };
+  return { ...data, claudeSystemPrompt, claudeUserPrompt, factContextBlock };
+}
+
+// ── Batched generation for large articles (>25 slides) ───────────────────────
+// Single-shot generation of 26+ slides degrades in the back half (thinner
+// slides, repeated openings). We instead generate the article in chunks of
+// ≤16 content slides, each call getting full model attention. The system prompt
+// (cached) is identical across batches; the full fact database is re-sent in
+// every batch's user prompt (acceptable cost, preserves global ranking context).
+// Batch 1 emits TITLE + META + intro + its content slides; later batches emit
+// content slides only and receive the prior batch's titles/openings so they
+// continue the exact order, never repeat an item, and vary their openings.
+
+/** Pull already-written slide titles + body opening-words out of a prior batch's
+ *  raw output, so the next batch can continue without repetition. */
+function extractBatchContinuity(text: string): { titles: string[]; openings: string[] } {
+  const titles: string[] = [];
+  const openings: string[] = [];
+  let state: 'seek' | 'title' | 'body' = 'seek';
+  let curTitle = '';
+  let curOpening = '';
+  const flush = () => {
+    if (curTitle) {
+      titles.push(curTitle);
+      if (curOpening) openings.push(curOpening.toLowerCase());
+    }
+    curTitle = '';
+    curOpening = '';
+  };
+  for (const raw of text.split('\n')) {
+    const t = raw.trim().replace(/\*\*/g, '').trim();
+    if (/^SLIDE\s*\d+/i.test(t)) { flush(); state = 'title'; continue; }
+    if (state === 'seek') continue;
+    if (/^SOURCES/i.test(t)) break;
+    if (!t || t.startsWith('META:')) continue;
+    if (state === 'title') { curTitle = t; state = 'body'; }
+    else if (state === 'body' && !curOpening) { curOpening = t.split(/\s+/)[0] ?? ''; }
+  }
+  flush();
+  return { titles, openings };
+}
+
+export async function buildBatchUserPrompt(data: PromptData, spec: BatchSpec, priorBatchText = ''): Promise<string> {
+  const ta = data.titleAnalysis;
+  const rangeEnd = spec.contentStart + spec.contentCount - 1;
+  const wcRange = data.userWordCountOverride
+    ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}`
+    : '35-50';
+
+  const mustBlock = data.hasMustInclude
+    ? `\nMANDATORY ITEMS (full list, for reference — cover the ones that fall in THIS batch's range, in order):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nAny tier headers or section labels here are organizational, NOT items — never give them a slide.\n`
+    : '';
+
+  let assignment: string;
+  if (spec.isFirst) {
+    assignment = `This is BATCH ${spec.batchIndex + 1} of ${spec.totalBatches}.
+Produce, in this exact order and nothing else:
+1. The article TITLE line
+2. META: [max 120 characters]
+3. SLIDE 1 — the intro (max 60 words)
+4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
+STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
+  } else {
+    const { titles, openings } = extractBatchContinuity(priorBatchText);
+    assignment = `This is BATCH ${spec.batchIndex + 1} of ${spec.totalBatches} — a CONTINUATION of an in-progress slideshow.
+Do NOT write a TITLE, META, intro, or SOURCES. Output ONLY SLIDE blocks.
+Produce the NEXT ${spec.contentCount} content slides — presentation positions ${spec.contentStart} to ${rangeEnd} of ${spec.totalContent} — continuing the EXACT ranking/presentation order from where the previous batch stopped.
+
+ALREADY WRITTEN — do NOT repeat any of these items:
+${titles.map((t, i) => `${i + 1}. ${t}`).join('\n') || '(none)'}
+
+OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
+${[...new Set(openings)].join(', ') || '(none)'}`;
+  }
+
+  return `${data.factContextBlock}
+
+═══════════════════════════════════════════════════════════════
+BATCH ASSIGNMENT
+═══════════════════════════════════════════════════════════════
+
+Title: "${data.title}"
+Category: ${data.category}
+${mustBlock}
+${assignment}
+
+CRITICAL REMINDERS:
+- Every specific claim must trace to TIER 1A or TIER 1B.
+- Content slides must be ${wcRange} words. Count silently — never print the count.
+- ${ta.isRanking ? 'Follow Tier 1A ranking order exactly. Each content slide title starts with its rank number.' : 'Keep slide order consistent with the source.'}
+- No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
+
+Write this batch now.`;
+}
+
+/** Merge the raw outputs of all batches into one article in the standard format.
+ *  Takes the header (TITLE + META) from batch 0, concatenates every SLIDE block
+ *  across all batches in order, and renumbers them sequentially. Downstream
+ *  validation re-parses this exactly like a single-shot article. */
+export async function stitchBatchedArticle(batchTexts: string[]): Promise<{ articleText: string }> {
+  const splitBlocks = (text: string): { header: string; blocks: string[] } => {
+    const headerLines: string[] = [];
+    const blocks: string[] = [];
+    let cur: string[] | null = null;
+    for (const line of text.split('\n')) {
+      const t = line.trim().replace(/\*\*/g, '').trim();
+      if (/^SLIDE\s*\d+/i.test(t)) {
+        if (cur) blocks.push(cur.join('\n'));
+        cur = [line];
+      } else if (/^SOURCES/i.test(t)) {
+        if (cur) { blocks.push(cur.join('\n')); cur = null; }
+        break;
+      } else if (cur === null) {
+        headerLines.push(line);
+      } else {
+        cur.push(line);
+      }
+    }
+    if (cur) blocks.push(cur.join('\n'));
+    return { header: headerLines.join('\n').trim(), blocks };
+  };
+
+  const first = splitBlocks(batchTexts[0] ?? '');
+  const allBlocks = [...first.blocks];
+  for (let i = 1; i < batchTexts.length; i++) {
+    allBlocks.push(...splitBlocks(batchTexts[i] ?? '').blocks);
+  }
+
+  // Renumber every SLIDE marker sequentially (1 = intro, 2..N = content).
+  const renumbered = allBlocks.map((b, idx) =>
+    b.replace(/^(\s*(?:\*\*)?\s*)SLIDE\s*\d+/i, `$1SLIDE ${idx + 1}`),
+  );
+
+  const articleText = `${first.header}\n\n${renumbered.join('\n\n')}`;
+  return { articleText };
 }
 
 // ── 10. generateWithClaude (n8n: "Claude - Generate Article") ─────────────────
@@ -3757,9 +3893,70 @@ Count every word silently before outputting each slide (the count must NEVER app
     ? `\n\nMANDATORY ITEMS — these override the scraped source's item list (non-negotiable):\n${data.mustIncludeItems.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nEvery mandatory item MUST get its own slide, even if it does not appear in TIER 1A. Do NOT substitute any with a different item from the source. Fill remaining slots (up to ${data.slideCount} total) with the best-fit entries.`
     : '';
 
-  const claudeUserPrompt = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${data.combinedFactRepresentation}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
+  const factContextBlock = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${data.combinedFactRepresentation}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}`;
 
-  return { ...data, claudeSystemPrompt, claudeUserPrompt };
+  const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
+
+  return { ...data, claudeSystemPrompt, claudeUserPrompt, factContextBlock };
+}
+
+// ── Batched generation for large SUBJECTIVE articles (>25 slides) ─────────────
+// Mirrors the objective batch builder, with subjective voice/tone framing.
+// Reuses the shared extractBatchContinuity + stitchBatchedArticle helpers.
+export async function buildSubjectiveBatchUserPrompt(data: SubjectivePromptData, spec: BatchSpec, priorBatchText = ''): Promise<string> {
+  const ta = data.titleAnalysis;
+  const rangeEnd = spec.contentStart + spec.contentCount - 1;
+  const wcRange = data.userWordCountOverride
+    ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}`
+    : '35-50';
+
+  const mustBlock = data.hasMustInclude
+    ? `\nMANDATORY ITEMS (full list, for reference — cover the ones that fall in THIS batch's range, in order):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nAny tier headers or section labels here are organizational, NOT items — never give them a slide.\n`
+    : '';
+
+  let assignment: string;
+  if (spec.isFirst) {
+    assignment = `This is BATCH ${spec.batchIndex + 1} of ${spec.totalBatches}.
+Produce, in this exact order and nothing else:
+1. The article TITLE line
+2. META: [max 120 characters — intriguing hook, not a CTA, not a title paraphrase]
+3. SLIDE 1 — the intro (max 60 words)
+4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
+STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
+  } else {
+    const { titles, openings } = extractBatchContinuity(priorBatchText);
+    assignment = `This is BATCH ${spec.batchIndex + 1} of ${spec.totalBatches} — a CONTINUATION of an in-progress slideshow.
+Do NOT write a TITLE, META, intro, or SOURCES. Output ONLY SLIDE blocks.
+Produce the NEXT ${spec.contentCount} content slides — presentation positions ${spec.contentStart} to ${rangeEnd} of ${spec.totalContent} — continuing the EXACT order from where the previous batch stopped.
+
+ALREADY WRITTEN — do NOT repeat any of these items:
+${titles.map((t, i) => `${i + 1}. ${t}`).join('\n') || '(none)'}
+
+OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
+${[...new Set(openings)].join(', ') || '(none)'}`;
+  }
+
+  return `${data.factContextBlock}
+
+═══════════════════════════════════════════════════════════════
+BATCH ASSIGNMENT
+═══════════════════════════════════════════════════════════════
+
+Title: "${data.title}"
+Category: ${data.category}
+Article Type: ${data.articleType}
+Tone Dial: ${data.toneDial}${data.writingStyle ? `\nStyle Influence: ${data.writingStyle}` : ''}
+${mustBlock}
+${assignment}
+
+CRITICAL REMINDERS:
+- Every specific claim must trace to TIER 1A/1B or be something you are genuinely certain of.
+- Content slides must be ${wcRange} words. Count silently — never print the count.
+- ${ta.isRanking ? 'List in REVERSE ranking order. Each content slide title starts with its rank number.' : 'Keep slide order consistent with the source.'}
+- Keep the ${data.toneDial} tone and the subjective voice throughout.
+- No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
+
+Write this batch now.`;
 }
 
 // ── S5. generateSubjectiveWithClaude (n8n: "Claude - Subjective Writer") ──────

@@ -159,6 +159,19 @@ export interface MergedData extends ResearchedData {
 export interface PromptData extends MergedData {
   claudeSystemPrompt: string;
   claudeUserPrompt: string;
+  /** The TIER 1A+1B fact-database section of the user prompt (facts + citation
+   *  context), reused verbatim by every batch in batched generation. */
+  factContextBlock: string;
+}
+
+/** One unit of work in batched generation of large articles (>25 slides). */
+export interface BatchSpec {
+  batchIndex: number;     // 0-based
+  totalBatches: number;
+  contentStart: number;   // 1-based presentation position of this batch's first content slide
+  contentCount: number;   // number of content slides to produce in this batch
+  totalContent: number;   // total content slides across the whole article
+  isFirst: boolean;       // first batch also emits TITLE + META + intro
 }
 
 export interface GeneratedData extends PromptData {
@@ -317,6 +330,9 @@ export interface SubjectiveMergedData extends SubjectiveResearchedData {
 export interface SubjectivePromptData extends SubjectiveMergedData {
   claudeSystemPrompt: string;
   claudeUserPrompt: string;
+  /** Fact-database + raw-source section of the user prompt, reused verbatim by
+   *  every batch in batched generation of large subjective articles. */
+  factContextBlock: string;
 }
 
 export interface SubjectiveGeneratedData extends SubjectivePromptData {
