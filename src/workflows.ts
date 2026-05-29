@@ -62,6 +62,7 @@ const {
 const {
   grokAuditAndVerify: grokAuditLong,
   generateWithGrok: grokLong,
+  generateWithClaude: generateWithClaudeLong,
   grokFactCheck: grokFactCheckLong,
   grokSubjectiveStyleAudit: grokSubjectiveStyleAuditLong,
 } = proxyActivities<typeof activities>({
@@ -809,10 +810,16 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   while (generationAttempt < MAX_GENERATION_ATTEMPTS) {
     generationAttempt++;
 
-    activate('generating', generationAttempt > 1 ? 'Regenerating article…' : 'Calling Claude…');
+    // Stream large articles (>30 slides) via the long-timeout proxy so a slow
+    // generation can't trip the socket timeout and get cut off; smaller articles
+    // use the fast default-proxy non-streaming path.
+    const useClaudeStreaming = promptData.slideCount > 30;
+    const claudeGen = useClaudeStreaming ? generateWithClaudeLong : generateWithClaude;
+
+    activate('generating', generationAttempt > 1 ? 'Regenerating article…' : (useClaudeStreaming ? 'Calling Claude (streaming)…' : 'Calling Claude…'));
     let generatedData;
     try {
-      const claudeRaw = await generateWithClaude(promptData.claudeSystemPrompt, promptData.claudeUserPrompt);
+      const claudeRaw = await claudeGen(promptData.claudeSystemPrompt, promptData.claudeUserPrompt, promptData.slideCount);
       const claudeChecked = await checkClaudeResponse(claudeRaw, promptData);
 
       if (claudeChecked.claudeFailed) {

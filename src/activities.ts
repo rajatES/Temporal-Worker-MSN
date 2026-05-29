@@ -1654,7 +1654,7 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
 
 The writer EXPLICITLY requested ${data.userWordCountOverride.min}-${data.userWordCountOverride.max} words per content slide.
 This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
-Count every word before outputting each slide. Rewrite if out of range.`
+Count every word silently before outputting each slide (the count must NEVER appear in the output). Rewrite if out of range.`
     : '';
 
   const claudeSystemPrompt = `You are an expert MSN Slideshow writer for American audiences covering ${data.category}.
@@ -1836,6 +1836,9 @@ WORD COUNTS (STRICT - Count every word)
 - Content slides: 35-50 words (aim for 40-45)
 - If over or under, rewrite until it fits. Do not approximate.
 - NEVER pad word count with invented facts. Use stronger writing instead.
+- Count every word and character SILENTLY. The counts must NEVER appear in the output (no "(48 words)", no "(98 characters)").
+- Produce EXACTLY ${data.slideCount} content slides (plus the 1 intro). No more, no fewer.
+- Tier headers, section dividers, and category labels (e.g. "Tier 2 - Strong Contenders") are organizational only. NEVER output them as a slide.
 
 ═══════════════════════════════════════════════════════════════
 META DESCRIPTION
@@ -1864,6 +1867,7 @@ Your intro must NOT:
 - Name any items from the list
 - Reveal the #1 pick or any rankings
 - Use "let's dive in" / "here are" / "we'll explore"
+- Use a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
 - Use generic openers ("Since the dawn of...", "In today's world...")
 - Paraphrase the title anywhere
 - Have generic background that assumes reader ignorance
@@ -2024,6 +2028,15 @@ Avoid: sexual content, graphic violence, drugs, gambling, political content, sen
 No profanity in titles or meta descriptions ever.
 
 ═══════════════════════════════════════════════════════════════
+OUTPUT HYGIENE (CRITICAL)
+═══════════════════════════════════════════════════════════════
+
+- Output ONLY the article in the format below — nothing before it, nothing after it.
+- NEVER write word counts, character counts, or parenthetical annotations like "(48 words)" or "(98 characters)" anywhere in the output.
+- NEVER include meta-commentary, planning notes, or explanations of your process.
+- Output exactly 1 intro slide + ${data.slideCount} content slides. Do NOT add tier/section label lines as slides.
+
+═══════════════════════════════════════════════════════════════
 FORMAT (Plain text only, no markdown)
 ═══════════════════════════════════════════════════════════════
 
@@ -2066,7 +2079,7 @@ Title: "${data.title}"
 Category: ${data.category}
 Slides: 1 intro + ${data.slideCount} content slides
 ${fc.isMultiSlideFormat ? `Format: ${fc.slidesPerEntity} slides per entity (${fc.entityCount} entities total)` : ''}
-${data.hasMustInclude ? `\nMANDATORY ITEMS — these override Tier 1A item selection (every one MUST get its own slide, even if not in Tier 1A):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nDo NOT substitute any mandatory item with a different item from the source. If a mandatory item lacks Tier 1A data, use Tier 1B/2/3 instead.` : ''}
+${data.hasMustInclude ? `\nMANDATORY ITEMS — these override Tier 1A item selection (every one MUST get its own slide, even if not in Tier 1A):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nDo NOT substitute any mandatory item with a different item from the source. If a mandatory item lacks Tier 1A data, use Tier 1B/2/3 instead. Any tier headers or section labels in this list (e.g. "Tier 2 - Strong Contenders") are organizational groupings, NOT items — never give them their own slide.` : ''}
 
 Primary Source: ${data.primarySourceUrl || 'See Tier 1A above'}
 
@@ -2100,10 +2113,103 @@ Write the complete slideshow now.`;
 
 // ── 10. generateWithClaude (n8n: "Claude - Generate Article") ─────────────────
 
-export async function generateWithClaude(systemPrompt: string, userPrompt: string): Promise<unknown> {
-  const model = 'claude-sonnet-4-5-20250929';
-  console.log(`[generateWithClaude] Calling model: ${model}`);
+// ── Claude streaming (large articles only) ───────────────────────────────────
+// For big slideshows (>30 slides) the full non-streaming response can outlast the
+// socket timeout while the model is still generating, producing a false timeout.
+// Streaming keeps the connection alive and lets us accumulate the COMPLETE
+// article token-by-token, so the output is never cut off by a buffering timeout.
+// We reshape the streamed deltas into the same { content: [{ text }], stop_reason }
+// object the non-streaming path returns, so checkClaudeResponse works unchanged.
+async function callClaudeStreaming(model: string, systemPrompt: string, userPrompt: string): Promise<unknown> {
+  let resp;
   try {
+    resp = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model,
+        max_tokens: 8192,                  // headroom so a 30+ slide article never hits the cap
+        temperature: 0.3,
+        stream: true,
+        system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: userPrompt }],
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'prompt-caching-2024-07-31',
+          'x-api-key': ANTHROPIC_KEY,
+        },
+        timeout: 300_000,                  // 5 min — streaming keeps the socket alive
+        responseType: 'stream',
+      },
+    );
+  } catch (err: unknown) {
+    const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+    const msg = axios.isAxiosError(err) ? err.message : String(err);
+    console.error(`[generateWithClaude] Streaming request failed (HTTP ${status ?? '?'}): ${msg}`);
+    return { type: 'error', error: { message: `Streaming request failed: ${msg}` } };
+  }
+
+  return await new Promise((resolve) => {
+    const stream = resp!.data as NodeJS.ReadableStream;
+    let buffer = '';
+    let text = '';
+    let stopReason: string | null = null;
+    let streamError: unknown = null;
+
+    const handleLine = (line: string) => {
+      const t = line.trim();
+      if (!t.startsWith('data:')) return;
+      const payload = t.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+      try {
+        const evt = JSON.parse(payload) as Record<string, any>;
+        if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
+          text += evt.delta.text ?? '';
+        } else if (evt.type === 'message_delta' && evt.delta?.stop_reason) {
+          stopReason = evt.delta.stop_reason;
+        } else if (evt.type === 'error') {
+          streamError = evt.error ?? { message: 'stream error' };
+        }
+      } catch { /* ignore keep-alive pings / non-JSON lines */ }
+    };
+
+    stream.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';          // retain trailing partial line for next chunk
+      for (const line of lines) handleLine(line);
+    });
+
+    stream.on('end', () => {
+      if (buffer) handleLine(buffer);       // flush any final partial line
+      if (streamError) {
+        resolve({ type: 'error', error: streamError });
+        return;
+      }
+      console.log(`[generateWithClaude] Streaming complete — ${text.length} chars, stop_reason: ${stopReason}`);
+      if (stopReason === 'max_tokens') {
+        console.warn('[generateWithClaude] Streaming hit max_tokens — output may be truncated.');
+      }
+      resolve({ type: 'message', content: [{ type: 'text', text }], stop_reason: stopReason });
+    });
+
+    stream.on('error', (err: Error) => {
+      console.error(`[generateWithClaude] Stream error: ${err.message}`);
+      resolve({ type: 'error', error: { message: String(err.message) } });
+    });
+  });
+}
+
+export async function generateWithClaude(systemPrompt: string, userPrompt: string, slideCount = 0): Promise<unknown> {
+  const model = 'claude-sonnet-4-5-20250929';
+  const useStreaming = slideCount > 30;
+  console.log(`[generateWithClaude] Calling model: ${model} (slideCount=${slideCount}, streaming=${useStreaming})`);
+  try {
+    if (useStreaming) {
+      return await callClaudeStreaming(model, systemPrompt, userPrompt);
+    }
     const resp = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
@@ -2120,7 +2226,7 @@ export async function generateWithClaude(systemPrompt: string, userPrompt: strin
           'anthropic-beta': 'prompt-caching-2024-07-31',
           'x-api-key': ANTHROPIC_KEY,
         },
-        timeout: 120_000,
+        timeout: 180_000,                    // bumped from 120s
       },
     );
     console.log(`[generateWithClaude] Success — response type: ${resp.data?.type}, stop_reason: ${resp.data?.stop_reason}`);
@@ -2168,11 +2274,27 @@ export async function checkClaudeResponse(claudeResp: unknown, promptData: Promp
   };
 }
 
+// ── Grok-specific generation delta ───────────────────────────────────────────
+// Grok uses the SAME system/user prompt as Claude (built by buildClaudePrompt),
+// so every content, sourcing, writing-style, and formatting rule stays identical
+// — this preamble only ADDS guardrails for Grok's known quirks (showing its
+// work, appending "(48 words)"-style counts, inventing tier/recap slides, literal
+// CTAs, and ignoring hard limits). It never relaxes any rule that follows it.
+const GROK_GENERATION_DELTA = `CRITICAL GROK OUTPUT RULES — these ADD TO (never replace) every rule in the system prompt that follows:
+1. Output ONLY the finished article in the exact required format. Do NOT show planning, reasoning, or any commentary before or after it.
+2. NEVER append counts or annotations to any line. Strings like "(48 words)" or "(98 characters)" must NEVER appear in the output. Count silently in your head.
+3. Produce EXACTLY the requested number of content slides plus the single intro. Do NOT add tier headers, section dividers, recap slides, or bonus slides.
+4. Do NOT write a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands") in the intro or anywhere else.
+5. Obey every word-count and character limit exactly. If a line is over the limit, rewrite it shorter BEFORE outputting.
+Every content, sourcing, writing-style, and formatting rule in the system prompt below remains fully in force.
+
+`;
+
 // ── 12. generateWithGrok (n8n: "Grok - Generate Article (Fallback)") ──────────
 
 export async function generateWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
   const data = await callGrokWithFallback({
-    systemContent: systemPrompt,
+    systemContent: GROK_GENERATION_DELTA + systemPrompt,
     userContent: userPrompt,
     maxTokens: 7000,
     temperature: 0.3,
@@ -2650,23 +2772,50 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
           correctionsSkipped++;
           correctionLog.push(`SKIP claim ${claimIdx - 1}: empty CORRECTION_FIND`);
         } else {
-          // Try 1: exact substring match
-          if (articleText.includes(cleanFind)) {
-            articleText = articleText.replace(cleanFind, cleanReplace);
-          } else {
-            // Try 2: whitespace-normalized match (handles line breaks, extra spaces)
-            const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
-            const escaped = cleanFind.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s+');
-            const rx = new RegExp(escaped);
-            if (rx.test(articleText)) {
-              articleText = articleText.replace(rx, cleanReplace);
-            } else {
-              // Try 3: case-insensitive match (Grok sometimes changes case)
-              const rxI = new RegExp(escaped, 'i');
-              if (rxI.test(articleText)) {
-                articleText = articleText.replace(rxI, cleanReplace);
-              }
+          // Whitespace-tolerant find/replace that PRESERVES original whitespace
+          // structure (newlines, tabs) in the matched span.
+          //
+          // Why this matters: slide titles like "Kyle Busch – 40 Wins" sit on
+          // their own line, followed by '\n' and then the body sentence. When
+          // Grok's CORRECTION_FIND spans the title→body newline (because the
+          // factual error is in the title and needs surrounding context for a
+          // unique match), a naïve `replace(rx, cleanReplace)` collapses that
+          // '\n' into a space, jamming title + body onto one line. The
+          // downstream slide parser then treats the entire paragraph as the
+          // title and leaves the description empty.
+          //
+          // Fix: capture each inter-word whitespace span via `(\s+)` and
+          // re-inject those exact spans (including any '\n') between the words
+          // of the replacement. Pure body-only corrections behave identically
+          // to before (captured spans are just " ").
+          const tryReplace = (text: string, find: string, replace: string, caseInsensitive: boolean): string | null => {
+            const words = find.split(/\s+/).filter(Boolean);
+            if (words.length === 0) return null;
+            const escaped = words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('(\\s+)');
+            const rx = new RegExp(escaped, caseInsensitive ? 'i' : '');
+            const m = text.match(rx);
+            if (!m) return null;
+            const spans = m.slice(1); // captured whitespace spans from the FIND match
+            const replaceWords = replace.split(/\s+/).filter(Boolean);
+            let rebuilt = replaceWords[0] ?? '';
+            for (let i = 1; i < replaceWords.length; i++) {
+              rebuilt += (spans[i - 1] ?? ' ') + replaceWords[i];
             }
+            // Escape '$' so String.replace doesn't interpret $1, $&, $$, etc. as backrefs.
+            const safe = rebuilt.replace(/\$/g, '$$$$');
+            return text.replace(rx, safe);
+          };
+
+          // Try 1: exact substring match (fast path, no whitespace differences).
+          // Escape '$' in the replacement to defuse backref interpretation.
+          if (articleText.includes(cleanFind)) {
+            articleText = articleText.replace(cleanFind, cleanReplace.replace(/\$/g, '$$$$'));
+          } else {
+            // Try 2: whitespace-tolerant, structure-preserving match.
+            // Try 3: case-insensitive fallback (Grok sometimes changes case).
+            const out = tryReplace(articleText, cleanFind, cleanReplace, false)
+                     ?? tryReplace(articleText, cleanFind, cleanReplace, true);
+            if (out !== null) articleText = out;
           }
 
           if (articleText !== beforeText) {
@@ -3601,7 +3750,7 @@ Always produce the full slideshow. No exceptions. Never write 'I cannot' or any 
 
 The writer EXPLICITLY requested ${data.userWordCountOverride.min}-${data.userWordCountOverride.max} words per content slide.
 This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
-Count every word before outputting each slide. Rewrite if out of range.`
+Count every word silently before outputting each slide (the count must NEVER appear in the output). Rewrite if out of range.`
       : ''}`;
 
   const mandatoryBlock = data.hasMustInclude
@@ -3691,7 +3840,7 @@ export async function checkSubjectiveClaudeResponse(claudeResp: unknown, promptD
 
 export async function generateSubjectiveWithGrok(systemPrompt: string, userPrompt: string): Promise<string> {
   const data = await callGrokWithFallback({
-    systemContent: systemPrompt,
+    systemContent: GROK_GENERATION_DELTA + systemPrompt,
     userContent: userPrompt,
     maxTokens: 5000,
     temperature: 0.4,
