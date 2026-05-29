@@ -2226,7 +2226,7 @@ export async function generateWithClaude(systemPrompt: string, userPrompt: strin
           'anthropic-beta': 'prompt-caching-2024-07-31',
           'x-api-key': ANTHROPIC_KEY,
         },
-        timeout: 180_000,                    // bumped from 120s
+        timeout: 160_000,                    // bumped from 120s; kept under the 180s activity timeout so the axios timeout wins the race and falls back gracefully
       },
     );
     console.log(`[generateWithClaude] Success — response type: ${resp.data?.type}, stop_reason: ${resp.data?.stop_reason}`);
