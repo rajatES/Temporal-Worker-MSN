@@ -122,7 +122,9 @@ async function callGrokWithFallback(opts: {
 }
 
 const RESTRICTED_DOMAINS = [
-  'instagram.com', 'facebook.com', 'twitter.com', 'x.com', 'tiktok.com',
+  // X/Twitter intentionally NOT restricted — Firecrawl v2 scrapes it cleanly, so X is
+  // allowed as a user source and as a scrapeable citation in both flows.
+  'instagram.com', 'facebook.com', 'tiktok.com',
   'linkedin.com', 'pinterest.com', 'nytimes.com', 'wsj.com', 'ft.com',
   'bloomberg.com', 'theathletic.com', 'reddit.com', 'quora.com', 'youtube.com',
 ];
@@ -1528,7 +1530,10 @@ function buildPerplexityUser(data: AtomizedData, isDeep: boolean): string {
 }
 
 export async function perplexityDeepResearch(data: AtomizedData): Promise<PerplexityRaw> {
-  return callPerplexity('sonar-pro', buildPerplexitySystem(data, true), buildPerplexityUser(data, true), 4000, 120_000);
+  // Cost optimization: downgraded from `sonar-pro` to `sonar`. All routing/conditions
+  // (needsDeep) are unchanged — the deep path still uses the deep multi-search prompt
+  // (deep=true) and longer timeout, just on the cheaper model.
+  return callPerplexity('sonar', buildPerplexitySystem(data, true), buildPerplexityUser(data, true), 4000, 120_000);
 }
 
 export async function perplexityStandardResearch(data: AtomizedData): Promise<PerplexityRaw> {
@@ -1536,7 +1541,9 @@ export async function perplexityStandardResearch(data: AtomizedData): Promise<Pe
 }
 
 export async function perplexityRetryResearch(data: AtomizedData): Promise<PerplexityRaw> {
-  return callPerplexity('sonar-pro', buildPerplexitySystem(data, true), buildPerplexityUser(data, true), 4000, 120_000);
+  // Cost optimization: downgraded from `sonar-pro` to `sonar`. Keeps the deep
+  // multi-search prompt (deep=true) for thoroughness but on the cheaper model.
+  return callPerplexity('sonar', buildPerplexitySystem(data, true), buildPerplexityUser(data, true), 4000, 120_000);
 }
 
 // ── 7. validateRetry (n8n: "Retry Validator") ────────────────────────────────
@@ -2426,7 +2433,7 @@ ${data.title}
 META: [Max 120 characters]
 
 SLIDE 1
-[Intro title]
+[Intro title — write the EXACT slideshow title, verbatim]
 [Max 60 words — Tier 1A/1B facts only]
 
 SLIDE 2
@@ -3779,7 +3786,9 @@ ${moderationReport}
 // news. Originally n8n omitted youtube.com — we add it here because Firecrawl
 // against a YouTube watch URL returns 0 chars or nav-menu garbage.
 const SUBJECTIVE_RESTRICTED = [
-  'instagram.com', 'facebook.com', 'twitter.com', 'x.com', 'tiktok.com',
+  // X/Twitter intentionally NOT restricted — Firecrawl v2 scrapes it cleanly, so X is
+  // allowed as a user source and as a scrapeable citation in both flows.
+  'instagram.com', 'facebook.com', 'tiktok.com',
   'linkedin.com', 'pinterest.com', 'nytimes.com', 'wsj.com', 'ft.com',
   'bloomberg.com', 'theathletic.com', 'si.com', 'reddit.com', 'quora.com',
   'youtube.com', 'youtu.be',
@@ -4249,7 +4258,7 @@ Plain text only. No asterisks, hashtags, bullet points, or markdown.
 META: [Max 120 characters — intriguing hook, not a CTA, not a title paraphrase]
 
 SLIDE 1
-[Intro title]
+[Intro title — write the EXACT slideshow title, verbatim]
 [Max 60 words — one specific anchoring detail, tease the angle, no generic openers, no items named]
 
 SLIDE 2
@@ -4260,6 +4269,29 @@ SLIDE 2
 
 SOURCES:
 [URL]: [what facts came from this source]
+
+═══════════════════════════════════════════════════════════════
+INTRO SLIDE (Slide 1) — MAX 60 WORDS
+═══════════════════════════════════════════════════════════════
+
+Your intro MUST:
+- Create CURIOSITY — make readers NEED to scroll
+- Include ONE surprising fact from Tier 1A or 1B tied to the theme
+- Hint at what's coming WITHOUT naming specific items
+- End with forward momentum
+- Talk about something the title is promising
+- Tease the main angle, not reveal it entirely
+
+Your intro must NOT:
+- Name any items from the list
+- Reveal the #1 pick or any rankings
+- Use "let's dive in" / "here are" / "we'll explore"
+- Use a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
+- Use generic openers ("Since the dawn of...", "In today's world...")
+- Paraphrase the title anywhere
+- Have generic background that assumes reader ignorance
+- Stack adjectives without information backing them
+- Use any fact not present in Tier 1A or 1B
 
 ═══════════════════════════════════════════════════════════════
 TITLE-BODY CORRELATION — HIGHEST PRIORITY

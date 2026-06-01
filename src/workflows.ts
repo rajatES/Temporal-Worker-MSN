@@ -355,7 +355,9 @@ function buildWorkflowResult(
   return {
     title: final.title,
     metaDescription,
-    introSlide: introSlide ? { title: introSlide.title, body: introSlide.body } : null,
+    // Editorial rule: the intro slide title mirrors the slideshow title exactly.
+    // The model's creative intro headline is discarded; only its body is kept.
+    introSlide: introSlide ? { title: final.title, body: introSlide.body } : null,
     description: metaDescription || introSlide?.body || '',
     keywords: final.category,
     slides: enrichedContentSlides,
@@ -495,9 +497,11 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
     // Stage 5: Perplexity research + retry + merge
     activate('researching');
+    // Cost optimization: the deep path now uses `sonar` (downgraded from sonar-pro) and
+    // only fires for very large slideshows, missing user source, or correlation titles.
+    // Raised the slide threshold 15 -> 25 and dropped the mustInclude>=8 clause.
     const needsDeep =
-      atomizedData.slideCount >= 15 ||
-      (atomizedData as any).mustIncludeItems?.length >= 8 ||
+      atomizedData.slideCount > 25 ||
       !atomizedData.hasValidUserSource ||
       (atomizedData as any).titleAnalysis?.requiresCorrelation;
 
@@ -532,7 +536,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     // Stage 6: citation scraping
     activate('scraping_citations');
     const skipDomains = [
-      'twitter.com', 'x.com', 'reddit.com', 'facebook.com', 'instagram.com',
+      // X/Twitter allowed — Firecrawl v2 scrapes it cleanly (omitted from skip list).
+      'reddit.com', 'facebook.com', 'instagram.com',
       'tiktok.com', 'pinterest.com', 'quora.com', 'youtube.com', 'youtu.be',
       'nytimes.com', 'wsj.com', 'bloomberg.com', 'theathletic.com', 'linkedin.com',
     ];
@@ -796,9 +801,11 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
   // ── Stage 4: Perplexity research ─────────────────────────────────────────────
   activate('researching');
+  // Cost optimization: the deep path now uses `sonar` (downgraded from sonar-pro) and
+  // only fires for very large slideshows, missing user source, or correlation titles.
+  // Raised the slide threshold 15 -> 25 and dropped the mustInclude>=8 clause.
   const needsDeep =
-    atomizedData.slideCount >= 15 ||
-    atomizedData.mustIncludeItems.length >= 8 ||
+    atomizedData.slideCount > 25 ||
     !atomizedData.hasValidUserSource ||
     atomizedData.titleAnalysis.requiresCorrelation;
 
@@ -865,7 +872,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   activate('scraping_citations');
 
   const skipDomains = [
-    'twitter.com', 'x.com', 'reddit.com', 'facebook.com', 'instagram.com',
+    // X/Twitter allowed — Firecrawl v2 scrapes it cleanly (omitted from skip list).
+    'reddit.com', 'facebook.com', 'instagram.com',
     'tiktok.com', 'pinterest.com', 'quora.com', 'youtube.com', 'youtu.be',
     'nytimes.com', 'wsj.com', 'bloomberg.com', 'theathletic.com', 'linkedin.com',
   ];
