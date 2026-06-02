@@ -611,11 +611,13 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
         }
 
         batchTexts.push(batchText);
-        priorText = batchText;
+        // Accumulate ALL prior batches (not just the last) so batch 3+ sees every
+        // item already written and can't repeat an early-batch entry.
+        priorText = priorText ? `${priorText}\n\n${batchText}` : batchText;
         cursor += contentCount;
       }
 
-      const stitched = await stitchBatchedArticle(batchTexts);
+      const stitched = await stitchBatchedArticle(batchTexts, { isMultiSlideFormat: prompted.formatConfig.isMultiSlideFormat });
       const allGrok = batchSources.every(s => s === 'Grok');
       const anyGrok = batchSources.some(s => s === 'Grok');
       generated = {
@@ -962,11 +964,13 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
         }
 
         batchTexts.push(batchText);
-        priorText = batchText;           // feed continuity into the next batch
+        // Accumulate ALL prior batches (not just the last) so batch 3+ sees every
+        // item already written and can't repeat an early-batch entry.
+        priorText = priorText ? `${priorText}\n\n${batchText}` : batchText;
         cursor += contentCount;
       }
 
-      const stitched = await stitchBatchedArticle(batchTexts);
+      const stitched = await stitchBatchedArticle(batchTexts, { isMultiSlideFormat: promptData.formatConfig.isMultiSlideFormat });
       const allGrok = batchSources.every(s => s === 'Grok');
       const anyGrok = batchSources.some(s => s === 'Grok');
       generatedData = {

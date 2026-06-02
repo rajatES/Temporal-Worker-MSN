@@ -1,4 +1,4 @@
-import axios from 'axios';
+﻿import axios from 'axios';
 import * as dotenv from 'dotenv';
 import {
   FormInput, PreparedData, SourcedData, AtomizedData, ResearchedData,
@@ -1042,11 +1042,29 @@ export async function analyzeSourceAlignment(
   const keywordMatches = titleWords.filter(w => sourceLower.includes(w));
   const keywordMatchRate = titleWords.length > 0 ? keywordMatches.length / titleWords.length : 0;
 
+  // Count item-like patterns in the source to estimate how many list items it covers.
+  // Sports sources typically use numbered lists; lifestyle/entertainment sources often
+  // use bare ## headings or **bold names** instead — count all patterns and take the max.
+  const STRUCTURAL_HEADING_EST_RE = /\b(comments?|related\s+articles?|related\s+stories|about\s+the\s+author|newsletter|sign\s*up|subscribe|trending|popular|more\s+from|the\s+latest|recommended|replies|editor'?s?\s*picks?|see\s+also|references?|footnotes?|table\s+of\s+contents|advertisement|sponsored)\b/i;
   const listPatterns = [/^\d+[.):\s]+/gm, /^#+\s+\d+/gm, /^\*\*\d+/gm];
   let estimatedItems = 0;
   for (const p of listPatterns) {
     const m = allSourceContent.match(p);
     if (m && m.length > estimatedItems) estimatedItems = m.length;
+  }
+
+  // Count bare ## headings that look like entity names (not structural headings).
+  // This catches lifestyle sources like HubPages: "## Lita (Amy Dumas)", "## Christy Hemme"
+  if (estimatedItems < 3) {
+    const headingLines = allSourceContent.match(/^#{1,3}\s+[A-Z].+$/gm) ?? [];
+    const entityHeadings = headingLines.filter(h => !STRUCTURAL_HEADING_EST_RE.test(h));
+    if (entityHeadings.length > estimatedItems) estimatedItems = entityHeadings.length;
+  }
+
+  // Count bold-name paragraphs: **Name** on its own line
+  if (estimatedItems < 3) {
+    const boldNames = allSourceContent.match(/^\*\*[A-Z][^*\n]{2,60}\*\*\s*$/gm) ?? [];
+    if (boldNames.length > estimatedItems) estimatedItems = boldNames.length;
   }
 
   const factTypeChecks = {
@@ -1236,6 +1254,25 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
           sections = entitySections;
         }
       }
+
+      // Strategy 4: Bold-name paragraphs — common in lifestyle/entertainment
+      // listicles that don't use markdown headings. "**Name**" on its own line.
+      // e.g. "**Jennifer Aniston**\nKnown for her role on Friends..."
+      if (sections.length < 3) {
+        const boldSections = sourceContent.split(/(?=\n\*\*[A-Z][^*\n]{2,60}\*\*\s*\n)/);
+        if (boldSections.length >= 3) {
+          sections = boldSections;
+        }
+      }
+
+      // Strategy 5: Bare numbered list items — "1. Name" or "1) Name" at line
+      // start WITHOUT heading markers (#). Catches plain-text listicles.
+      if (sections.length < 3) {
+        const bareNumberedSections = sourceContent.split(/(?=\n\d{1,3}[.)]\s+[A-Z])/);
+        if (bareNumberedSections.length >= 3) {
+          sections = bareNumberedSections;
+        }
+      }
     }
 
     sections.forEach((section, sectionIdx) => {
@@ -1276,6 +1313,65 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
             itemName = numberedMatch[2].trim().replace(/\*\*/g, '');
             content = section.replace(/^[ \t]*#{1,3}[ \t]+\d{1,3}\\?[.):][ \t]+.+?\n/, '');
           }
+        }
+      }
+
+      // ── Fallback patterns for lifestyle/entertainment/pop-culture sources ──
+      // These fire only when Patterns A-C left the itemName as the default
+      // "Item N", meaning the heading format is non-sports/non-numbered.
+
+      // Common structural headings that should NOT become item names — they
+      // signal navigation, comments, sidebars, or article meta-sections.
+      const STRUCTURAL_HEADING_RE = /\b(comments?|related\s+articles?|related\s+stories|about\s+the\s+author|newsletter|sign\s*up|subscribe|trending|popular|more\s+from|the\s+latest|recommended|replies|editor'?s?\s*picks?|see\s+also|references?|footnotes?|table\s+of\s+contents|advertisement|sponsored|share\s+this)\b/i;
+
+      // Pattern D: Bare ## heading — lifestyle, entertainment, pop-culture
+      // sources using plain "## Name" or "## Name (Alias)" headings without
+      // numbers or colons.
+      // e.g. "## Lita (Amy Dumas)", "## Christy Hemme", "## Jennifer Aniston"
+      if (itemName === `Item ${sectionIdx + 1}`) {
+        const bareHeadingMatch = section.match(/^#{1,3}\s+(.+?)(?:\n|$)/);
+        if (bareHeadingMatch) {
+          let heading = bareHeadingMatch[1].trim()
+            .replace(/\*\*/g, '')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+
+          if (!STRUCTURAL_HEADING_RE.test(heading) && heading.length > 1 && heading.length < 80) {
+            itemName = heading;
+            content = section.replace(/^#{1,3}\s+[^\n]+\n/, '');
+          }
+        }
+      }
+
+      // Pattern E: Bold name at start of section — **Name** on its own line.
+      // Matches Strategy 4 bold-name splits.
+      // e.g. "**Reese Witherspoon**\nThe Legally Blonde star..."
+      if (itemName === `Item ${sectionIdx + 1}`) {
+        const boldNameMatch = section.match(/^\*\*([^*\n]{2,60})\*\*\s*(?:\n|$)/);
+        if (boldNameMatch) {
+          const heading = boldNameMatch[1].trim()
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+
+          if (!STRUCTURAL_HEADING_RE.test(heading) && heading.length > 1) {
+            itemName = heading;
+            content = section.replace(/^\*\*[^*]+\*\*\s*\n/, '');
+          }
+        }
+      }
+
+      // Pattern F: Bare numbered list item — "1. Name" or "2) Name" without
+      // heading markers. Matches Strategy 5 bare-numbered splits.
+      if (itemName === `Item ${sectionIdx + 1}`) {
+        const bareNumMatch = section.match(/^(\d{1,3})[.)]\s+(.+?)(?:\n|$)/);
+        if (bareNumMatch) {
+          itemNumber = parseInt(bareNumMatch[1]);
+          let heading = bareNumMatch[2].trim()
+            .replace(/\*\*/g, '')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+          // If there's a dash/em-dash/colon separator, take just the name part
+          const sepMatch = heading.match(/^(.{3,}?)\s*[—–:\-]\s+/);
+          if (sepMatch && sepMatch[1].length > 2) heading = sepMatch[1].trim();
+          itemName = heading;
+          content = section.replace(/^\d{1,3}[.)]\s+[^\n]*\n/, '');
         }
       }
 
@@ -2511,6 +2607,35 @@ Write the complete slideshow now.`;
 // content slides only and receive the prior batch's titles/openings so they
 // continue the exact order, never repeat an item, and vary their openings.
 
+/** Build a human-readable descending rank sequence string, e.g. (30, 16) → "30, 29, 28, … 16".
+ *  Used to tell a batch the exact rank numbers it must title its slides with. */
+function buildRankSequenceStr(startRank: number, endRank: number): string {
+  const nums: number[] = [];
+  for (let r = startRank; r >= endRank; r--) nums.push(r);
+  if (nums.length === 0) return String(startRank);
+  if (nums.length <= 12) return nums.join(', ');
+  return `${nums.slice(0, 6).join(', ')}, … ${nums.slice(-3).join(', ')}`;
+}
+
+/** Extract the entity/person a slide title refers to, stripped of any leading rank
+ *  prefix ("20. ", "#20 ", "20) ") and trailing team abbreviation (", DET"), then
+ *  normalized to a comparable key. Empty string when nothing identifiable remains.
+ *  Used by stitchBatchedArticle to detect the same person re-emitted under a
+ *  different rank number across a batch seam. */
+function slideEntityKey(title: string): string {
+  let t = (title || '').replace(/\*\*/g, '').replace(/^#+\s*/, '').trim();
+  // Strip a leading rank marker: "20.", "20)", "20:", "#20 ", "No. 20", "20 -"
+  // (separator may be punctuation OR just whitespace, e.g. "#16 Eury Pérez").
+  t = t.replace(/^(?:no\.?\s*)?#?\s*\d{1,3}(?:\s*[.):\-–—]\s*|\s+)/i, '');
+  // Strip a trailing all-caps team/league abbreviation: ", DET" / " - LAA"
+  t = t.replace(/[\s,\-–—]+[A-Z]{2,4}\s*$/, '');
+  // Fold diacritics (Pérez → Perez) so the same name always maps to one key.
+  t = t.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // Normalize: letters/digits/spaces only, collapse whitespace, lowercase
+  t = t.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+  return t;
+}
+
 /** Pull already-written slide titles + body opening-words out of a prior batch's
  *  raw output, so the next batch can continue without repetition. */
 function extractBatchContinuity(text: string): { titles: string[]; openings: string[] } {
@@ -2547,6 +2672,27 @@ export async function buildBatchUserPrompt(data: PromptData, spec: BatchSpec, pr
     ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}`
     : '35-50';
 
+  // ── Explicit rank mapping for ranked countdowns ──────────────────────────
+  // Rankings are presented LOWEST-to-HIGHEST: content presentation position 1 is
+  // the lowest rank (= totalContent) and the final position is rank 1. The model
+  // must title each slide with its RANK number, NOT its presentation position —
+  // conflating the two is what makes a later batch restart numbering and re-emit
+  // players from an earlier batch. We compute the exact descending rank sequence
+  // this batch must cover and state it as non-negotiable. Skip for multi-slide
+  // formats, where one entity spans two slides and a 1-rank-per-slide sequence
+  // does not apply.
+  const isRankCountdown = ta.isRanking && !data.formatConfig.isMultiSlideFormat;
+  const startRank = spec.totalContent - spec.contentStart + 1;   // first (highest) rank in this batch
+  const endRank = spec.totalContent - rangeEnd + 1;              // last (lowest) rank in this batch
+  const rankDirective = isRankCountdown
+    ? `\n\n⚠️ RANK NUMBERS FOR THIS BATCH — NON-NEGOTIABLE
+This is a ranked countdown shown LOWEST-to-HIGHEST (the #1 pick is the LAST slide of the whole article).
+The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them in this exact descending order: ${buildRankSequenceStr(startRank, endRank)}.
+- Each slide title MUST start with its rank number from the list above.
+- These rank numbers CONTINUE from the earlier batches. Do NOT restart at ${spec.totalContent}. Do NOT reuse any rank number already written in a previous batch.
+- "Presentation positions ${spec.contentStart}–${rangeEnd}" are NOT rank numbers — ignore them for titling and use the rank numbers above.`
+    : '';
+
   const mustBlock = data.hasMustInclude
     ? `\nMANDATORY ITEMS (full list, for reference — cover the ones that fall in THIS batch's range, in order):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nAny tier headers or section labels here are organizational, NOT items — never give them a slide.\n`
     : '';
@@ -2566,7 +2712,7 @@ STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec
 Do NOT write a TITLE, META, intro, or SOURCES. Output ONLY SLIDE blocks.
 Produce the NEXT ${spec.contentCount} content slides — presentation positions ${spec.contentStart} to ${rangeEnd} of ${spec.totalContent} — continuing the EXACT ranking/presentation order from where the previous batch stopped.
 
-ALREADY WRITTEN — do NOT repeat any of these items:
+ALREADY WRITTEN — these items are DONE. Do NOT write any of them again (no repeats, no near-duplicates, no same person under a different rank):
 ${titles.map((t, i) => `${i + 1}. ${t}`).join('\n') || '(none)'}
 
 OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
@@ -2582,22 +2728,47 @@ BATCH ASSIGNMENT
 Title: "${data.title}"
 Category: ${data.category}
 ${mustBlock}
-${assignment}
+${assignment}${rankDirective}
 
 CRITICAL REMINDERS:
 - Every specific claim must trace to TIER 1A or TIER 1B.
 - Content slides must be ${wcRange} words. Count silently — never print the count.
-- ${ta.isRanking ? 'Follow Tier 1A ranking order exactly. Each content slide title starts with its rank number.' : 'Keep slide order consistent with the source.'}
+- ${isRankCountdown ? 'Use the exact rank numbers listed above for this batch. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : ta.isRanking ? 'Follow the ranking order exactly. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : 'Keep slide order consistent with the source. Never repeat an item already written in an earlier batch.'}
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
 Write this batch now.`;
 }
 
+/** Read the entity-bearing title line out of a single SLIDE block. The first line
+ *  is the "SLIDE N" marker (optionally "SLIDE N: Inline Title"); otherwise the
+ *  next non-empty, non-META line is the title. */
+function blockTitleLine(block: string): string {
+  const lines = block.split('\n');
+  const first = (lines[0] ?? '').trim().replace(/\*\*/g, '').replace(/^#+\s*/, '');
+  const m = first.match(/^SLIDE\s*\d+\s*:?\s*(.*)$/i);
+  if (m && m[1].trim()) return m[1].trim();
+  for (let i = 1; i < lines.length; i++) {
+    const t = lines[i].trim().replace(/\*\*/g, '');
+    if (t && !/^META:/i.test(t)) return t;
+  }
+  return '';
+}
+
 /** Merge the raw outputs of all batches into one article in the standard format.
  *  Takes the header (TITLE + META) from batch 0, concatenates every SLIDE block
  *  across all batches in order, and renumbers them sequentially. Downstream
- *  validation re-parses this exactly like a single-shot article. */
-export async function stitchBatchedArticle(batchTexts: string[]): Promise<{ articleText: string }> {
+ *  validation re-parses this exactly like a single-shot article.
+ *
+ *  LEAK-PROOF BACKSTOP: when NOT a multi-slide-per-entity format, drops any
+ *  content slide whose entity (person/item, ignoring rank prefix + team suffix)
+ *  already appeared in an earlier slide. The prompt-level rank directive prevents
+ *  cross-batch repeats in the first place; this guarantees no duplicate ships
+ *  even if a batch ignores the directive. A clean shorter article (flagged by
+ *  validateStructure for the count shortfall) beats one with phantom duplicates. */
+export async function stitchBatchedArticle(
+  batchTexts: string[],
+  opts?: { isMultiSlideFormat?: boolean },
+): Promise<{ articleText: string }> {
   const splitBlocks = (text: string): { header: string; blocks: string[] } => {
     const headerLines: string[] = [];
     const blocks: string[] = [];
@@ -2626,8 +2797,28 @@ export async function stitchBatchedArticle(batchTexts: string[]): Promise<{ arti
     allBlocks.push(...splitBlocks(batchTexts[i] ?? '').blocks);
   }
 
+  // ── Duplicate-entity backstop ────────────────────────────────────────────
+  // Skip entirely for multi-slide-per-entity formats, where the same entity
+  // legitimately spans 2 consecutive slides. Block 0 is the intro — always kept.
+  let dedupedBlocks = allBlocks;
+  if (!opts?.isMultiSlideFormat && allBlocks.length > 1) {
+    const seen = new Set<string>();
+    const dropped: string[] = [];
+    dedupedBlocks = allBlocks.filter((block, idx) => {
+      if (idx === 0) return true;                         // intro slide
+      const key = slideEntityKey(blockTitleLine(block));
+      if (!key) return true;                              // unidentifiable → keep
+      if (seen.has(key)) { dropped.push(key); return false; }
+      seen.add(key);
+      return true;
+    });
+    if (dropped.length > 0) {
+      console.warn(`[stitchBatchedArticle] Dropped ${dropped.length} duplicate-entity slide(s) at batch seam: ${dropped.join(', ')}`);
+    }
+  }
+
   // Renumber every SLIDE marker sequentially (1 = intro, 2..N = content).
-  const renumbered = allBlocks.map((b, idx) =>
+  const renumbered = dedupedBlocks.map((b, idx) =>
     b.replace(/^(\s*(?:\*\*)?\s*)SLIDE\s*\d+/i, `$1SLIDE ${idx + 1}`),
   );
 
@@ -4410,6 +4601,20 @@ export async function buildSubjectiveBatchUserPrompt(data: SubjectivePromptData,
     ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}`
     : '35-50';
 
+  // Explicit rank mapping for ranked countdowns (see buildBatchUserPrompt for rationale).
+  // Subjective rankings are also presented LOWEST-to-HIGHEST (#1 is the final slide).
+  const isRankCountdown = ta.isRanking && !data.formatConfig.isMultiSlideFormat;
+  const startRank = spec.totalContent - spec.contentStart + 1;
+  const endRank = spec.totalContent - rangeEnd + 1;
+  const rankDirective = isRankCountdown
+    ? `\n\n⚠️ RANK NUMBERS FOR THIS BATCH — NON-NEGOTIABLE
+This is a ranked countdown shown LOWEST-to-HIGHEST (the #1 pick is the LAST slide of the whole article).
+The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them in this exact descending order: ${buildRankSequenceStr(startRank, endRank)}.
+- Each slide title MUST start with its rank number from the list above.
+- These rank numbers CONTINUE from the earlier batches. Do NOT restart at ${spec.totalContent}. Do NOT reuse any rank number already written in a previous batch.
+- "Presentation positions ${spec.contentStart}–${rangeEnd}" are NOT rank numbers — ignore them for titling and use the rank numbers above.`
+    : '';
+
   const mustBlock = data.hasMustInclude
     ? `\nMANDATORY ITEMS (full list, for reference — cover the ones that fall in THIS batch's range, in order):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nAny tier headers or section labels here are organizational, NOT items — never give them a slide.\n`
     : '';
@@ -4429,7 +4634,7 @@ STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec
 Do NOT write a TITLE, META, intro, or SOURCES. Output ONLY SLIDE blocks.
 Produce the NEXT ${spec.contentCount} content slides — presentation positions ${spec.contentStart} to ${rangeEnd} of ${spec.totalContent} — continuing the EXACT order from where the previous batch stopped.
 
-ALREADY WRITTEN — do NOT repeat any of these items:
+ALREADY WRITTEN — these items are DONE. Do NOT write any of them again (no repeats, no near-duplicates, no same person under a different rank):
 ${titles.map((t, i) => `${i + 1}. ${t}`).join('\n') || '(none)'}
 
 OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
@@ -4447,12 +4652,12 @@ Category: ${data.category}
 Article Type: ${data.articleType}
 Tone Dial: ${data.toneDial}${data.writingStyle ? `\nStyle Influence: ${data.writingStyle}` : ''}
 ${mustBlock}
-${assignment}
+${assignment}${rankDirective}
 
 CRITICAL REMINDERS:
 - Every specific claim must trace to TIER 1A/1B or be something you are genuinely certain of.
 - Content slides must be ${wcRange} words. Count silently — never print the count.
-- ${ta.isRanking ? 'List in REVERSE ranking order. Each content slide title starts with its rank number.' : 'Keep slide order consistent with the source.'}
+- ${isRankCountdown ? 'Use the exact rank numbers listed above for this batch. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : ta.isRanking ? 'List in REVERSE ranking order. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : 'Keep slide order consistent with the source. Never repeat an item already written in an earlier batch.'}
 - Keep the ${data.toneDial} tone and the subjective voice throughout.
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
