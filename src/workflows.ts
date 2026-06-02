@@ -588,14 +588,18 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
           isFirst: b === 0,
         };
         activate('generating', `Batch ${b + 1}/${totalBatches} (slides ${cursor}-${cursor + contentCount - 1})…`);
-        const batchUserPrompt = await buildSubjectiveBatchUserPrompt(prompted, spec, priorText);
+        // factBlock (the fact DB) is identical across every batch of this article;
+        // assignment is the per-batch part. Caching the fact block lets batches 2..N
+        // read it instead of re-paying full input price.
+        const { factBlock, assignment } = await buildSubjectiveBatchUserPrompt(prompted, spec, priorText);
+        const grokBatchPrompt = factBlock + assignment;   // Grok auto-caches; send the full prompt
 
         let batchText = '';
         try {
-          const raw = await generateSubjectiveWithClaude(prompted.claudeSystemPrompt, batchUserPrompt);
+          const raw = await generateSubjectiveWithClaude(prompted.claudeSystemPrompt, assignment, factBlock);
           const checked = await checkSubjectiveClaudeResponse(raw, prompted);
           if (checked.claudeFailed) {
-            batchText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, batchUserPrompt);
+            batchText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, grokBatchPrompt);
             batchSources.push('Grok');
           } else {
             batchText = checked.articleText;
@@ -603,7 +607,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
           }
         } catch {
           try {
-            batchText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, batchUserPrompt);
+            batchText = await generateSubjectiveWithGrok(prompted.claudeSystemPrompt, grokBatchPrompt);
             batchSources.push('Grok');
           } catch {
             throw new Error(`Both Claude and Grok failed on subjective batch ${b + 1}/${totalBatches}`);
@@ -940,15 +944,19 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
           isFirst: b === 0,
         };
         activate('generating', `Batch ${b + 1}/${totalBatches} (slides ${cursor}-${cursor + contentCount - 1})…`);
-        const batchUserPrompt = await buildBatchUserPrompt(promptData, spec, priorText);
+        // factBlock (the fact DB) is identical across every batch of this article;
+        // assignment is the per-batch part. Caching the fact block lets batches 2..N
+        // read it instead of re-paying full input price.
+        const { factBlock, assignment } = await buildBatchUserPrompt(promptData, spec, priorText);
+        const grokBatchPrompt = factBlock + assignment;   // Grok auto-caches; send the full prompt
 
         let batchText = '';
         try {
           // contentCount ≤ 16, so this stays on the fast non-streaming path.
-          const raw = await generateWithClaude(promptData.claudeSystemPrompt, batchUserPrompt, contentCount);
+          const raw = await generateWithClaude(promptData.claudeSystemPrompt, assignment, contentCount, factBlock);
           const checked = await checkClaudeResponse(raw, promptData);
           if (checked.claudeFailed) {
-            batchText = await grokLong(promptData.claudeSystemPrompt, batchUserPrompt);
+            batchText = await grokLong(promptData.claudeSystemPrompt, grokBatchPrompt);
             batchSources.push('Grok');
           } else {
             batchText = checked.articleText;
@@ -956,7 +964,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
           }
         } catch {
           try {
-            batchText = await grokLong(promptData.claudeSystemPrompt, batchUserPrompt);
+            batchText = await grokLong(promptData.claudeSystemPrompt, grokBatchPrompt);
             batchSources.push('Grok');
           } catch {
             throw new Error(`Both Claude and Grok failed on batch ${b + 1}/${totalBatches} — cannot produce article`);

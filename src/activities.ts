@@ -59,7 +59,7 @@ async function callGrokWithFallback(opts: {
   maxTokens: number;
   temperature: number;
   timeout: number;
-  tools?: Array<{ type: string }>;
+  tools?: Array<{ type: string; max_search_results?: number }>;
   label: string;
 }): Promise<unknown> {
   // ── 1. Try Vercel AI Gateway (Responses API format) ──────────────────────
@@ -943,6 +943,101 @@ export function cleanFirecrawlMarkdown(md: string): string {
     .trim();
 }
 
+// ── Robust structural source cleaner (runs once, in analyzeSourceAlignment) ───
+// Heading patterns that mark the END of the article body. Everything from the
+// EARLIEST such heading (past a minimum offset) onward is discarded. Anchored to
+// real markdown headings (## …) so mid-article link widgets — which are bare
+// links, not headings — never trigger a premature cut.
+//
+// STRONG keywords may appear ANYWHERE inside the heading text, because a page
+// often titles its comments section "<Article Title> Comments" — these phrases
+// never occur inside a real entity heading (a person/movie/team name).
+const TAIL_SECTION_RE = /\n#{1,4}\s[^\n]*?\b(?:Comments?|Replies|Discussion|Leave a (?:Reply|Comment)|Related\s+(?:Articles?|Stories|Posts?|Reading|Content)|More\s+(?:From|in|Stories|Articles?|To Explore)|You\s+(?:May|Might)\s+(?:Also\s+)?(?:Like|Enjoy)|Recommended(?:\s+for\s+you)?|Up\s+Next|Read\s+(?:More|Next)|Most\s+(?:Read|Popular|Viewed)|Editor'?s?\s+(?:Pick|Choice)s?|Active\s+Articles?|About\s+the\s+(?:Author|Writer))\b/i;
+// GENERIC short words must be the WHOLE heading (start-anchored) to avoid cutting
+// a content heading that merely contains the word.
+const TAIL_SECTION_STRICT_RE = /\n#{1,4}\s*\**\s*(?:The\s+Latest|Trending(?:\s+Now)?|Popular(?:\s+(?:Now|Posts?|Stories))?|Newsletter|Subscribe|Sign\s*Up|Follow\s+Us|Share\s+This|Tags?|Topics?|Sources?|References?|Footnotes?|Advertisement|Sponsored)\b/i;
+
+// Lines (short, non-prose) that are injected widgets/ad markers/credits to drop
+// from anywhere in the body. Prose (>60 chars) and table rows are never matched.
+const INLINE_NOISE_PATTERNS: RegExp[] = [
+  /^scroll\s+to\s+continue\b/i,
+  /^(?:advertisement|sponsored(?:\s+content)?|promoted(?:\s+content|\s+links?)?)\s*$/i,
+  /^(?:story|article|content)\s+continues\s+(?:below|after)\b/i,
+  /^(?:continue\s+reading|read\s+(?:more|the\s+full\s+(?:story|article)))\s*(?:below)?\s*$/i,
+  /^(?:also\s+read|read\s+also|see\s+also|related)\s*[:\-]?\s*$/i,
+  /^(?:photo|image|picture)\s*(?:credit|by|source|courtesy)\s*[:\-]/i,
+  // Wire/agency photo credit lines: "Jane Doe / Getty Images", "AP Photo/…"
+  /^[A-Z][\w.'\- ]{0,40}(?:\s*[\/|]\s*)?(?:Getty(?:\s+Images)?|AFP|Reuters|AP(?:\s+Photo)?|EPA|Shutterstock|Icon\s+Sportswire|Imagn(?:\s+Images)?|USA\s+TODAY\s+Sports|Allsport|Icon\s+SMI|NurPhoto|Zuma\s*Press)\b[^\n]{0,40}$/,
+  /^©\s*\d{0,4}.*$/,
+  /^\d+\s+(?:min(?:ute)?s?|sec(?:ond)?s?)\s+read\s*$/i,
+  /^(?:By\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\s*$/,        // bare byline line
+];
+
+/**
+ * Robust, comprehensive structural cleaner. Strips non-article noise — end-of-body
+ * sections (comments, related, sidebars, newsletter, footer), inline ad/widget
+ * markers, image markup, link markup, reference-link defs, bare URLs, horizontal
+ * rules, HTML comments — while PRESERVING the article body AND markdown tables.
+ *
+ * No length cap (capping is a prompt-only concern). Idempotent: safe to run more
+ * than once. Run ONCE in analyzeSourceAlignment so every downstream consumer
+ * (atomization, alignment scoring, prompt building) shares the same clean text —
+ * fewer tokens, lower cost, and no comment/sidebar leakage into the fact spine.
+ */
+export function cleanSourceMarkdown(raw: string): string {
+  if (!raw) return '';
+  let md = raw;
+
+  // 1. Normalize: strip HTML comments, flatten <br> to spaces (helps table cells
+  //    and inline breaks), strip zero-width characters.
+  md = md
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<br\s*\/?>/gi, ' ')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '');
+
+  // 2. Cut everything from the EARLIEST end-of-body section heading onward.
+  //    Require a minimum offset so a "Comments"/"Related" link in the top nav
+  //    can't truncate the doc.
+  let cutIdx = -1;
+  for (const rx of [TAIL_SECTION_RE, TAIL_SECTION_STRICT_RE]) {
+    const m = md.match(rx);
+    if (m && m.index !== undefined && m.index > 800 && (cutIdx === -1 || m.index < cutIdx)) {
+      cutIdx = m.index;
+    }
+  }
+  if (cutIdx !== -1) md = md.slice(0, cutIdx);
+
+  // 3. Strip image/link markup so prose + numbers dominate (link TEXT is kept,
+  //    which preserves stats like "[49](url)" → "49" inside table cells).
+  md = md
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                                    // images
+    .replace(/\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)/g, '')                       // linked images
+    .replace(/\[([^\]]+)\]\((?:https?:[^)]+|mailto:[^)]+|#[^)]*)\)/g, '$1')  // [text](url) → text
+    .replace(/^\s*\[[^\]]+\]:\s*https?:\/\/\S+\s*$/gm, '')                   // reference-link defs
+    .replace(/^\s*[-*]\s*\[[^\]]*\]\([^)]*\)\s*$/gm, '');                    // list-of-links lines
+
+  // 4. Per-line filter: drop injected widgets, ad markers, credits, bare URLs, and
+  //    horizontal rules. Prose and table rows are always preserved.
+  md = md
+    .split('\n')
+    .filter(line => {
+      const t = line.trim();
+      if (!t) return true;                                  // keep blank lines (paragraph breaks)
+      if (t.startsWith('|')) return true;                   // never drop a table row
+      if (/^[-*_]{3,}$/.test(t)) return false;              // horizontal rule (NOT a table sep)
+      if (/^https?:\/\/\S+$/.test(t)) return false;         // bare URL on its own line
+      if (INLINE_NOISE_PATTERNS.some(rx => rx.test(t))) return false;
+      if (t.length > 60) return true;                       // long prose always passes
+      return !NOISE_LINE_PATTERNS.some(rx => rx.test(t));
+    })
+    .join('\n')
+    .replace(/[ \t]{2,}/g, ' ')                             // collapse runs of spaces (from <br> flattening)
+    .replace(/\n{3,}/g, '\n\n')                             // collapse 3+ blank lines → 1
+    .trim();
+
+  return md;
+}
+
 export async function firecrawlScrape(url: string, onlyMainContent = true): Promise<string> {
   if (!url || !url.startsWith('http')) {
     console.log(`[firecrawlScrape] Skipping URL (empty/invalid): ${url}`);
@@ -1022,11 +1117,18 @@ export async function analyzeSourceAlignment(
   // No primary/secondary/tertiary tiering — each scraped URL is an equally
   // authoritative Tier 1A source. atomizeFacts uses `scrapedSources` to
   // atomize each independently and merge facts by item name.
+  // Run the robust structural cleaner ONCE here so every downstream consumer —
+  // atomization, alignment scoring below, and prompt building — sees the same
+  // clean text (no comments/sidebars/ad-markup), which also cuts token cost.
   const scrapedSources: Array<{ url: string; markdown: string }> = [];
-  if (primaryMarkdown) scrapedSources.push({ url: prepData.userPrimaryUrl, markdown: primaryMarkdown });
+  if (primaryMarkdown) {
+    const cleaned = cleanSourceMarkdown(primaryMarkdown);
+    if (cleaned) scrapedSources.push({ url: prepData.userPrimaryUrl, markdown: cleaned });
+  }
   additionalMarkdowns.forEach((md, i) => {
     if (md && md.length > 0) {
-      scrapedSources.push({ url: prepData.userSecondaryUrls[i] ?? '', markdown: md });
+      const cleaned = cleanSourceMarkdown(md);
+      if (cleaned) scrapedSources.push({ url: prepData.userSecondaryUrls[i] ?? '', markdown: cleaned });
     }
   });
 
@@ -1136,6 +1238,106 @@ export async function buildResearchStrategy(prepData: PreparedData): Promise<Sou
 // ── 5. atomizeFacts (n8n: "Fact Atomizer") ───────────────────────────────────
 
 /**
+ * Best-effort cleanup of a person/entity name pulled from a markdown table cell.
+ * Tables from headless scrapes often mangle the name cell (leading rank number,
+ * trailing position code, duplicated surname like "MisiorowskiMisiorowski", or a
+ * merged middle initial like "JacobJ"). Conservative — leaves clean names intact.
+ */
+function cleanTableEntityName(raw: string): string {
+  let s = (raw || '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')   // [text](url) → text (defensive)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')     // zero-width chars
+    .replace(/\*\*/g, '')
+    .trim();
+  s = s.replace(/^\s*#?\d{1,3}\s+/, '');                       // leading rank number
+  s = s.replace(/(\p{Lu}\p{Ll}+)\1/gu, '$1');                  // "SánchezSánchez" → "Sánchez" (Unicode-aware)
+  s = s.replace(/(\p{Lu}\p{Ll}{2,})\p{Lu}(?=\s|$)/gu, '$1');   // "JacobJ" → "Jacob"
+  // Strip trailing position codes / stray numbers (repeatedly): "Jacob Misiorowski P 1" → "Jacob Misiorowski"
+  let prev = '';
+  do { prev = s; s = s.replace(/\s+(?:[A-Z]{1,3}|\d+)$/, '').trim(); } while (s !== prev);
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+// Separator row of a markdown table: "| --- | --- |", "|:--|--:|", etc.
+const TABLE_SEPARATOR_RE = /^\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)+\|?$/;
+// Column headers whose cell holds the entity name (everything else is a stat).
+const TABLE_NAME_COL_RE = /^(?:player|name|athlete|artist|actor|actress|driver|fighter|boxer|wrestler|team|movie|film|show|song|track|title|book|celebrity|person|entry)$/i;
+
+/**
+ * Parse a markdown table into one atomized item per data row. Returns null when
+ * the source has no usable, list-sized table so the caller falls through to the
+ * prose section-splitting strategies.
+ *
+ * Handles stat-table sources (mlb.com, sports/basketball-reference, Wikipedia):
+ * a header row, a |---| separator, then one row per entity. Each row → one item:
+ * the name from the name-like column (or first cell), and every numeric cell
+ * becomes a typed fact labeled by its column header (e.g. "49 SO", "0.29 ERA").
+ */
+function parseMarkdownTableItems(sourceContent: string, expectedItems: number): AtomizedFact[] | null {
+  const lines = sourceContent.split('\n');
+
+  // Locate the header row: a line with ≥2 pipes immediately followed by a
+  // separator row. The separator is the strong discriminator vs prose-with-pipes.
+  let headerIdx = -1;
+  for (let i = 0; i < lines.length - 1; i++) {
+    const pipes = (lines[i].match(/\|/g) || []).length;
+    if (pipes >= 2 && TABLE_SEPARATOR_RE.test(lines[i + 1].trim())) { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) return null;
+
+  const splitRow = (line: string): string[] =>
+    line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+
+  // Header label = first whitespace token of each cell (MLB headers append a long
+  // description after the abbreviation, e.g. "SO Strikeouts When a pitcher…").
+  const headers = splitRow(lines[headerIdx]).map(h => (h.split(/\s+/)[0] || h).trim());
+
+  const dataRows: string[][] = [];
+  for (let i = headerIdx + 2; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (!t.startsWith('|')) { if (t === '') continue; break; }   // blank = skip, prose = end of table
+    const cells = splitRow(lines[i]);
+    if (cells.length >= 2) dataRows.push(cells);
+  }
+
+  // Only treat the table as the article's list when it is list-sized — avoids
+  // hijacking a small comparison/spec box embedded in an otherwise-prose article.
+  if (dataRows.length < Math.max(3, Math.floor(expectedItems * 0.4))) return null;
+
+  let nameCol = headers.findIndex(h => TABLE_NAME_COL_RE.test(h));
+  if (nameCol === -1) nameCol = 0;
+
+  const items: AtomizedFact[] = [];
+  dataRows.forEach((cells, idx) => {
+    const itemName = cleanTableEntityName(cells[nameCol] ?? '');
+    if (!itemName || itemName.length < 2) return;
+
+    const facts: AtomizedFact['facts'] = [];
+    for (let c = 0; c < cells.length; c++) {
+      if (c === nameCol) continue;
+      const cell = cells[c];
+      const label = headers[c] || '';
+      if (!cell) continue;
+      if (/^-?\d+(?:[.,]\d+)?\s*%$/.test(cell)) {
+        facts.push({ type: 'percentage', value: label ? `${cell} ${label}` : cell });
+      } else if (/^-?\$?\d+(?:[.,]\d+)?$/.test(cell)) {
+        facts.push({ type: cell.includes('$') ? 'money' : 'stat', value: label ? `${cell} ${label}` : cell });
+      } else if (/^[A-Z][A-Za-z.&'\- ]{1,30}$/.test(cell) && /team|tm|club|nation|country/i.test(label)) {
+        facts.push({ type: 'affiliation', value: cell });
+      }
+    }
+    items.push({
+      itemNumber: idx + 1,
+      itemName,
+      facts: facts.slice(0, 20),
+      rawContent: cells.join(' | ').slice(0, 400),
+    });
+  });
+
+  return items.length >= 3 ? items : null;
+}
+
+/**
  * Merge atomized items that refer to the same entity across different sources.
  * Match key = sorted lowercase tokens of itemName (length > 2). So
  * "Caleb Williams — Chicago Bears" and "Chicago Bears: Caleb Williams" merge
@@ -1220,6 +1422,17 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
   // Atomize each source independently — equal Tier 1A authority across all.
   for (const sourceContent of sourcesToAtomize) {
     if (!sourceContent || sourceContent.length < 50) continue;
+
+    // Strategy 0 (table-first): stat-table sources (mlb.com, sports-reference,
+    // Wikipedia) are rows, not prose sections. Parse the table row-by-row so each
+    // entity becomes its own named item with its stats. Falls through to the prose
+    // strategies below when the source has no list-sized table.
+    const tableItems = parseMarkdownTableItems(sourceContent, data.formatConfig.entityCount);
+    if (tableItems) {
+      console.log(`[atomizeFacts] table source → ${tableItems.length} row-items`);
+      rawItems.push(...tableItems);
+      continue;
+    }
 
     // Try multiple section-splitting strategies in priority order.
     // Order matters: numbered per-item splits run BEFORE the entity-prefix split,
@@ -1822,45 +2035,13 @@ function lightSanitizePerplexity(
  */
 function cleanOneSourceForPrompt(rawScraped: string, perSourceCharCap: number): string {
   if (!rawScraped) return '';
-  let md = rawScraped;
+  // Structural cleaning is centralized in cleanSourceMarkdown (already applied
+  // upstream in analyzeSourceAlignment; idempotent, so re-running is a safe no-op
+  // and keeps this path correct even if called on raw markdown). The only
+  // prompt-specific concern left here is the per-source length cap.
+  let md = cleanSourceMarkdown(rawScraped);
 
-  // 1. Cut everything after the article body for THIS source. Most sources put
-  //    nav/related/comments AFTER the main content under predictable headings —
-  //    chop the first occurrence and discard the tail.
-  const tailHeadings = [
-    /\n##+\s*(?:Active Articles?|More (?:From|in)\s|The Latest|Recommended|Related (?:Articles?|Stories|Posts?|Reading)|Comments?|Replies|Trending|Popular|Most Read|You (?:May|Might) Also Like|Up Next|Editor'?s Pick)\b/i,
-    /\n##+\s*(?:About the (?:Author|Writer)|Newsletter|Sign Up|Subscribe)\b/i,
-    /\nSee More:\s*$/m,
-  ];
-  for (const rx of tailHeadings) {
-    const m = md.match(rx);
-    if (m && m.index !== undefined && m.index > 500) {
-      md = md.slice(0, m.index);
-    }
-  }
-
-  // 2. Remove image markdown and bare-link markdown so phrasing dominates.
-  md = md
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                                    // images
-    .replace(/\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)/g, '')                       // linked images
-    .replace(/\[([^\]]+)\]\((?:https?:[^)]+|mailto:[^)]+|#[^)]*)\)/g, '$1')  // [text](url) → text
-    .replace(/^\s*[-*]\s*\[[^\]]*\]\([^)]*\)\s*$/gm, '');                    // list-of-links lines
-
-  // 3. Same per-line filter the firecrawl cleaner already runs — catches widgets
-  //    that slip in between paragraphs of the article body.
-  md = md
-    .split('\n')
-    .filter(line => {
-      const t = line.trim();
-      if (!t) return true;
-      if (t.length > 40) return true;
-      return !NOISE_LINE_PATTERNS.some(rx => rx.test(t));
-    })
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  // 4. Cap per-source on a paragraph boundary if possible.
+  // Cap per-source on a paragraph boundary if possible.
   if (md.length > perSourceCharCap) {
     const slice = md.slice(0, perSourceCharCap);
     const lastBreak = slice.lastIndexOf('\n\n');
@@ -2536,7 +2717,7 @@ SLIDE 2
 [Creative title${ta.isRanking ? ' — start with rank number from Tier 1A' : ''}]
 [35-50 words — Tier 1A/1B facts only]
 
-...continue for all ${data.slideCount} slides...
+...continue numbering through SLIDE ${data.slideCount + 1}. The intro is SLIDE 1 and does NOT count toward the content total — produce EXACTLY ${data.slideCount} CONTENT slides (SLIDE 2 through SLIDE ${data.slideCount + 1}), for ${data.slideCount + 1} slides in total...
 
 SOURCES:
 [URL]: [What Tier 1A/1B facts came from this source]`;
@@ -2665,7 +2846,7 @@ function extractBatchContinuity(text: string): { titles: string[]; openings: str
   return { titles, openings };
 }
 
-export async function buildBatchUserPrompt(data: PromptData, spec: BatchSpec, priorBatchText = ''): Promise<string> {
+export async function buildBatchUserPrompt(data: PromptData, spec: BatchSpec, priorBatchText = ''): Promise<{ factBlock: string; assignment: string }> {
   const ta = data.titleAnalysis;
   const rangeEnd = spec.contentStart + spec.contentCount - 1;
   const wcRange = data.userWordCountOverride
@@ -2719,7 +2900,13 @@ OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
 ${[...new Set(openings)].join(', ') || '(none)'}`;
   }
 
-  return `${data.factContextBlock}
+  // Split into the cacheable fact block (identical across every batch of this
+  // article) and the per-batch assignment. The batched generation path puts a
+  // cache breakpoint on factBlock so batches 2..N read it instead of re-paying
+  // full input price. `assignment` keeps the leading blank line so
+  // factBlock + assignment reproduces the original single-string prompt verbatim.
+  const factBlock = data.factContextBlock;
+  const assignmentBlock = `
 
 ═══════════════════════════════════════════════════════════════
 BATCH ASSIGNMENT
@@ -2737,6 +2924,7 @@ CRITICAL REMINDERS:
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
 Write this batch now.`;
+  return { factBlock, assignment: assignmentBlock };
 }
 
 /** Read the entity-bearing title line out of a single SLIDE block. The first line
@@ -2917,14 +3105,25 @@ async function callClaudeStreaming(model: string, systemPrompt: string, userProm
   });
 }
 
-export async function generateWithClaude(systemPrompt: string, userPrompt: string, slideCount = 0): Promise<unknown> {
+export async function generateWithClaude(systemPrompt: string, userPrompt: string, slideCount = 0, cachedUserPrefix?: string): Promise<unknown> {
   const model = 'claude-sonnet-4-5-20250929';
   const useStreaming = slideCount > 30;
-  console.log(`[generateWithClaude] Calling model: ${model} (slideCount=${slideCount}, streaming=${useStreaming})`);
+  console.log(`[generateWithClaude] Calling model: ${model} (slideCount=${slideCount}, streaming=${useStreaming}, cachedPrefix=${!!cachedUserPrefix})`);
   try {
     if (useStreaming) {
-      return await callClaudeStreaming(model, systemPrompt, userPrompt);
+      // Streaming path (single-shot >30 slides) never receives a cached prefix; if one is
+      // ever passed, concatenate so the model sees the identical prompt.
+      return await callClaudeStreaming(model, systemPrompt, cachedUserPrefix ? cachedUserPrefix + userPrompt : userPrompt);
     }
+    // When a cachedUserPrefix is provided (batched path), send the user message as two
+    // blocks with a cache breakpoint after the fact DB. The fact DB is identical across
+    // batches of one article, so batches 2..N read it from cache instead of re-paying.
+    const userContent = cachedUserPrefix
+      ? [
+          { type: 'text', text: cachedUserPrefix, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: userPrompt },
+        ]
+      : userPrompt;
     const resp = await axios.post(
       VERCEL_GATEWAY_MESSAGES_URL,
       {
@@ -2932,7 +3131,7 @@ export async function generateWithClaude(systemPrompt: string, userPrompt: strin
         max_tokens: 7500,
         temperature: 0.3,
         system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-        messages: [{ role: 'user', content: userPrompt }],
+        messages: [{ role: 'user', content: userContent }],
       },
       {
         headers: {
@@ -3292,12 +3491,29 @@ export async function grokFactCheck(data: ClaimedData): Promise<unknown> {
   const tc = data.temporalContext;
   const systemContent = `You are a STRICT, COST-CONSCIOUS fact-checker for an MSN slideshow article.
 
-Web search is EXPENSIVE. You have access to web_search and x_search tools, but USE THEM SPARINGLY. Default to your training data and ONLY search when you genuinely cannot fully verify a claim from memory.
+Web search is EXPENSIVE. You have access to web_search and x_search tools, but USE THEM SPARINGLY. Verify each claim against the SOURCE FACT DATABASE (below) FIRST, then your training data, and ONLY web_search when a claim is covered by NEITHER and you genuinely cannot verify it from memory.
 
 This is the only step that emits numeric fact corrections. Style violations (em-dashes, banned phrases, etc.) are handled by a downstream audit step — DO NOT emit style patches here.
 
 ${tc.dateAnchor}
 ${tc.seasonAnchor}
+
+═══════════════════════════════════════════════════════════════
+SOURCE FACT DATABASE — PRE-VERIFIED, DO NOT RE-SEARCH
+═══════════════════════════════════════════════════════════════
+
+The article was written from the SOURCE FACT DATABASE provided in the user message
+(scraped source + upstream research). Those facts are ALREADY verified — treat them as
+authoritative and do NOT spend web searches re-confirming them:
+
+  • Article claim MATCHES a fact in the database   → VERIFIED, METHOD: SOURCE. No web search.
+  • Article claim CONTRADICTS the database         → INCORRECT; correct it to the database
+                                                      value via CORRECTION_FIND/CORRECTION_REPLACE. No web search.
+  • Article claim NOT covered by the database      → fall through to the protocol below
+                                                      (training triage first, web_search only if truly needed).
+
+Reserve your very limited web searches for time-sensitive or high-risk claims that the
+SOURCE FACT DATABASE does not cover at all.
 
 ═══════════════════════════════════════════════════════════════
 TWO-PHASE VERIFICATION PROTOCOL
@@ -3328,7 +3544,7 @@ PHASE 2 — SELECTIVE WEB SEARCH
 
 For each NEEDS_SEARCH claim ONLY, do ONE focused web search.
 
-HARD CAP: maximum 8 web_search calls total for this entire article. If you exceed
+HARD CAP: maximum 2 web_search calls total for this entire article. If you exceed
 the cap, prioritize the most prominent / most prominent-stat claims and mark the
 rest UNVERIFIABLE with METHOD: TRAINING.
 
@@ -3358,7 +3574,7 @@ OUTPUT FORMAT — EXACTLY THIS
 --- SLIDE [N]: [Entity Name] ---
 CLAIM 1: "[exact claim text from article]"
   STATUS: VERIFIED | INCORRECT | UNVERIFIABLE
-  METHOD: TRAINING | WEB_SEARCH
+  METHOD: SOURCE | TRAINING | WEB_SEARCH
   FOUND: [one short line — what your training or search shows]
   SOURCE: [URL if METHOD=WEB_SEARCH, else "training_data"]
   CORRECTION_FIND: [only if INCORRECT — copy the EXACT substring from the article that is wrong]
@@ -3373,7 +3589,7 @@ Total claims checked: [N]
 Verified: [N]
 Incorrect: [N]
 Unverifiable: [N]
-Web searches used: [N]/8
+Web searches used: [N]/2
 Verification rate: [X]%
 
 === END FACT CHECK ===
@@ -3396,9 +3612,13 @@ HARD RULES:
 - For factual corrections, use the CORRECTION_FIND/CORRECTION_REPLACE fields — the pipeline applies them as surgical find-and-replace automatically.
 - DO NOT emit style patches, em-dash fixes, or banned-phrase corrections — the audit step handles those.
 - Start output with === FACT CHECK ===.
-- Default to TRAINING for stable historical facts. Reserve WEB_SEARCH for time-sensitive
-  or low-confidence claims. Aim to keep web searches well under the 8-call cap.`;
-  const userContent = `Fact-check this MSN slideshow using the two-phase protocol.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nLast completed season: ${tc.lastSeason}\nCurrent/ongoing season: ${tc.currentSeason}\n\nPrimary Source URL: ${data.primarySourceUrl || 'Not provided'}\n\nARTICLE TO VERIFY\n\n${data.articleText}\n\nRun PHASE 1 first (training-data triage). ONLY call web_search for claims classified NEEDS_SEARCH, hard-capped at 8 calls. Output in the exact format specified, starting with === FACT CHECK ===.`;
+- Default to SOURCE (database) or TRAINING for stable facts. Reserve WEB_SEARCH for
+  time-sensitive or low-confidence claims the database does not cover. Keep web searches
+  at or under the 2-call cap.`;
+  // Pass the pre-verified atomized facts so Grok can confirm most claims against the
+  // database instead of web-searching them. Bounded to keep input cost in check.
+  const factDb = (data.factOnlyRepresentation || data.combinedFactRepresentation || '').slice(0, 8000);
+  const userContent = `Fact-check this MSN slideshow using the two-phase protocol.\n\nTitle: "${data.title}"\nCategory: ${data.category}\nLast completed season: ${tc.lastSeason}\nCurrent/ongoing season: ${tc.currentSeason}\n\nPrimary Source URL: ${data.primarySourceUrl || 'Not provided'}\n\nSOURCE FACT DATABASE (pre-verified — check claims against THIS before any web search):\n${factDb || '(none provided)'}\n\nARTICLE TO VERIFY\n\n${data.articleText}\n\nRun PHASE 1 first: verify each claim against the SOURCE FACT DATABASE, then training data. ONLY call web_search for claims covered by NEITHER and classified NEEDS_SEARCH, hard-capped at 2 calls. Output in the exact format specified, starting with === FACT CHECK ===.`;
 
   const grokResp = await callGrokWithFallback({
     systemContent,
@@ -3406,7 +3626,7 @@ HARD RULES:
     maxTokens: 7000,
     temperature: 0.0,
     timeout: 300_000,
-    tools: [{ type: 'web_search' }],
+    tools: [{ type: 'web_search', max_search_results: 5 }],
     label: 'grokFactCheck',
   });
   return grokResp;
@@ -4243,13 +4463,17 @@ export async function mergeSubjectiveResearch(
 
   const sourceList = citations.map((url, i) => `[${i + 1}] ${url}`).join('\n');
 
-  // Raw source excerpt for subjective voice/narrative context (2000-word cap)
-  const rawSourceExcerpt = primaryMarkdown
+  // Raw source excerpt for subjective voice/narrative context (2000-word cap).
+  // Run the same deep cleaner first so this block — which goes straight into the
+  // prompt — carries no comments/sidebars/ad-markup and benefits from the token
+  // savings (parity with the cleaned TIER 1A source the objective flow sends).
+  const cleanedPrimary = cleanSourceMarkdown(primaryMarkdown ?? '');
+  const rawSourceExcerpt = cleanedPrimary
     ? (() => {
-      const words = primaryMarkdown.split(/\s+/);
+      const words = cleanedPrimary.split(/\s+/);
       return words.length > 2000
         ? words.slice(0, 2000).join(' ') + '\n[truncated]'
-        : primaryMarkdown;
+        : cleanedPrimary;
     })()
     : '';
 
@@ -4456,7 +4680,7 @@ SLIDE 2
 [Creative title]
 [35-50 words]
 
-...continue for all slides...
+...continue numbering through SLIDE ${data.slideCount + 1}. The intro is SLIDE 1 and does NOT count toward the content total — produce EXACTLY ${data.slideCount} CONTENT slides (SLIDE 2 through SLIDE ${data.slideCount + 1}), for ${data.slideCount + 1} slides in total...
 
 SOURCES:
 [URL]: [what facts came from this source]
@@ -4594,7 +4818,7 @@ Count every word silently before outputting each slide (the count must NEVER app
 // ── Batched generation for large SUBJECTIVE articles (>25 slides) ─────────────
 // Mirrors the objective batch builder, with subjective voice/tone framing.
 // Reuses the shared extractBatchContinuity + stitchBatchedArticle helpers.
-export async function buildSubjectiveBatchUserPrompt(data: SubjectivePromptData, spec: BatchSpec, priorBatchText = ''): Promise<string> {
+export async function buildSubjectiveBatchUserPrompt(data: SubjectivePromptData, spec: BatchSpec, priorBatchText = ''): Promise<{ factBlock: string; assignment: string }> {
   const ta = data.titleAnalysis;
   const rangeEnd = spec.contentStart + spec.contentCount - 1;
   const wcRange = data.userWordCountOverride
@@ -4641,7 +4865,10 @@ OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
 ${[...new Set(openings)].join(', ') || '(none)'}`;
   }
 
-  return `${data.factContextBlock}
+  // Split into the cacheable fact block (identical across every batch of this
+  // article) and the per-batch assignment — see buildBatchUserPrompt for rationale.
+  const factBlock = data.factContextBlock;
+  const assignmentBlock = `
 
 ═══════════════════════════════════════════════════════════════
 BATCH ASSIGNMENT
@@ -4662,14 +4889,23 @@ CRITICAL REMINDERS:
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
 Write this batch now.`;
+  return { factBlock, assignment: assignmentBlock };
 }
 
 // ── S5. generateSubjectiveWithClaude (n8n: "Claude - Subjective Writer") ──────
 
-export async function generateSubjectiveWithClaude(systemPrompt: string, userPrompt: string): Promise<unknown> {
+export async function generateSubjectiveWithClaude(systemPrompt: string, userPrompt: string, cachedUserPrefix?: string): Promise<unknown> {
   const model = 'claude-sonnet-4-5-20250929';
-  console.log(`[generateSubjectiveWithClaude] Calling model: ${model}`);
+  console.log(`[generateSubjectiveWithClaude] Calling model: ${model} (cachedPrefix=${!!cachedUserPrefix})`);
   try {
+    // When a cachedUserPrefix is provided (batched path), send the user message as two
+    // blocks with a cache breakpoint after the fact DB so batches 2..N read it from cache.
+    const userContent = cachedUserPrefix
+      ? [
+          { type: 'text', text: cachedUserPrefix, cache_control: { type: 'ephemeral' } },
+          { type: 'text', text: userPrompt },
+        ]
+      : userPrompt;
     const resp = await axios.post(
       VERCEL_GATEWAY_MESSAGES_URL,
       {
@@ -4677,7 +4913,7 @@ export async function generateSubjectiveWithClaude(systemPrompt: string, userPro
         max_tokens: 5000,
         temperature: 0.4,
         system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-        messages: [{ role: 'user', content: userPrompt }],
+        messages: [{ role: 'user', content: userContent }],
       },
       {
         headers: {
@@ -5219,13 +5455,17 @@ export async function enrichSlides(
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 3500,
         temperature: 0,
-        system: ENRICHER_SYSTEM_PROMPT,
+        // Prompt caching enabled for parity with the other Claude nodes. NOTE: this
+        // static system prompt is ~1k tokens — below Haiku's 2048-token cache minimum —
+        // so the cache only actually engages if the prompt grows past that threshold.
+        system: [{ type: 'text', text: ENRICHER_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
         messages: [{ role: 'user', content: userPrompt }],
       },
       {
         headers: {
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'prompt-caching-2024-07-31',
           Authorization: `Bearer ${VERCEL_GATEWAY_KEY}`,
         },
         timeout: 60_000,
