@@ -614,58 +614,183 @@ function parseWordCountOverride(userContext: string): { min: number; max: number
   return undefined;
 }
 
-// parseMustIncludeItems — robust extraction of must-include items from any
-// user-supplied format: markdown tables, numbered/bulleted lists, plain lines,
-// or mixed. Strips source rank numbers, table formatting, header/separator
-// rows, and deduplicates by normalised entity name.
 // ─────────────────────────────────────────────────────────────────────────────
+// parseMustIncludeItems — robust extraction of must-include items from any
+// user-supplied format:
+//   • Structured slide specs  ("Slide 1: Title\nparagraph\n\nSlide 2: …")
+//   • Heading + paragraph blocks (blank-line separated, no explicit prefix)
+//   • Markdown / pipe tables
+//   • Tab-separated tables
+//   • Numbered / bulleted lists
+//   • Comma-separated lists
+//   • Plain lines
+//   • Any mix of the above with emoji section headers and instruction lines
+//
+// The function auto-detects which format the input is in and extracts clean
+// item headings.  Structured-block detection runs FIRST — if the input looks
+// like heading+paragraph groups, only the headings are extracted (the body
+// paragraphs are guidance, not separate mandatory items).  This prevents
+// sentences from being fragmented at commas into dozens of spurious items.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Matches "Slide 1:", "Part 2.", "Section 3)", "Topic 4 -", "Item 5:", etc.
+// Broad enough to catch any writer-invented heading prefix with a number.
+const HEADING_PREFIX_RE = /^(?:slide|part|section|chapter|item|entry|topic|point)\s+\d+\s*[:.)–—-]\s*/i;
+// Standard list markers: "1.", "1)", "#1", "- ", "* ", "•"
+const LIST_MARKER_RE = /^(\d{1,3}[.)]\s*|#\d+[.):]?\s*|[-*•]\s+)/;
+// Emoji section-header detection — \p{Emoji_Presentation} avoids false-
+// positives on ASCII digits 0-9 (which are in the broader \p{Emoji} set
+// because they form keycap sequences like 4️⃣).
+const EMOJI_HEADER_RE = /^\p{Emoji_Presentation}/u;
+// Instruction-only lines that direct the model, not content to include.
+const INSTRUCTION_RE = /^(use\s+the\s+following|avoid\s|focus\s+on\s|go\s+through\s|do\s+not\s|don['']t\s|make\s+sure|ensure\s+|remember\s+to|please\s+|note\s*:|important\s*:)/i;
+
+/** Split raw text into groups separated by blank lines. */
+function splitIntoBlocks(raw: string): string[][] {
+  const blocks: string[][] = [];
+  let current: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (current.length) { blocks.push(current); current = []; }
+    } else {
+      current.push(trimmed);
+    }
+  }
+  if (current.length) blocks.push(current);
+  return blocks;
+}
+
+/** True if a line is purely decorative / organisational (not a content item). */
+function isSkippableLine(line: string): boolean {
+  if (EMOJI_HEADER_RE.test(line) && !/[.!?]$/.test(line)) return true;
+  if (INSTRUCTION_RE.test(line)) return true;
+  return false;
+}
+
+/**
+ * Strip any leading heading prefix from a line.
+ * "Slide 1: Present-day fitness snapshot" → "Present-day fitness snapshot"
+ * "3) Core stability emphasis"            → "Core stability emphasis"
+ */
+function stripHeadingPrefix(line: string): string {
+  return line
+    .replace(HEADING_PREFIX_RE, '')
+    .replace(LIST_MARKER_RE, '')
+    .trim();
+}
+
+/**
+ * Structured-block extractor: for each blank-line-separated block, find the
+ * heading line (first non-skippable line) and return it as the item.
+ * Body paragraphs are discarded — they're writer guidance, not item names.
+ */
+function extractStructuredHeadings(blocks: string[][]): string[] {
+  const items: string[] = [];
+  for (const block of blocks) {
+    // Find the heading — first non-skippable line in the block
+    let heading: string | null = null;
+    for (const line of block) {
+      if (isSkippableLine(line)) continue;
+      heading = line;
+      break;
+    }
+    if (!heading) continue;
+
+    heading = stripHeadingPrefix(heading);
+
+    // Re-check after stripping — might still be skippable
+    if (!heading || heading.length <= 2) continue;
+    if (isSkippableLine(heading)) continue;
+
+    items.push(heading);
+  }
+  return items;
+}
+
+/**
+ * Heading-marker splitter: when the input has NO blank-line separation but
+ * contains ≥3 recognisable heading markers, split on those markers and
+ * treat each as an item.  Body text between markers is discarded.
+ *
+ * Handles:
+ *   Slide 1: Title A\nbody...\nSlide 2: Title B\nbody...
+ *   1. Title A\nbody...\n2. Title B\nbody...
+ */
+function extractByHeadingMarkers(lines: string[]): string[] {
+  const items: string[] = [];
+  for (const line of lines) {
+    // Only extract lines that start with a heading marker
+    if (HEADING_PREFIX_RE.test(line) || /^\d{1,3}[.)]\s+\S/.test(line)) {
+      const cleaned = stripHeadingPrefix(line);
+      if (cleaned.length > 2 && !isSkippableLine(cleaned)) {
+        items.push(cleaned);
+      }
+    }
+    // Non-heading lines (body paragraphs) are silently dropped
+  }
+  return items;
+}
 
 function parseMustIncludeItems(raw: string): string[] {
   if (!raw || !raw.trim()) return [];
 
-  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const allLines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-  // Detect if this is a markdown/pipe table: 2+ lines contain at least 2 pipes
-  const pipeLines = lines.filter(l => (l.match(/\|/g) ?? []).length >= 2);
+  // ── Phase 0: Detect structured heading+paragraph input ───────────────
+  // Writers often submit full slide specs with headings and body paragraphs.
+  // If we don't detect this, the comma-splitter shatters sentences into
+  // junk items like "curls", "dairy", "vegetables".
+  //
+  // Strategy A: blank-line-separated blocks (most common structured format)
+  const blocks = splitIntoBlocks(raw);
+  const multiLineBlocks = blocks.filter(b => b.length > 1);
+  if (multiLineBlocks.length >= 3) {
+    return deduplicateItems(extractStructuredHeadings(blocks));
+  }
+
+  // Strategy B: heading markers in a single dense block (no blank lines)
+  // Count lines that look like heading markers (Slide N:, Part N:, 1., etc.)
+  const headingMarkerLines = allLines.filter(l =>
+    HEADING_PREFIX_RE.test(l) || (/^\d{1,3}[.)]\s+\S/.test(l) && l.split(/\s+/).length <= 12),
+  );
+  // If ≥3 heading markers exist AND there are also non-heading body lines
+  // between them, this is structured content without blank-line separation.
+  if (headingMarkerLines.length >= 3 && allLines.length > headingMarkerLines.length * 1.5) {
+    return deduplicateItems(extractByHeadingMarkers(allLines));
+  }
+
+  // ── Phase 1: Table detection (pipe or TSV) ───────────────────────────
+  const pipeLines = allLines.filter(l => (l.match(/\|/g) ?? []).length >= 2);
   const isTable = pipeLines.length >= 2;
 
-  // Detect tab-separated table: 2+ lines contain 2+ tab characters
-  const tabLines = lines.filter(l => (l.match(/\t/g) ?? []).length >= 2);
+  const tabLines = allLines.filter(l => (l.match(/\t/g) ?? []).length >= 2);
   const isTsv = !isTable && tabLines.length >= 2;
 
   const extracted: string[] = [];
 
   if (isTable) {
-    for (const line of lines) {
+    for (const line of allLines) {
       // Skip separator rows: | -- | --- | etc.
       if (/^\|[\s\-:|]+\|$/.test(line)) continue;
 
-      // Split pipe-delimited cells
       const cells = line.split('|').map(c => c.trim()).filter(Boolean);
       if (cells.length < 2) continue;
 
-      // Skip header rows: detect by checking if first cell is a common header
-      // keyword or if all cells look like column headers (no digits in any cell)
       const firstLower = cells[0].toLowerCase();
       if (/^(#|rank|no\.?|number|pos\.?|position|sr\.?)$/i.test(firstLower)) continue;
       if (cells.every(c => /^[a-z\s.()\/&]+$/i.test(c) && !/\d{4}/.test(c) && c.length < 30)) continue;
 
-      // Try to identify: rank-number cell, name cell(s), and optional context cells
-      // The first cell that's purely numeric (or #N) is the source rank — skip it
       let nameParts: string[] = [];
       let contextParts: string[] = [];
       let seenName = false;
 
       for (const cell of cells) {
-        // Pure rank number — skip
         if (/^\d{1,3}$/.test(cell) || /^#\d+$/.test(cell)) continue;
-
-        // Year-only cell (e.g. "1993", "1985–1990") → context
         if (/^\d{4}(\s*[–\-]\s*\d{4})?$/.test(cell)) {
           contextParts.push(cell);
           continue;
         }
-
         if (!seenName) {
           nameParts.push(cell);
           seenName = true;
@@ -675,15 +800,13 @@ function parseMustIncludeItems(raw: string): string[] {
       }
 
       if (nameParts.length === 0) continue;
-
-      // Build a clean item string: "Name — Context1, Context2" or just "Name"
       const name = nameParts.join(' ').trim();
       const context = contextParts.filter(c => c.length > 0).join(', ').trim();
       const item = context ? `${name} — ${context}` : name;
       if (item.length > 2) extracted.push(item);
     }
   } else if (isTsv) {
-    for (const line of lines) {
+    for (const line of allLines) {
       if (/^[\s\-=:]+$/.test(line.replace(/\t/g, ''))) continue;
       const cols = line.split('\t').map(c => c.trim()).filter(Boolean);
       if (cols.length < 2) continue;
@@ -697,20 +820,13 @@ function parseMustIncludeItems(raw: string): string[] {
       if (name.length > 2) extracted.push(name);
     }
   } else {
-    // Non-table: numbered list, bulleted list, comma-separated, or plain lines.
-    // Handles any mix: "1. A, 2. B", "A\nB\nC", "1. A 2. B 3. C" (no delimiter),
-    // or single-word items like "Sektori, Dispatch, BALL x PIT".
-    for (const line of lines) {
-      // Strip leading list marker: "1.", "1)", "#1", "- ", "* ", "•"
-      let cleaned = line
-        .replace(/^(\d{1,3}[.)]\s*|#\d+[.):]?\s*|[-*•]\s+)/, '')
-        .trim();
-
+    // ── Phase 2: Flat list (numbered, bulleted, comma-separated, plain) ──
+    for (const line of allLines) {
+      let cleaned = line.replace(LIST_MARKER_RE, '').trim();
       if (!cleaned) continue;
 
-      // ── Inline-numbered items on one line ──────────────────────────────
-      // Catches "Game A 2. Game B 3. Game C" or "Game A, 2. Game B, 3. Game C"
-      // after the leading "1." was already stripped above.
+      // Inline-numbered items on one line:
+      // "Game A 2. Game B 3. Game C" after leading "1." was stripped
       const numberedParts = cleaned.split(/,?\s+(?=\d{1,3}[.)]\s|#\d+\s)/);
       if (numberedParts.length >= 2) {
         for (const part of numberedParts) {
@@ -724,10 +840,7 @@ function parseMustIncludeItems(raw: string): string[] {
         continue;
       }
 
-      // ── Comma-separated items ──────────────────────────────────────────
-      // Split on commas (but not commas inside parentheses).
-      // 3+ parts = always a list. 2 parts = only split if both have 2+ words
-      // (avoids false splits like "Game Title, 2025").
+      // Comma-separated items (but not commas inside parentheses).
       const commaParts = cleaned.split(/,(?!\d{3}(?:\D|$))(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
       if (commaParts.length >= 3 ||
         (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2))) {
@@ -737,45 +850,48 @@ function parseMustIncludeItems(raw: string): string[] {
         continue;
       }
 
-      // ── Single item ────────────────────────────────────────────────────
+      // Single item
       if (cleaned.length > 2) extracted.push(stripLeadingRank(cleaned));
     }
   }
 
-  // Deduplicate by normalised form (preserves first-occurrence order).
-  //
+  // ── Phase 3: Sanitise all extracted items ─────────────────────────────
+  const sanitised: string[] = [];
+  for (const item of extracted) {
+    let cleaned = stripHeadingPrefix(item);
+    if (!cleaned || cleaned.length <= 2) continue;
+    if (isSkippableLine(cleaned)) continue;
+    sanitised.push(cleaned);
+  }
+
+  return deduplicateItems(sanitised);
+}
+
+/** Deduplicate items by normalised form (preserves first-occurrence order). */
+function deduplicateItems(items: string[]): string[] {
   // We strip parentheticals that are ALIASES (no digits) — e.g. "Player (QB)" vs
   // "Player (Quarterback)" should merge. But we KEEP parentheticals that contain
   // DIGITS — e.g. "Mark McGwire (70 HR, 1998)" vs "Mark McGwire (65 HR, 1999)" are
-  // distinct rows in an "every season" list and must NOT collapse. Same entity,
-  // different qualifying year/stat = different item.
-  //
-  // We also fold trailing digit-bearing context that sits OUTSIDE parentheses
-  // into the key (e.g. "Mark Martin — 49 wins" vs "Mark Martin — 1 win"), so
-  // dash/colon-delimited stat suffixes keep otherwise-identical names separate.
+  // distinct rows and must NOT collapse.
   const normalizeForDedup = (raw: string): string => {
     let s = raw.toLowerCase();
-    // Strip ONLY digit-free parentheticals (true aliases); keep digit-bearing ones.
     s = s.replace(/\s*\(([^()]*)\)\s*/g, (full, inner) =>
       /\d/.test(inner) ? ` (${String(inner).trim()}) ` : ' ',
     );
-    // Normalise dash variants and whitespace so spacing/punctuation don't create
-    // false distinctions.
     s = s.replace(/[—–-]/g, '-').replace(/\s+/g, ' ').trim();
     return s;
   };
 
   const seen = new Set<string>();
   const deduped: string[] = [];
-  for (const item of extracted) {
+  for (const item of items) {
     const norm = normalizeForDedup(item);
-    if (norm.length === 0) continue;            // nothing meaningful left → skip
+    if (norm.length === 0) continue;
     if (!seen.has(norm)) {
       seen.add(norm);
       deduped.push(item);
     }
   }
-
   return deduped;
 }
 

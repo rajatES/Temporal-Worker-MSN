@@ -274,6 +274,18 @@ type ParsedSlide = { slideNum: number; title: string; body: string };
 //  - Trailing colon:  "SLIDE 5:"
 //  - Missing SOURCES section (just stop at end of text)
 //  - Empty body (slide is still emitted so the count is accurate)
+// Cleans residual "Slide N:" prefixes and emoji section headers from parsed
+// slide content. These artefacts originate in writer mustInclude input — the
+// primary sanitisation happens in parseMustIncludeItems (activities.ts), but
+// this acts as a safety net for anything the LLM echoes back despite prompting.
+function cleanSlideText(t: string): string {
+  // Strip "Slide N:" / "Slide N." / "Slide N)" prefix (any case)
+  let s = t.replace(/^[Ss][Ll][Ii][Dd][Ee]\s+\d+\s*[:.)]\s*/, '').trim();
+  // Strip leading emoji section labels (e.g. "🥗 OLD DIET APPROACH (EARLIER YEARS)")
+  s = s.replace(/^\p{Emoji_Presentation}️?\s*/u, '').trim();
+  return s;
+}
+
 function parseSlides(text: string): ParsedSlide[] {
   const result: ParsedSlide[] = [];
   let num: number | null = null;
@@ -286,11 +298,13 @@ function parseSlides(text: string): ParsedSlide[] {
     // Strip markdown wrappers (**, leading #, trailing colon) so the matcher
     // works on Claude's clean output AND Grok's rewrap variations.
     const t = rawLine.trim().replace(/\*\*/g, '').replace(/^#+\s*/, '').trim();
-    const m = t.match(/^SLIDE\s*(\d+)\s*:?\s*(.*)$/i);
+    // SLIDE marker must be uppercase — prevents "Slide N: Title" mustInclude headings
+    // from being misidentified as new slide markers (they share the same "Slide N:" format).
+    const m = t.match(/^SLIDE\s*(\d+)\s*:?\s*(.*)$/);
     if (m) {
       flush();
       num = parseInt(m[1], 10);
-      ttl = m[2].trim();             // captures inline title if present
+      ttl = cleanSlideText(m[2].trim());
       bdy = '';
       continue;
     }
@@ -298,7 +312,12 @@ function parseSlides(text: string): ParsedSlide[] {
     if (!t) continue;
     if (t.startsWith('SOURCES')) break;       // end of article body
     if (t.startsWith('META:')) continue;       // META lines never belong to a slide
-    if (!ttl) ttl = t;
+    // Skip emoji-only section headers (structural dividers, not content).
+    // Use Emoji_Presentation — plain \p{Emoji} matches ASCII digits 0-9/#/*
+    // (they're emoji keycap bases), which would false-positive on titles like
+    // "40s–50s maintenance phase".
+    if (/^\p{Emoji_Presentation}/u.test(t) && !/[.!?]/.test(t)) continue;
+    if (!ttl) ttl = cleanSlideText(t);
     else bdy += (bdy ? ' ' : '') + t;
   }
   flush();
