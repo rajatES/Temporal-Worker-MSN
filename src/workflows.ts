@@ -376,8 +376,21 @@ function buildWorkflowResult(
     metaDescription,
     // Editorial rule: the intro slide title mirrors the slideshow title exactly.
     // The model's creative intro headline is discarded; only its body is kept.
-    introSlide: introSlide ? { title: final.title, body: introSlide.body } : null,
-    description: metaDescription || introSlide?.body || '',
+    //
+    // Fallback priority for the intro body (each tier used only when the
+    // previous one is empty):
+    //   1. introSlide.body       — real parsed body (ideal)
+    //   2. metaDescription       — META line teaser; a concise alternative
+    //                              when the body paragraph was not written
+    //   3. introSlide.title      — recovery for when Claude writes the body
+    //                              paragraph as the first line after SLIDE 1
+    //                              with no separate heading; parseSlides puts
+    //                              that paragraph into `title` and `body`
+    //                              ends up empty
+    introSlide: introSlide
+      ? { title: final.title, body: introSlide.body || metaDescription || introSlide.title }
+      : null,
+    description: metaDescription || introSlide?.body || introSlide?.title || '',
     keywords: final.category,
     slides: enrichedContentSlides,
     author: final.writerName,
