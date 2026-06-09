@@ -2742,7 +2742,8 @@ INTRO SLIDE (Slide 1) — MAX 60 WORDS
 
 Your intro MUST:
 - Create CURIOSITY — make readers NEED to scroll
-- Include ONE surprising fact from Tier 1A or 1B tied to the theme
+- Reveal AT MOST ONE specific data point that also appears in the content slides — this is your single "hook" stat. Pick the most striking one and use it once.
+- Build the rest of the intro from THEMATIC / CONTEXTUAL framing about the topic — the broader trend, the stakes, why this matters, the season's backdrop. This framing should relate to the slideshow's subject WITHOUT being the core per-slide facts.
 - Hint at what's coming WITHOUT naming specific items
 - End with forward momentum
 - Talk about something the title is promising
@@ -2751,13 +2752,15 @@ Your intro MUST:
 Your intro must NOT:
 - Name any items from the list
 - Reveal the #1 pick or any rankings
+- Preview MORE THAN ONE of the specific facts (exact distances, velocities, dates, totals, scores) that belong to individual content slides — those numbers are each slide's payoff; do not give them away up front
+- Stack multiple slide stats together (e.g. two or more exact numbers pulled from different list items)
 - Use "let's dive in" / "here are" / "we'll explore"
 - Use a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
 - Use generic openers ("Since the dawn of...", "In today's world...")
 - Paraphrase the title anywhere
 - Have generic background that assumes reader ignorance
 - Stack adjectives without information backing them
-- Use any fact not present in Tier 1A or 1B
+- Invent a hard stat that is not present in Tier 1A or 1B (thematic framing is fine; fabricated numbers are not)
 
 ═══════════════════════════════════════════════════════════════
 WRITING VOICE — THE SPICY WRITER FACTOR
@@ -2939,7 +2942,7 @@ META: [Max 120 characters]
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[Max 60 words — Tier 1A/1B facts only]
+[Max 60 words — at most ONE core slide stat as the hook; rest is thematic/contextual framing; no items named, no invented stats]
 
 SLIDE 2
 [Creative title${ta.isRanking ? ' — start with rank number from Tier 1A' : ''}]
@@ -3594,15 +3597,23 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   }
   if (plagScore > 20) warnings.push(`Potential plagiarism: ${plagMatches.length} phrase matches`);
 
-  // Intro spoiler check — intro should not name list items
+  // Intro stat-leak check — the intro should reveal AT MOST ONE specific data
+  // point that belongs to the content slides; the rest should be thematic
+  // framing. Count distinct numeric stat tokens in the intro body; >1 means it
+  // is stacking core slide facts up front instead of teasing.
+  // (Named-item spoiler detection is intentionally left to human review.)
   const introSlide = slides.find(s => s.slideNum === 1);
-  if (introSlide && data.atomizedFacts && data.atomizedFacts.length > 0) {
-    const introLower = introSlide.body.toLowerCase();
-    const itemNames = data.atomizedFacts
-      .map(f => f.itemName.toLowerCase().split(' ')[0])
-      .filter(n => n.length > 3);
-    const spoilers = [...new Set(itemNames.filter(name => introLower.includes(name)))];
-    if (spoilers.length > 0) warnings.push(`Intro may spoil items: ${spoilers.join(', ')}`);
+  if (introSlide) {
+    const introStats = (introSlide.body.match(
+      /\d+(?:,\d{3})*(?:\.\d+)?\s*(?:mph|ft|feet|yards?|points?|touchdowns?|home runs?|RBIs?|°|degrees?|%)?/gi,
+    ) || []).map(s => s.trim())
+      // Drop bare 4-digit years (e.g. "2026") — a season/year reference is
+      // thematic framing, not one of the slideshow's per-slide payoff stats.
+      .filter(s => /\d/.test(s) && !/^(?:19|20)\d{2}$/.test(s));
+    const distinctIntroStats = [...new Set(introStats.map(s => s.toLowerCase()))];
+    if (distinctIntroStats.length > 1) {
+      warnings.push(`Intro stacks ${distinctIntroStats.length} stats (max 1 hook stat): ${distinctIntroStats.slice(0, 4).join(', ')}`);
+    }
   }
 
   // Stat provenance — check how many article stats appear in the user source
@@ -4929,7 +4940,8 @@ INTRO SLIDE (Slide 1) — MAX 60 WORDS
 
 Your intro MUST:
 - Create CURIOSITY — make readers NEED to scroll
-- Include ONE surprising fact from Tier 1A or 1B tied to the theme
+- Reveal AT MOST ONE specific data point that also appears in the content slides — this is your single "hook" stat. Pick the most striking one and use it once.
+- Build the rest of the intro from THEMATIC / CONTEXTUAL framing about the topic — the broader trend, the stakes, why this matters, the season's backdrop. This framing should relate to the slideshow's subject WITHOUT being the core per-slide facts.
 - Hint at what's coming WITHOUT naming specific items
 - End with forward momentum
 - Talk about something the title is promising
@@ -4938,13 +4950,15 @@ Your intro MUST:
 Your intro must NOT:
 - Name any items from the list
 - Reveal the #1 pick or any rankings
+- Preview MORE THAN ONE of the specific facts (exact distances, velocities, dates, totals, scores) that belong to individual content slides — those numbers are each slide's payoff; do not give them away up front
+- Stack multiple slide stats together (e.g. two or more exact numbers pulled from different list items)
 - Use "let's dive in" / "here are" / "we'll explore"
 - Use a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
 - Use generic openers ("Since the dawn of...", "In today's world...")
 - Paraphrase the title anywhere
 - Have generic background that assumes reader ignorance
 - Stack adjectives without information backing them
-- Use any fact not present in Tier 1A or 1B
+- Invent a hard stat that is not present in Tier 1A or 1B (thematic framing is fine; fabricated numbers are not)
 
 ═══════════════════════════════════════════════════════════════
 TITLE-BODY CORRELATION — HIGHEST PRIORITY
