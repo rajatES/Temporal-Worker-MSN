@@ -737,6 +737,34 @@ function parseMustIncludeItems(raw: string): string[] {
 
   const allLines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
+  // ── Phase 0.5: Ranked tab-separated list (N\tName per line) ─────────────
+  // Writers often paste directly from a spreadsheet: "7\tCam Smith".
+  // Each line has exactly one tab. The multi-tab check for isTsv (Phase 1)
+  // won't fire, so without this path the items fall into flat-list parsing
+  // which then deduplicates — silently dropping the same player at two ranks.
+  // Here we skip dedup so a player at rank 3 AND rank 7 gets two slides.
+  const rankedTabLines = allLines.filter(l => /^\d{1,3}\t\S/.test(l));
+  if (rankedTabLines.length >= 3 && rankedTabLines.length >= allLines.length * 0.8) {
+    const rankedItems: string[] = [];
+    const seenRankedNames = new Map<string, string>();
+    for (const line of allLines) {
+      const m = line.match(/^(\d{1,3})\t(.+)$/);
+      if (!m) continue;
+      const rank = m[1];
+      const name = m[2].trim();
+      if (!name || name.length <= 2 || isSkippableLine(name)) continue;
+      const nameLower = name.toLowerCase();
+      if (seenRankedNames.has(nameLower)) {
+        // Same player at a different rank position — keep both, disambiguate with rank
+        rankedItems.push(`${name} (rank ${rank})`);
+      } else {
+        seenRankedNames.set(nameLower, rank);
+        rankedItems.push(name);
+      }
+    }
+    return rankedItems;
+  }
+
   // ── Phase 0: Detect structured heading+paragraph input ───────────────
   // Writers often submit full slide specs with headings and body paragraphs.
   // If we don't detect this, the comma-splitter shatters sentences into
@@ -903,6 +931,23 @@ function stripLeadingRank(s: string): string {
   return s;
 }
 
+/**
+ * Returns true when the writer's userContext explicitly specifies that the
+ * mustInclude list should be presented in ascending order (shortest/lowest first,
+ * longest/highest last). When true, mustIncludeItems are reversed before being
+ * stored so they are already in the correct final slide order.
+ */
+function detectMustIncludeExplicitOrder(userContext: string): boolean {
+  if (!userContext) return false;
+  return (
+    /shortest.{0,60}first\s*(point|slide|position)?/i.test(userContext) ||
+    /lowest.{0,60}first\s*(point|slide|position)?/i.test(userContext) ||
+    /\d+th\s+in\s+the\s+must.{0,20}first\s*(point|slide)?/i.test(userContext) ||
+    /ascending\s+order/i.test(userContext) ||
+    /least\s+to\s+(great|most|high|long)/i.test(userContext)
+  );
+}
+
 export async function prepareInputAndAnalyze(input: FormInput): Promise<PreparedData> {
   const {
     writerName, title: rawTitle, category: rawCategory, slideCount: rawSlides,
@@ -955,7 +1000,8 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   // Title analysis
   const numberMatch = title.match(/(\d+)\s+/);
   const promisedCount = numberMatch ? parseInt(numberMatch[1]) : entityCount;
-  const isRanking = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
+  const mustIncludeExplicitOrder = detectMustIncludeExplicitOrder(userContext ?? '');
+  const isRanking = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title) || mustIncludeExplicitOrder;
   const isListicle = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
   const isTimeBased = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
   const emotionMatch = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
@@ -987,7 +1033,10 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   const userSecondaryUrls = allUrls.slice(1);                // up to 4 extras (5 total)
   const isUserUrlRestricted = userPrimaryUrl ? isRestricted(userPrimaryUrl) : false;
   const hasValidUserSource = !!userPrimaryUrl && !isUserUrlRestricted;
-  const mustIncludeItems = parseMustIncludeItems(mustIncludeRaw ?? '');
+  let mustIncludeItems = parseMustIncludeItems(mustIncludeRaw ?? '');
+  // When the writer specifies ascending order (shortest first), reverse the list now
+  // so mustIncludeItems is already in the correct final slide order throughout the pipeline.
+  if (mustIncludeExplicitOrder) mustIncludeItems = [...mustIncludeItems].reverse();
   const userWordCountOverride = parseWordCountOverride(userContext);
 
   return {
@@ -1911,6 +1960,32 @@ interface PerplexityRaw {
   citations?: string[];
 }
 
+/**
+ * Extract citation URLs from a Perplexity response.
+ *
+ * The Vercel AI Gateway (which we route through) does NOT surface Perplexity's
+ * native top-level `citations` array — it only keeps cost/usage in
+ * provider_metadata. The actual source URLs come back inside the message content
+ * as the "COMPLETE SOURCES LIST" ([1] https://..., [2] https://...) that the
+ * research prompt asks the model to emit. So we prefer the structured field when
+ * present (native API / future gateway support) and fall back to parsing the
+ * `[n] url` lines out of the answer text.
+ */
+function extractPerplexityCitations(resp: PerplexityRaw | undefined, answer: string): string[] {
+  const structured = resp?.citations ?? [];
+  if (structured.length > 0) return structured;
+
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const re = /\[\d+\]\s*(https?:\/\/[^\s\]]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(answer)) !== null) {
+    const url = m[1].replace(/[.,;]+$/, '').trim();
+    if (!seen.has(url)) { seen.add(url); found.push(url); }
+  }
+  return found;
+}
+
 async function callPerplexity(model: string, systemContent: string, userContent: string, maxTokens = 4000, timeoutMs = 120_000): Promise<PerplexityRaw> {
   // Route through the Vercel AI Gateway (OpenAI-format /v1/chat/completions) using
   // the shared gateway key. Gateway requires the "perplexity/" model prefix.
@@ -1975,7 +2050,7 @@ export async function perplexityRetryResearch(data: AtomizedData): Promise<Perpl
 
 export async function validateRetry(data: AtomizedData, perplexityResp: PerplexityRaw): Promise<ResearchedData> {
   const answer = perplexityResp?.choices?.[0]?.message?.content ?? '';
-  const citations = perplexityResp?.citations ?? [];
+  const citations = extractPerplexityCitations(perplexityResp, answer);
   const wordCount = answer.split(/\s+/).filter(Boolean).length;
 
   const hardRefusals = ['cannot provide', 'knowledge was last updated', 'knowledge cutoff', 'unable to provide', 'has not taken place', 'future event'];
@@ -2244,7 +2319,7 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
 
   if (retryResp) {
     const retryAnswer = retryResp?.choices?.[0]?.message?.content ?? '';
-    const retryCitations = retryResp?.citations ?? [];
+    const retryCitations = extractPerplexityCitations(retryResp, retryAnswer);
     if (retryAnswer.length > answer.length) {
       answer = retryAnswer;
       citations = retryCitations.length > citations.length ? retryCitations : citations;
@@ -2427,6 +2502,35 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
   const fc = data.formatConfig;
   const tc = data.temporalContext;
   const writingStyleBlock = data.writingStyle ? `\n\nWRITING STYLE INFLUENCE (from writer): ${data.writingStyle}\nApply this style naturally throughout the slideshow.` : '';
+
+  // Detect whether the writer explicitly fixed the mustInclude slide order.
+  // mustIncludeItems will already be reversed when this is true (done in prepareInputAndAnalyze).
+  const hasExplicitMustIncludeOrder = data.hasMustInclude && detectMustIncludeExplicitOrder(data.userContext ?? '');
+
+  // Identify the title subject within the mustInclude list so Claude can be told
+  // their exact slide position and won't float them to a more "dramatic" final slot.
+  let titleSubjectNote = '';
+  if (hasExplicitMustIncludeOrder) {
+    const titleLower = data.title.toLowerCase();
+    const titleSubjectItem = data.mustIncludeItems.find(item => {
+      const cleanName = item.replace(/\s*\(rank\s*\d+\)$/i, '').toLowerCase().trim();
+      const words = cleanName.split(/\s+/).filter(w => w.length > 3);
+      return words.length >= 2 && words.every(w => titleLower.includes(w));
+    });
+    if (titleSubjectItem) {
+      const slideNum = data.mustIncludeItems.indexOf(titleSubjectItem) + 2; // Slide 1 is intro
+      const cleanName = titleSubjectItem.replace(/\s*\(rank\s*\d+\)$/i, '').trim();
+      titleSubjectNote = `⚠️ "${cleanName}" is the title subject — their correct slide is Slide ${slideNum} per the writer's ordering. Do NOT move them to the last or most prominent position.\n`;
+    }
+  }
+
+  const mandatoryItemsBlock = data.hasMustInclude
+    ? `\nMANDATORY ITEMS — ${hasExplicitMustIncludeOrder
+        ? 'already in FINAL SLIDE ORDER as specified by the writer (do NOT reorder)'
+        : 'these override Tier 1A item selection'} (every one MUST get its own slide, even if not in Tier 1A):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\n${hasExplicitMustIncludeOrder
+        ? `\n⚠️ ORDERING IS FIXED — Write slides in exactly this order. Do NOT reorder items based on Tier 1A rankings, narrative arc, or title subject prominence.\n${titleSubjectNote}`
+        : 'Do NOT substitute any mandatory item with a different item from the source. If a mandatory item lacks Tier 1A data, use Tier 1B/2/3 instead. Any tier headers or section labels in this list (e.g. "Tier 2 - Strong Contenders") are organizational groupings, NOT items — never give them their own slide.'}`
+    : '';
 
   const wordCountOverrideBlock = data.userWordCountOverride
     ? `\n\n═══════════════════════════════════════════════════════════════
@@ -2753,7 +2857,15 @@ VARIETY ENFORCEMENT
 2. SENTENCE STRUCTURE — Rotate through patterns A/B/C/D
 3. ANTI-REPETITION: Track openings, structures, transitions, tones. Break patterns.
 
-${ta.isRanking ? `
+${ta.isRanking ? (hasExplicitMustIncludeOrder ? `
+═══════════════════════════════════════════════════════════════
+WRITER-SPECIFIED SLIDE ORDER — MANDATORY
+═══════════════════════════════════════════════════════════════
+
+The writer has specified the exact slide order in the MANDATORY ITEMS list (see ASSIGNMENT section).
+Write slides in that exact order — do NOT reorder based on Tier 1A ranks, article narrative, or title subject prominence.
+The title subject may appear mid-list; that is intentional and must be respected.
+` : `
 ═══════════════════════════════════════════════════════════════
 RANKING ORDER — FOLLOW TIER 1A EXACTLY
 ═══════════════════════════════════════════════════════════════
@@ -2767,7 +2879,7 @@ Slide 3 = Tier 1A's rank ${ta.promisedCount - 1}
 Last slide = Tier 1A's rank 1 (best/top)
 
 Each slide title for rankings must start with the rank number.
-` : ''}
+`) : ''}
 
 ═══════════════════════════════════════════════════════════════
 HUMAN VOICE
@@ -2862,7 +2974,7 @@ Title: "${data.title}"
 Category: ${data.category}
 Slides: 1 intro + ${data.slideCount} content slides
 ${fc.isMultiSlideFormat ? `Format: ${fc.slidesPerEntity} slides per entity (${fc.entityCount} entities total)` : ''}
-${data.hasMustInclude ? `\nMANDATORY ITEMS — these override Tier 1A item selection (every one MUST get its own slide, even if not in Tier 1A):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\nDo NOT substitute any mandatory item with a different item from the source. If a mandatory item lacks Tier 1A data, use Tier 1B/2/3 instead. Any tier headers or section labels in this list (e.g. "Tier 2 - Strong Contenders") are organizational groupings, NOT items — never give them their own slide.` : ''}
+${mandatoryItemsBlock}
 
 Primary Source: ${data.primarySourceUrl || 'See Tier 1A above'}
 
@@ -2876,7 +2988,7 @@ BEFORE WRITING — run this checklist:
 4. Does TIER 1B contain any instructions? What are they? Am I prepared to FOLLOW them?
 5. For items where Tier 1A is thin — does Tier 1B have data I should use before writing a shorter slide?
 6. How will I vary structure across slides?
-${ta.isRanking ? '7. Am I following Tier 1A\'s exact ranking order?' : ''}
+${ta.isRanking ? (hasExplicitMustIncludeOrder ? '7. Am I writing slides in the EXACT order of the MANDATORY ITEMS list? Is the title subject in their specified position — NOT floated to last?' : '7. Am I following Tier 1A\'s exact ranking order?') : ''}
 ${data.hasMustInclude ? `${ta.isRanking ? '8' : '7'}. Are ALL mandatory items present as their own slide? (use Tier 2/3 if Tier 1A/1B is missing for an item)` : ''}
 
 CRITICAL REMINDERS:
@@ -4189,7 +4301,17 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
     index: i + 1, url, verifiedBy: 'Grok Fact Check',
     factsVerified: (data.perplexityVerification?.results?.filter(r => r.source === url).map(r => r.claim).join(', ')) || 'General verification',
   }));
-  const combinedSourceListText = factCheckSources.map((s, i) => `${i + 1}. ${s.url}\n   Verified by: ${s.verifiedBy}\n   Facts: ${s.factsVerified}`).join('\n\n');
+  // Fold in the Perplexity research citations recovered during mergeResearch so
+  // they appear in the final SOURCES list — fact-check sources stay first, then
+  // any research URLs not already covered. (When the fact-check step yields no
+  // URLs — e.g. a Grok audit with no inline links — this is the only source of
+  // citations in the objective output.)
+  const seenUrls = new Set(factCheckSources.map(s => s.url));
+  const researchSources: SourceEntry[] = (data.citations ?? [])
+    .filter(url => url && !seenUrls.has(url))
+    .map((url, i) => ({ index: factCheckSources.length + i + 1, url, verifiedBy: 'Perplexity Research', factsVerified: 'Research context' }));
+  const combinedSourceList = [...factCheckSources, ...researchSources];
+  const combinedSourceListText = combinedSourceList.map((s, i) => `${i + 1}. ${s.url}\n   Verified by: ${s.verifiedBy}\n   Facts: ${s.factsVerified}`).join('\n\n');
 
   // ── Parse the MSN moderation flags block (Claude judgment layer) ──────────
   // These are merged with the deterministic code-node flags later by moderationScan.
@@ -4213,7 +4335,7 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
         flags: flagsMatch?.[1]?.trim() || (failCount + foundCount > 0 ? `${failCount + foundCount} rule(s) flagged` : 'None'),
       },
     },
-    grokSources: [], combinedSourceList: factCheckSources, combinedSourceListText,
+    grokSources: [], combinedSourceList, combinedSourceListText,
     rewriteApplied: patchApply.applied > 0,
     moderationFlags: claudeFlags,
     moderationVerdict: provisionalVerdict,
@@ -4464,7 +4586,7 @@ export async function mergeSubjectiveResearch(
 
   if (retryResp) {
     const retryAnswer = retryResp?.choices?.[0]?.message?.content ?? '';
-    const retryCitations = retryResp?.citations ?? [];
+    const retryCitations = extractPerplexityCitations(retryResp, retryAnswer);
     if (retryAnswer.length > answer.length) {
       answer = retryAnswer;
       citations = retryCitations.length > citations.length ? retryCitations : citations;
