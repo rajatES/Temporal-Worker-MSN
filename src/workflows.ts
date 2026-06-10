@@ -653,7 +653,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
         cursor += contentCount;
       }
 
-      const stitched = await stitchBatchedArticle(batchTexts, { isMultiSlideFormat: prompted.formatConfig.isMultiSlideFormat });
+      const stitched = await stitchBatchedArticle(batchTexts, { isMultiSlideFormat: prompted.formatConfig.isMultiSlideFormat, mustIncludeItems: prompted.mustIncludeItems });
       const allGrok = batchSources.every(s => s === 'Grok');
       const anyGrok = batchSources.some(s => s === 'Grok');
       generated = {
@@ -1010,7 +1010,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
         cursor += contentCount;
       }
 
-      const stitched = await stitchBatchedArticle(batchTexts, { isMultiSlideFormat: promptData.formatConfig.isMultiSlideFormat });
+      const stitched = await stitchBatchedArticle(batchTexts, { isMultiSlideFormat: promptData.formatConfig.isMultiSlideFormat, mustIncludeItems: promptData.mustIncludeItems });
       const allGrok = batchSources.every(s => s === 'Grok');
       const anyGrok = batchSources.some(s => s === 'Grok');
       generatedData = {
