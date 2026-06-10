@@ -2717,7 +2717,7 @@ WORD COUNTS (STRICT - Count every word)
 ═══════════════════════════════════════════════════════════════
 
 - Meta Description: MAX 120 characters
-- Intro slide (Slide 1): 45-65 words (substantial and intriguing — never thin)
+- Intro slide (Slide 1): 40-60 words (substantial and intriguing — never thin)
 - Content slides: 35-50 words (aim for 40-45)
 - If over or under, rewrite until it fits. Do not approximate.
 - NEVER pad word count with invented facts. Use stronger writing instead.
@@ -2737,7 +2737,7 @@ AI patterns to NEVER use: "Discover the...", "Explore the top...", "Find out why
 Good pattern: [Specific unexpected fact from Tier 1A or 1B]. [Implied question].
 
 ═══════════════════════════════════════════════════════════════
-INTRO SLIDE (Slide 1) — 45-65 WORDS
+INTRO SLIDE (Slide 1) — 40-60 WORDS
 ═══════════════════════════════════════════════════════════════
 
 The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene, stake out a strong claim, and frame what's at stake. Write it in a real human voice: a sharp, opinionated columnist talking to a friend who loves this topic — not a press release. A thin, vague, or hedged intro fails. So does an intro that hands over the payoff. The reader should finish the intro thinking "I need to see this," NOT "I already know the answer."
@@ -2949,7 +2949,7 @@ META: [Max 120 characters]
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[45-65 words — substantial, intriguing setup with strong claims; contextual/scale stats only, NEVER a payoff/key stat; end on a thesis line; no items named, no #1/rankings revealed]
+[40-60 words — substantial, intriguing setup with strong claims; contextual/scale stats only, NEVER a payoff/key stat; end on a thesis line; no items named, no #1/rankings revealed]
 
 SLIDE 2
 [Creative title${ta.isRanking ? ' — start with rank number from Tier 1A' : ''}]
@@ -3146,7 +3146,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters]
-3. SLIDE 1 — the intro (45-65 words, substantial and intriguing)
+3. SLIDE 1 — the intro (40-60 words, substantial and intriguing)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -3552,8 +3552,8 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   // Word count
   slides.forEach(slide => {
     if (slide.slideNum === 1) {
-      if (slide.wordCount > 65) errors.push(`Slide 1 (Intro): ${slide.wordCount} words – MAX is 65`);
-      else if (slide.wordCount < 35) warnings.push(`Slide 1 (Intro): ${slide.wordCount} words – too thin, expand the setup (aim 45-65)`);
+      if (slide.wordCount > 60) errors.push(`Slide 1 (Intro): ${slide.wordCount} words – MAX is 60`);
+      else if (slide.wordCount < 40) warnings.push(`Slide 1 (Intro): ${slide.wordCount} words – too thin, expand the setup (aim 40-60)`);
     } else {
       const minWc = data.userWordCountOverride?.min ?? 35;
       const maxWc = data.userWordCountOverride?.max ?? 50;
@@ -4114,7 +4114,7 @@ PART A — AUDIT CHECKLIST (evaluate each rule)
 1. STRUCTURE
    - META present + max 120 characters
    - META not a CTA, not a title paraphrase
-   - Intro (Slide 1): 45-65 words
+   - Intro (Slide 1): 40-60 words
    - Content slides: 35-50 words
    - Correct total number of content slides. IMPORTANT: Slide 1 is the INTRO and is NOT a content slide. Content slides are numbered Slide 2 onward, so N content slides means the article runs through Slide N+1 (e.g. 15 content slides = Slides 2–16). Do NOT count the intro toward the content-slide total.
    - Ranking articles: slide titles start with the rank number
@@ -4970,7 +4970,7 @@ META: [Max 120 characters — intriguing hook, not a CTA, not a title paraphrase
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[45-65 words — substantial, intriguing setup with strong claims; NO stats or numbers at all; end on a thesis line; no generic openers, no items named]
+[40-60 words — substantial, intriguing setup with strong claims; NO stats or numbers at all; end on a thesis line; no generic openers, no items named]
 
 SLIDE 2
 [Creative title]
@@ -4982,7 +4982,7 @@ SOURCES:
 [URL]: [what facts came from this source]
 
 ═══════════════════════════════════════════════════════════════
-INTRO SLIDE (Slide 1) — 45-65 WORDS
+INTRO SLIDE (Slide 1) — 40-60 WORDS
 ═══════════════════════════════════════════════════════════════
 
 The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene, stake out a strong claim, and frame what's at stake, WITHOUT handing over any data. Write it in a real human voice: a sharp, opinionated columnist talking to a friend who loves this topic — not a press release. The stats are the payoff that lives INSIDE the slides; the intro's only job is to make the reader crave them. A thin, vague, or hedged intro fails.
@@ -5036,7 +5036,7 @@ WORD COUNTS — STRICT
 ═══════════════════════════════════════════════════════════════
 
 META: max 120 characters
-Slide 1 (Intro): 45-65 words (substantial and intriguing — no stats)
+Slide 1 (Intro): 40-60 words (substantial and intriguing — no stats)
 All content slides: 35-50 words (aim for 40-45)
 
 ═══════════════════════════════════════════════════════════════
@@ -5149,7 +5149,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters — intriguing hook, not a CTA, not a title paraphrase]
-3. SLIDE 1 — the intro (45-65 words, substantial and intriguing)
+3. SLIDE 1 — the intro (40-60 words, substantial and intriguing)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -5344,8 +5344,8 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
       const wc = slideBody.trim().split(/\s+/).filter(Boolean).length;
       slideResults.push({ slide: slideNum, words: wc });
       if (slideNum === 1) {
-        if (wc > 65) warnings.push(`Intro: ${wc} words (max 65)`);
-        else if (wc < 35) warnings.push(`Intro: ${wc} words – too thin, expand the setup (aim 45-65)`);
+        if (wc > 60) warnings.push(`Intro: ${wc} words (max 60)`);
+        else if (wc < 40) warnings.push(`Intro: ${wc} words – too thin, expand the setup (aim 40-60)`);
         // Subjective intros carry NO stats — every number is a payoff that lives
         // inside the slides. Flag any specific figure (bare years excepted).
         const introNums = [...new Set((slideBody.replace(/,/g, '').match(/\d+(?:\.\d+)?/g) || [])
@@ -5451,7 +5451,7 @@ WHAT TO PATCH (in priority order)
 
 4. META TOO LONG (>120 chars): emit a patch with the full META line as FIND and a ≤120-char rewrite as REPLACE.
 
-5. SLIDE WORD COUNT VIOLATIONS (intro >65 words, body slide outside 35-50): only patch if you can tighten without losing meaning. Use the full slide body as FIND.
+5. SLIDE WORD COUNT VIOLATIONS (intro >60 words, body slide outside 35-50): only patch if you can tighten without losing meaning. Use the full slide body as FIND.
 
 6. FABRICATED SPECIFICS (a year/event/quote-origin that has no support in source data): patch the specific span to soften or remove the invented precision. Keep the rest of the slide.
 
