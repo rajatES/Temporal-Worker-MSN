@@ -2717,7 +2717,7 @@ WORD COUNTS (STRICT - Count every word)
 ═══════════════════════════════════════════════════════════════
 
 - Meta Description: MAX 120 characters
-- Intro slide (Slide 1): MAX 60 words
+- Intro slide (Slide 1): 45-70 words (substantial and intriguing — never thin)
 - Content slides: 35-50 words (aim for 40-45)
 - If over or under, rewrite until it fits. Do not approximate.
 - NEVER pad word count with invented facts. Use stronger writing instead.
@@ -2737,30 +2737,37 @@ AI patterns to NEVER use: "Discover the...", "Explore the top...", "Find out why
 Good pattern: [Specific unexpected fact from Tier 1A or 1B]. [Implied question].
 
 ═══════════════════════════════════════════════════════════════
-INTRO SLIDE (Slide 1) — MAX 60 WORDS
+INTRO SLIDE (Slide 1) — 45-70 WORDS
 ═══════════════════════════════════════════════════════════════
 
+The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene, stake out a strong claim, and frame what's at stake. Write it in a real human voice: a sharp, opinionated columnist talking to a friend who loves this topic — not a press release. A thin, vague, or hedged intro fails. So does an intro that hands over the payoff. The reader should finish the intro thinking "I need to see this," NOT "I already know the answer."
+
+Model the energy of this example:
+"The schedule just dropped, and front offices everywhere are quietly panicking. After an offseason of blockbuster trades, fresh draft picks, and a few desperate gambles, the gap between the real contenders and the pretenders has never looked this stark. A handful of rosters are stacked to chase a ring while everyone else tells themselves it's a rebuild. Here is how all 32 teams actually stack up in the title race."
+Note: it sounds like a person with a take — confident, a little wry, real stakes and tension — and it closes on a thesis line that frames what the piece delivers WITHOUT revealing a single ranking or number.
+
 Your intro MUST:
-- Create CURIOSITY — make readers NEED to scroll
-- Reveal AT MOST ONE specific data point that also appears in the content slides — this is your single "hook" stat. Pick the most striking one and use it once.
-- Build the rest of the intro from THEMATIC / CONTEXTUAL framing about the topic — the broader trend, the stakes, why this matters, the season's backdrop. This framing should relate to the slideshow's subject WITHOUT being the core per-slide facts.
-- Hint at what's coming WITHOUT naming specific items
-- End with forward momentum
-- Talk about something the title is promising
-- Tease the main angle, not reveal it entirely
+- Open with a strong, specific claim or tension about the topic — establish why this matters NOW
+- Build genuine context and stakes (the trend, the shift, the drama) — give the reader something to chew on
+- Be SUBSTANTIAL — confident claims, not generic background or hedged filler. This sets up everything the writer is about to deliver.
+- Create real intrigue — the reader must feel they have to open the slideshow to get the payoff
+- End with a thesis-style line that frames what the slideshow delivers (like the example's last sentence), WITHOUT giving away the ranking, the #1, or the key numbers
+
+ON STATS (objective flow — stats are allowed, but handle with care):
+- You MAY use a stat ONLY to establish scale or context (a broad, scene-setting figure). Prefer framing magnitude in words over exact figures.
+- NEVER reveal a payoff stat — the specific number that is a content slide's main point. If knowing that figure would make a reader feel they no longer need to open the slideshow, leave it out.
+- When unsure whether a number is "context" or "payoff," treat it as payoff and keep it out.
 
 Your intro must NOT:
+- Reveal a payoff/key stat — the exact distances, velocities, totals, scores, records, or dates that individual slides deliver
 - Name any items from the list
 - Reveal the #1 pick or any rankings
-- Preview MORE THAN ONE of the specific facts (exact distances, velocities, dates, totals, scores) that belong to individual content slides — those numbers are each slide's payoff; do not give them away up front
-- Stack multiple slide stats together (e.g. two or more exact numbers pulled from different list items)
-- Use "let's dive in" / "here are" / "we'll explore"
-- Use a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
+- Use "let's dive in" / "we'll explore" or a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
 - Use generic openers ("Since the dawn of...", "In today's world...")
 - Paraphrase the title anywhere
 - Have generic background that assumes reader ignorance
 - Stack adjectives without information backing them
-- Invent a hard stat that is not present in Tier 1A or 1B (thematic framing is fine; fabricated numbers are not)
+- Invent a hard stat that is not present in Tier 1A or 1B
 
 ═══════════════════════════════════════════════════════════════
 WRITING VOICE — THE SPICY WRITER FACTOR
@@ -2942,7 +2949,7 @@ META: [Max 120 characters]
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[Max 60 words — at most ONE core slide stat as the hook; rest is thematic/contextual framing; no items named, no invented stats]
+[45-70 words — substantial, intriguing setup with strong claims; contextual/scale stats only, NEVER a payoff/key stat; end on a thesis line; no items named, no #1/rankings revealed]
 
 SLIDE 2
 [Creative title${ta.isRanking ? ' — start with rank number from Tier 1A' : ''}]
@@ -3115,7 +3122,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters]
-3. SLIDE 1 — the intro (max 60 words)
+3. SLIDE 1 — the intro (45-70 words, substantial and intriguing)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -3513,7 +3520,8 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   // Word count
   slides.forEach(slide => {
     if (slide.slideNum === 1) {
-      if (slide.wordCount > 60) errors.push(`Slide 1 (Intro): ${slide.wordCount} words – MAX is 60`);
+      if (slide.wordCount > 70) errors.push(`Slide 1 (Intro): ${slide.wordCount} words – MAX is 70`);
+      else if (slide.wordCount < 35) warnings.push(`Slide 1 (Intro): ${slide.wordCount} words – too thin, expand the setup (aim 45-70)`);
     } else {
       const minWc = data.userWordCountOverride?.min ?? 35;
       const maxWc = data.userWordCountOverride?.max ?? 50;
@@ -3597,22 +3605,29 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   }
   if (plagScore > 20) warnings.push(`Potential plagiarism: ${plagMatches.length} phrase matches`);
 
-  // Intro stat-leak check — the intro should reveal AT MOST ONE specific data
-  // point that belongs to the content slides; the rest should be thematic
-  // framing. Count distinct numeric stat tokens in the intro body; >1 means it
-  // is stacking core slide facts up front instead of teasing.
+  // Intro payoff-stat leak check — the intro may use a broad contextual figure,
+  // but must NOT reveal a number that is a content slide's payoff. Compare every
+  // number in the intro against the stats pulled from the slide data
+  // (atomizedFacts); a match means the intro gave away a key figure the reader
+  // would otherwise open the slideshow to learn. Contextual/scale numbers that
+  // are NOT in the slide data are fine and won't trip this.
   // (Named-item spoiler detection is intentionally left to human review.)
   const introSlide = slides.find(s => s.slideNum === 1);
-  if (introSlide) {
-    const introStats = (introSlide.body.match(
-      /\d+(?:,\d{3})*(?:\.\d+)?\s*(?:mph|ft|feet|yards?|points?|touchdowns?|home runs?|RBIs?|°|degrees?|%)?/gi,
-    ) || []).map(s => s.trim())
-      // Drop bare 4-digit years (e.g. "2026") — a season/year reference is
-      // thematic framing, not one of the slideshow's per-slide payoff stats.
-      .filter(s => /\d/.test(s) && !/^(?:19|20)\d{2}$/.test(s));
-    const distinctIntroStats = [...new Set(introStats.map(s => s.toLowerCase()))];
-    if (distinctIntroStats.length > 1) {
-      warnings.push(`Intro stacks ${distinctIntroStats.length} stats (max 1 hook stat): ${distinctIntroStats.slice(0, 4).join(', ')}`);
+  if (introSlide && data.atomizedFacts && data.atomizedFacts.length > 0) {
+    const numCore = (s: string): string[] => (s.replace(/,/g, '').match(/\d+(?:\.\d+)?/g) || []);
+    const isYear = (n: string): boolean => /^(?:19|20)\d{2}$/.test(n);
+    const payoffNumbers = new Set<string>();
+    data.atomizedFacts.forEach(item => {
+      if (item.itemName === 'USER_CONTEXT_DATA') return;
+      (item.facts || []).forEach(f => {
+        if (['stat', 'money', 'percentage', 'achievement'].includes(f.type)) {
+          numCore(String(f.value)).forEach(n => { if (!isYear(n)) payoffNumbers.add(n); });
+        }
+      });
+    });
+    const leaked = [...new Set(numCore(introSlide.body).filter(n => !isYear(n) && payoffNumbers.has(n)))];
+    if (leaked.length > 0) {
+      warnings.push(`Intro reveals payoff stat(s) from the slides: ${leaked.slice(0, 4).join(', ')} — keep key numbers inside the content slides`);
     }
   }
 
@@ -4067,9 +4082,9 @@ PART A — AUDIT CHECKLIST (evaluate each rule)
 1. STRUCTURE
    - META present + max 120 characters
    - META not a CTA, not a title paraphrase
-   - Intro (Slide 1): max 60 words
+   - Intro (Slide 1): 45-70 words
    - Content slides: 35-50 words
-   - Correct total number of content slides
+   - Correct total number of content slides. IMPORTANT: Slide 1 is the INTRO and is NOT a content slide. Content slides are numbered Slide 2 onward, so N content slides means the article runs through Slide N+1 (e.g. 15 content slides = Slides 2–16). Do NOT count the intro toward the content-slide total.
    - Ranking articles: slide titles start with the rank number
 
 2. TITLE-BODY CORRELATION
@@ -4224,7 +4239,7 @@ HARD RULES
 - DO NOT re-flag literal banned words or literal clickbait title patterns — the
   deterministic scanner already handles those. Focus on contextual judgment.`;
 
-  const userContent = `Audit this MSN slideshow for compliance, emit style patches for mechanical violations, AND flag MSN moderation issues.\n\nTitle: "${data.title}"\nCategory / feed topic: ${data.category}\nExpected content slides: ${data.slideCount}\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE\n\n${data.articleText}\n\nEmit the AUDIT REPORT, SUMMARY, STYLE PATCHES, and MODERATION FLAGS blocks in that order. Do not regenerate the article.`;
+  const userContent = `Audit this MSN slideshow for compliance, emit style patches for mechanical violations, AND flag MSN moderation issues.\n\nTitle: "${data.title}"\nCategory / feed topic: ${data.category}\nExpected content slides: ${data.slideCount} (these are Slides 2 through ${data.slideCount + 1}; Slide 1 is the intro and does NOT count as a content slide)\nIs ranking: ${ta?.isRanking ? 'YES — slide titles must start with rank number' : 'NO'}\nPromised count in title: ${ta?.promisedCount ?? 'N/A'}\nEmotional promise: ${ta?.emotionalPromise ?? 'None'}\n\nARTICLE\n\n${data.articleText}\n\nEmit the AUDIT REPORT, SUMMARY, STYLE PATCHES, and MODERATION FLAGS blocks in that order. Do not regenerate the article.`;
 
   const model = 'claude-haiku-4-5-20251001';
   try {
@@ -4923,7 +4938,7 @@ META: [Max 120 characters — intriguing hook, not a CTA, not a title paraphrase
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[Max 60 words — one specific anchoring detail, tease the angle, no generic openers, no items named]
+[45-70 words — substantial, intriguing setup with strong claims; NO stats or numbers at all; end on a thesis line; no generic openers, no items named]
 
 SLIDE 2
 [Creative title]
@@ -4935,30 +4950,31 @@ SOURCES:
 [URL]: [what facts came from this source]
 
 ═══════════════════════════════════════════════════════════════
-INTRO SLIDE (Slide 1) — MAX 60 WORDS
+INTRO SLIDE (Slide 1) — 45-70 WORDS
 ═══════════════════════════════════════════════════════════════
 
+The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene, stake out a strong claim, and frame what's at stake, WITHOUT handing over any data. Write it in a real human voice: a sharp, opinionated columnist talking to a friend who loves this topic — not a press release. The stats are the payoff that lives INSIDE the slides; the intro's only job is to make the reader crave them. A thin, vague, or hedged intro fails.
+
+Model the energy of this example:
+"The schedule just dropped, and front offices everywhere are quietly panicking. After an offseason of blockbuster trades, fresh draft picks, and a few desperate gambles, the gap between the real contenders and the pretenders has never looked this stark. A handful of rosters are stacked to chase a ring while everyone else tells themselves it's a rebuild. Here is how every team actually stacks up in the title race."
+Note: it sounds like a person with a take — confident, a little wry, real stakes and tension — and it closes on a thesis line that frames what the piece delivers WITHOUT a single number.
+
 Your intro MUST:
-- Create CURIOSITY — make readers NEED to scroll
-- Reveal AT MOST ONE specific data point that also appears in the content slides — this is your single "hook" stat. Pick the most striking one and use it once.
-- Build the rest of the intro from THEMATIC / CONTEXTUAL framing about the topic — the broader trend, the stakes, why this matters, the season's backdrop. This framing should relate to the slideshow's subject WITHOUT being the core per-slide facts.
-- Hint at what's coming WITHOUT naming specific items
-- End with forward momentum
-- Talk about something the title is promising
-- Tease the main angle, not reveal it entirely
+- Open with a strong, specific claim or tension about the topic — establish why this matters NOW
+- Build genuine context, stakes, and drama — give the reader something to chew on
+- Be SUBSTANTIAL — confident claims, not generic background or hedged filler
+- Create real intrigue — the reader must feel they have to open the slideshow to get the payoff
+- End with a thesis-style line that frames what the slideshow delivers (like the example's last sentence)
 
 Your intro must NOT:
+- Contain ANY stat or specific number — no figures, distances, velocities, totals, scores, records, percentages, or rankings. ZERO. The numbers live inside the slides; the intro is pure intrigue.
 - Name any items from the list
 - Reveal the #1 pick or any rankings
-- Preview MORE THAN ONE of the specific facts (exact distances, velocities, dates, totals, scores) that belong to individual content slides — those numbers are each slide's payoff; do not give them away up front
-- Stack multiple slide stats together (e.g. two or more exact numbers pulled from different list items)
-- Use "let's dive in" / "here are" / "we'll explore"
-- Use a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
+- Use "let's dive in" / "we'll explore" or a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
 - Use generic openers ("Since the dawn of...", "In today's world...")
 - Paraphrase the title anywhere
 - Have generic background that assumes reader ignorance
 - Stack adjectives without information backing them
-- Invent a hard stat that is not present in Tier 1A or 1B (thematic framing is fine; fabricated numbers are not)
 
 ═══════════════════════════════════════════════════════════════
 TITLE-BODY CORRELATION — HIGHEST PRIORITY
@@ -4988,7 +5004,7 @@ WORD COUNTS — STRICT
 ═══════════════════════════════════════════════════════════════
 
 META: max 120 characters
-Slide 1 (Intro): max 60 words
+Slide 1 (Intro): 45-70 words (substantial and intriguing — no stats)
 All content slides: 35-50 words (aim for 40-45)
 
 ═══════════════════════════════════════════════════════════════
@@ -5101,7 +5117,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters — intriguing hook, not a CTA, not a title paraphrase]
-3. SLIDE 1 — the intro (max 60 words)
+3. SLIDE 1 — the intro (45-70 words, substantial and intriguing)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -5295,8 +5311,15 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
     if (slideNum > 0 && slideBody.trim()) {
       const wc = slideBody.trim().split(/\s+/).filter(Boolean).length;
       slideResults.push({ slide: slideNum, words: wc });
-      if (slideNum === 1 && wc > 60) warnings.push(`Intro: ${wc} words (max 60)`);
-      else if (slideNum > 1) {
+      if (slideNum === 1) {
+        if (wc > 70) warnings.push(`Intro: ${wc} words (max 70)`);
+        else if (wc < 35) warnings.push(`Intro: ${wc} words – too thin, expand the setup (aim 45-70)`);
+        // Subjective intros carry NO stats — every number is a payoff that lives
+        // inside the slides. Flag any specific figure (bare years excepted).
+        const introNums = [...new Set((slideBody.replace(/,/g, '').match(/\d+(?:\.\d+)?/g) || [])
+          .filter(n => !/^(?:19|20)\d{2}$/.test(n)))];
+        if (introNums.length > 0) warnings.push(`Intro contains stats (${introNums.slice(0, 4).join(', ')}) — subjective intros must be stat-free`);
+      } else if (slideNum > 1) {
         const minWc = data.userWordCountOverride?.min ?? 35;
         const maxWc = data.userWordCountOverride?.max ?? 50;
         if (wc < minWc || wc > maxWc + 5) warnings.push(`Slide ${slideNum}: ${wc} words (expected ${minWc}-${maxWc})`);
@@ -5396,7 +5419,7 @@ WHAT TO PATCH (in priority order)
 
 4. META TOO LONG (>120 chars): emit a patch with the full META line as FIND and a ≤120-char rewrite as REPLACE.
 
-5. SLIDE WORD COUNT VIOLATIONS (intro >60 words, body slide outside 35-50): only patch if you can tighten without losing meaning. Use the full slide body as FIND.
+5. SLIDE WORD COUNT VIOLATIONS (intro >70 words, body slide outside 35-50): only patch if you can tighten without losing meaning. Use the full slide body as FIND.
 
 6. FABRICATED SPECIFICS (a year/event/quote-origin that has no support in source data): patch the specific span to soften or remove the invented precision. Keep the rest of the slide.
 
