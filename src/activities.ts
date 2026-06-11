@@ -1271,6 +1271,134 @@ export async function firecrawlScrape(url: string, onlyMainContent = true): Prom
   throw new Error(`Firecrawl scrape failed after all attempts for ${url}`);
 }
 
+// ── 2b. statmuseResearch — live stat scrape for sports articles ───────────────
+// StatMuse (statmuse.com) is a natural-language sports stats engine with
+// deterministic ask URLs: https://www.statmuse.com/{league}/ask/{question-slug}.
+// For sports-category articles we ask it the article title as a question and, when
+// it can answer, get back a clean current leaderboard/stat table — far more
+// reliable for NUMBERS than Perplexity prose. The result is injected into the
+// fact database as TIER 1S (above Perplexity, below the writer's own sources).
+// StatMuse can't answer everything (e.g. hit-distance queries return HTTP 422
+// with a "Sorry, I can't answer" page) — every failure path returns an empty
+// block so the pipeline falls back to the existing research flow unchanged.
+
+/** Map an MSN category (+ title keywords for "Sports - Other") to a StatMuse
+ *  league domain. Returns null for non-sports categories and for sports StatMuse
+ *  does not cover (Tennis, UFC, NASCAR, Olympics). New "Sports - X" categories
+ *  added to the form later follow the same pattern: add a `direct` entry if
+ *  StatMuse covers the league, otherwise leave it to keyword detection / null. */
+function detectStatmuseLeague(category: string, title: string): string | null {
+  if (!/^sports/i.test(category.trim())) return null;
+  const sub = category.replace(/^sports\s*-?\s*/i, '').trim().toUpperCase();
+  const direct: Record<string, string> = { NFL: 'nfl', NBA: 'nba', WNBA: 'wnba', GOLF: 'pga' };
+  if (direct[sub]) return direct[sub];
+  // "Sports - Other" (and uncovered subcategories): infer the league from the title.
+  const t = ` ${title.toLowerCase()} `;
+  if (/\bmlb\b|baseball|home run|world series|pitcher|inning/.test(t)) return 'mlb';
+  if (/\bnhl\b|hockey|stanley cup/.test(t)) return 'nhl';
+  if (/\bnba\b|basketball/.test(t)) return 'nba';
+  if (/\bnfl\b|touchdown|quarterback|super bowl/.test(t)) return 'nfl';
+  if (/\bwnba\b/.test(t)) return 'wnba';
+  if (/premier league|champions league|la liga|serie a|bundesliga|\bsoccer\b|\bmls\b|\bepl\b/.test(t)) return 'fc';
+  if (/college football|\bcfb\b|heisman|ncaa football/.test(t)) return 'cfb';
+  if (/\bpga\b|golf|masters|ryder cup/.test(t)) return 'pga';
+  return null;
+}
+
+/** Reduce a StatMuse page to its answer sentence + stat table. Strips images and
+ *  link markup, drops nav junk, caps table size so the block stays prompt-sized. */
+function cleanStatmuseMarkdown(md: string): string {
+  const noImages = md
+    .replace(/\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)/g, '')   // linked images
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                 // bare images
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');             // links → text
+  const out: string[] = [];
+  let tableRows = 0;
+  for (const raw of noImages.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith('|')) {
+      if (tableRows < 45) { out.push(line.replace(/\s+/g, ' ')); tableRows++; }
+      continue;
+    }
+    // Narrative answer lines carry a number and a real sentence; nav links don't.
+    if (/\d/.test(line) && line.split(/\s+/).length >= 5 && !/sign in|toggle theme|trending/i.test(line)) {
+      out.push(line);
+    }
+  }
+  const result = out.join('\n');
+  return result.length > 7000 ? result.slice(0, 7000) + '\n[truncated]' : result;
+}
+
+export async function statmuseResearch(category: string, title: string): Promise<{ block: string; url: string }> {
+  const empty = { block: '', url: '' };
+  const league = detectStatmuseLeague(category, title);
+  if (!league) return empty;
+  if (!FIRECRAWL_KEY) {
+    console.error('[statmuseResearch] FIRECRAWL_API_KEY is not set — skipping');
+    return empty;
+  }
+
+  const question = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!question) return empty;
+  const url = `https://www.statmuse.com/${league}/ask/${question.replace(/ /g, '-')}`;
+
+  try {
+    const resp = await axios.post(
+      'https://api.firecrawl.dev/v2/scrape',
+      { url, formats: ['markdown'], onlyMainContent: true, blockAds: true, removeBase64Images: true, waitFor: 4000 },
+      { headers: { Authorization: `Bearer ${FIRECRAWL_KEY}` }, timeout: 75_000 },
+    );
+    const statusCode = resp.data?.data?.metadata?.statusCode;
+    const md: string = resp.data?.data?.markdown ?? resp.data?.markdown ?? '';
+    // StatMuse serves unsupported questions as an HTTP 422 "Sorry, I can't
+    // answer…" page — treat anything but a clean 200 answer as no-data.
+    if (statusCode !== 200 || !md || /sorry, i can.{0,3}t answer/i.test(md)) {
+      console.log(`[statmuseResearch] StatMuse could not answer (HTTP ${statusCode ?? '?'}): ${url}`);
+      return empty;
+    }
+    const block = cleanStatmuseMarkdown(md);
+    if (block.length < 80) {
+      console.log(`[statmuseResearch] Answer too thin after cleaning (${block.length} chars): ${url}`);
+      return empty;
+    }
+    console.log(`[statmuseResearch] ${url}: ${md.length} chars raw → ${block.length} chars cleaned`);
+    return { block, url };
+  } catch (err: unknown) {
+    const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+    console.error(`[statmuseResearch] Scrape failed (HTTP ${status ?? '?'}) for ${url}: ${axios.isAxiosError(err) ? err.message : String(err)}`);
+    return empty;       // never block the pipeline — research falls back to Perplexity
+  }
+}
+
+/** Insert the StatMuse block into a fact representation as TIER 1S, directly above
+ *  the TIER 2 (Perplexity) section. Carries its own self-contained priority rules
+ *  so both the objective and subjective prompts get identical tiering: 1A/1B still
+ *  win where they cover a fact; TIER 1S beats TIER 2 on every number; TIER 2 keeps
+ *  its existing context/anti-plagiarism role. */
+function injectStatmuseTier(factRepresentation: string, statmuse?: { block: string; url: string }): string {
+  if (!statmuse?.block) return factRepresentation;
+  const tier = `═══════════════════════════════════════════════════════════════
+TIER 1S: STATMUSE LIVE STAT DATA — AUTHORITATIVE FOR NUMBERS
+═══════════════════════════════════════════════════════════════
+
+Live, queried-for-this-exact-topic stat data from StatMuse (${statmuse.url}).
+• For every NUMBER — stats, totals, rankings, leaderboard values — TIER 1S OUTRANKS TIER 2 (Perplexity). If they disagree on a number, TIER 1S wins. Always.
+• TIER 1A and TIER 1B still outrank TIER 1S where they cover the same fact.
+• TIER 2 keeps its existing role: tone, mood, framing, and context per its own rules. TIER 1S replaces only the numbers, never the narrative.
+• Same anti-plagiarism rules apply: use the data, never the phrasing.
+
+${statmuse.block}
+
+`;
+  const marker = 'TIER 2: SUPPLEMENTARY';
+  const markerIdx = factRepresentation.indexOf(marker);
+  if (markerIdx === -1) return factRepresentation + '\n' + tier;
+  const borderIdx = factRepresentation.lastIndexOf('═══════', markerIdx);
+  const insertAt = borderIdx === -1 ? markerIdx : factRepresentation.lastIndexOf('\n', borderIdx) + 1;
+  return factRepresentation.slice(0, insertAt) + tier + factRepresentation.slice(insertAt);
+}
+
 // ── 3. analyzeSourceAlignment (n8n: "Analyze Source Alignment") ──────────────
 
 export async function analyzeSourceAlignment(
@@ -1958,31 +2086,45 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
 interface PerplexityRaw {
   choices: Array<{ message: { content: string } }>;
   citations?: string[];
+  search_results?: Array<string | { url?: string }>;
 }
 
 /**
  * Extract citation URLs from a Perplexity response.
  *
- * The Vercel AI Gateway (which we route through) does NOT surface Perplexity's
- * native top-level `citations` array — it only keeps cost/usage in
- * provider_metadata. The actual source URLs come back inside the message content
- * as the "COMPLETE SOURCES LIST" ([1] https://..., [2] https://...) that the
- * research prompt asks the model to emit. So we prefer the structured field when
- * present (native API / future gateway support) and fall back to parsing the
- * `[n] url` lines out of the answer text.
+ * The Vercel AI Gateway (which we route through) does NOT reliably surface
+ * Perplexity's native top-level `citations` array — it only keeps cost/usage in
+ * provider_metadata. The actual source URLs come back inside the message content,
+ * but the model formats them as "Source URL: https://..." lines (one per fact),
+ * NOT as the "[n] https://..." footnote-with-URL pattern an earlier version
+ * assumed. The old `[n] url` regex therefore matched nothing, citations came back
+ * empty, and citation scraping fell back to a useless homepage — starving
+ * generation of real source content.
+ *
+ * Fix: prefer structured fields when present (native API / search_results
+ * variant), otherwise harvest EVERY URL embedded in the answer body. The primary
+ * source URL is filtered out downstream when picking scrape targets.
  */
 function extractPerplexityCitations(resp: PerplexityRaw | undefined, answer: string): string[] {
-  const structured = resp?.citations ?? [];
-  if (structured.length > 0) return structured;
-
   const found: string[] = [];
   const seen = new Set<string>();
-  const re = /\[\d+\]\s*(https?:\/\/[^\s\]]+)/g;
+  const add = (raw: string | undefined): void => {
+    if (!raw) return;
+    // Trim markdown/punctuation that clings to inline URLs (e.g. "url.**" or "url),").
+    const url = raw.trim().replace(/[)\]>.,;:'"*`]+$/, '');
+    if (/^https?:\/\//i.test(url) && !seen.has(url)) { seen.add(url); found.push(url); }
+  };
+
+  // 1. Structured citations from the API (tolerate the `search_results` variant).
+  for (const c of resp?.citations ?? []) add(c);
+  for (const s of resp?.search_results ?? []) add(typeof s === 'string' ? s : s?.url);
+  if (found.length > 0) return found;
+
+  // 2. Fallback — harvest every URL embedded in the answer body (Source URL lines,
+  //    footnote URLs, or bare links), in document order.
+  const re = /https?:\/\/[^\s)<>\]"'*`]+/g;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(answer)) !== null) {
-    const url = m[1].replace(/[.,;]+$/, '').trim();
-    if (!seen.has(url)) { seen.add(url); found.push(url); }
-  }
+  while ((m = re.exec(answer)) !== null) add(m[0]);
   return found;
 }
 
@@ -2481,7 +2623,7 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
 
 // ── 9. buildClaudePrompt (n8n: "Build Claude Prompt") ────────────────────────
 
-export async function buildClaudePrompt(data: MergedData, citation1Markdown: string, citation2Markdown: string): Promise<PromptData> {
+export async function buildClaudePrompt(data: MergedData, citation1Markdown: string, citation2Markdown: string, statmuse?: { block: string; url: string }): Promise<PromptData> {
   function truncate(text: string, maxWords: number): string {
     const words = text.split(/\s+/);
     return words.length > maxWords ? words.slice(0, maxWords).join(' ') + '\n[truncated]' : text;
@@ -2740,18 +2882,20 @@ Good pattern: [Specific unexpected fact from Tier 1A or 1B]. [Implied question].
 INTRO SLIDE (Slide 1) — 40-60 WORDS
 ═══════════════════════════════════════════════════════════════
 
-The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene, stake out a strong claim, and frame what's at stake. Write it in a real human voice: a sharp, opinionated columnist talking to a friend who loves this topic — not a press release. A thin, vague, or hedged intro fails. So does an intro that hands over the payoff. The reader should finish the intro thinking "I need to see this," NOT "I already know the answer."
+The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene with sweep and atmosphere, frame what's at stake, and make the reader crave the breakdown that follows. A thin, vague, or hedged intro fails. So does an intro that hands over the payoff. The reader should finish the intro thinking "I need to see this," NOT "I already know the answer."
 
-Model the energy of this example:
-"The schedule just dropped, and front offices everywhere are quietly panicking. After an offseason of blockbuster trades, fresh draft picks, and a few desperate gambles, the gap between the real contenders and the pretenders has never looked this stark. A handful of rosters are stacked to chase a ring while everyone else tells themselves it's a rebuild. Here is how all 32 teams actually stack up in the title race."
-Note: it sounds like a person with a take — confident, a little wry, real stakes and tension — and it closes on a thesis line that frames what the piece delivers WITHOUT revealing a single ranking or number.
+WRITE IT AS FLOWING PROSE — THIS IS NON-NEGOTIABLE. The intro is full, graceful sentences that build on each other: polished magazine-style writing with momentum. The clipped "gut punch" fragment rhythm used in content slides does NOT belong in the intro. Never open with stacked short declaratives ("Team A built a dynasty. Team B matched it. Team C shocked everyone.") — that reads broken and choppy here.
+
+Model this example:
+"Winning a Lombardi Trophy is the ultimate gridiron dream. Since the turn of the century, the NFL has seen dominant dynasties, jaw-dropping upsets, and legendary quarterbacks cement their legacies on the sport's biggest stage. From powerhouse runs to nail-biting overtime thrillers, here is a breakdown of every single team to capture football immortality since 2000."
+Note what makes it work: it FLOWS — every sentence feeds the next; it builds atmosphere through evocative specifics (dynasties, upsets, legacies) WITHOUT naming a single team or revealing a single payoff number; and it closes on a graceful thesis line that promises the payoff without giving any of it away.
 
 Your intro MUST:
-- Open with a strong, specific claim or tension about the topic — establish why this matters NOW
-- Build genuine context and stakes (the trend, the shift, the drama) — give the reader something to chew on
-- Be SUBSTANTIAL — confident claims, not generic background or hedged filler. This sets up everything the writer is about to deliver.
+- Open with a strong, evocative claim about why this topic matters — the dream, the stakes, the drama
+- Build genuine context and atmosphere (the trend, the era, the tension) — give the reader something to chew on
+- Flow as connected, polished prose — each sentence builds on the last; no choppy fragments
 - Create real intrigue — the reader must feel they have to open the slideshow to get the payoff
-- End with a thesis-style line that frames what the slideshow delivers (like the example's last sentence), WITHOUT giving away the ranking, the #1, or the key numbers
+- End with a graceful thesis-style line that frames what the slideshow delivers (like the example's last sentence), WITHOUT giving away the ranking, the #1, or the key numbers
 
 ON STATS (objective flow — stats are allowed, but handle with care):
 - You MAY use a stat ONLY to establish scale or context (a broad, scene-setting figure). Prefer framing magnitude in words over exact figures.
@@ -2760,8 +2904,9 @@ ON STATS (objective flow — stats are allowed, but handle with care):
 
 Your intro must NOT:
 - Reveal a payoff/key stat — the exact distances, velocities, totals, scores, records, or dates that individual slides deliver
-- Name any items from the list
+- Name any items from the list — not even as scene-setting in the opening lines (naming the headline teams/players up front is the most common failure)
 - Reveal the #1 pick or any rankings
+- Be built from stacked short fragments — the staccato rhythm belongs to content slides, never the intro
 - Use "let's dive in" / "we'll explore" or a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
 - Use generic openers ("Since the dawn of...", "In today's world...")
 - Paraphrase the title anywhere
@@ -2775,6 +2920,8 @@ WRITING VOICE — THE SPICY WRITER FACTOR
 
 You are not summarizing facts. You are REACTING to them. Write like a sharp, witty sports columnist or pop culture critic who genuinely cares about the subject and has opinions — but whose every factual claim traces back to Tier 1A or 1B.
 
+SCOPE: These voice rules govern the CONTENT slides (Slide 2 onward). The intro (Slide 1) follows its own section above — flowing, polished prose, never the gut-punch fragment rhythm below.
+
 THE ENERGY RULES:
 - Lead with what made YOU react. If a Tier 1A/1B stat shocked you, let that shock hit the reader first.
 - One-sentence gut punches are your weapon. "38 years old. 40 touchdowns. Zero signs of slowing down." (assuming all numbers from Tier 1A/1B)
@@ -2786,6 +2933,12 @@ RHYTHM AND PACING:
 - Never let two slides have the same energy.
 - The reader should feel a tempo change every 2-3 slides.
 
+NO TEMPLATE WRITING — CRITICAL WHEN SLIDES COVER SIMILAR ITEMS:
+When the slides describe similar things (home runs, games, players, gadgets, cars), the BIGGEST failure mode is reusing one sentence skeleton for every item with only the numbers swapped — e.g. "[Name] [verb] a [X]-foot blast that registered [Y] mph with a [Z]-degree launch angle." That reads as robotic stat-dumping and gets flagged.
+- Each slide must be BUILT DIFFERENTLY: vary the opening, change the order facts arrive in, change the sentence shape. Lead with the date on one, the reaction on the next, the opponent on another.
+- If you could generate slides 2–N by filling blanks in a single template, you have FAILED. Rewrite them.
+- Put the same stat in a different grammatical position each time (subject, object, aside) so no two slides rhyme structurally.
+
 EMOTIONAL TEXTURE (rotate through):
 - DISBELIEF, RESPECT, HUMOR (light), TENSION, NOSTALGIA
 
@@ -2793,6 +2946,7 @@ WHAT TO AVOID:
 - Wikipedia voice: "He is widely regarded as one of the greatest..."
 - Cheerleader voice: "What an incredible, amazing, stunning performance!"
 - Resume voice: stat-dumping without framing
+- Template voice: the same sentence skeleton repeated across slides with only the numbers changed
 
 THE GOLDEN RULE: Every slide should make someone want to text their friend about it. AND every fact must come from Tier 1A or 1B.
 
@@ -2816,6 +2970,9 @@ Every stat (from Tier 1A/1B) needs ONE of these as framing:
 - WHAT it led to
 
 The framing can come from your writing voice. The stat itself must be Tier 1A/1B.
+
+SAY SOMETHING ABOUT THE SUBJECT, NOT JUST THE NUMBERS:
+Every slide must include at least one line about WHO this player/item actually is — their role, reputation, story arc, or what this moment means for them. A slide that is just stats stitched together with transitions is a failure, even if every number is correct. The numbers prove the point; the point is about a person. Write the person first, then let the stat land the punch.
 
 ${fc.isMultiSlideFormat ? `
 ═══════════════════════════════════════════════════════════════
@@ -2949,7 +3106,7 @@ META: [Max 120 characters]
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[40-60 words — substantial, intriguing setup with strong claims; contextual/scale stats only, NEVER a payoff/key stat; end on a thesis line; no items named, no #1/rankings revealed]
+[40-60 words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; contextual/scale stats only, NEVER a payoff/key stat; end on a graceful thesis line; no items named, no #1/rankings revealed]
 
 SLIDE 2
 [Creative title${ta.isRanking ? ' — start with rank number from Tier 1A' : ''}]
@@ -2970,7 +3127,7 @@ SOURCES:
 TIER 1A + 1B FACT DATABASE — YOUR ONLY FACT SOURCES
 ═══════════════════════════════════════════════════════════════
 
-${data.combinedFactRepresentation}
+${injectStatmuseTier(data.combinedFactRepresentation, statmuse)}
 
 ${citationContext}`;
 
@@ -3146,7 +3303,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters]
-3. SLIDE 1 — the intro (40-60 words, substantial and intriguing)
+3. SLIDE 1 — the intro (40-60 words, flowing polished prose — substantial and intriguing, no choppy fragments)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -3531,13 +3688,17 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
 
   for (const line of articleText.split('\n')) {
     const trimmed = line.trim().replace(/\*\*/g, '').trim();
+    // The SOURCES section ends the slides — stop here so its URL/attribution
+    // lines are never folded into the last content slide's body (which would
+    // inflate that slide's word count well past the limit).
+    if (/^SOURCES/i.test(trimmed)) break;
     const slideMatch = trimmed.match(/^SLIDE\s*(\d+)/i);
     if (slideMatch) {
       if (currentSlide !== null) slides.push({ slideNum: currentSlide, title: currentTitle, body: currentBody.trim(), wordCount: currentBody.trim().split(/\s+/).filter(Boolean).length });
       currentSlide = parseInt(slideMatch[1]); currentTitle = ''; currentBody = '';
     } else if (currentSlide !== null && !currentTitle && trimmed && !trimmed.startsWith('META:')) {
       currentTitle = trimmed;
-    } else if (currentSlide !== null && currentTitle && trimmed && !trimmed.startsWith('SOURCES')) {
+    } else if (currentSlide !== null && currentTitle && trimmed) {
       currentBody += ' ' + trimmed;
     }
   }
@@ -3586,16 +3747,11 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
     });
   }
 
-  // Punctuation bans — em-dash is AUTO-FIXED (replaced with comma), not just warned.
-  const emDashFix = stripEmDashesFromArticle(articleText);
-  if (emDashFix.changed) {
-    articleText = emDashFix.text;
-    // Keep the parsed slides in sync so downstream (Grok audit, final assembly)
-    // sees the corrected text in both the raw article AND the slide objects.
-    slides.forEach(s => { s.title = fixEmDashLine(s.title); s.body = fixEmDashLine(s.body); });
-    autoFixes.push('Replaced em-dashes with commas');
-  }
-
+  // Em-dashes are NOT fixed here. They're stripped once at the very end, in
+  // finalAssembly, after all generation, fact-correction, and audit rewrites are
+  // done — a single final pass guarantees a clean output and avoids re-stripping
+  // text that later stages might rewrite anyway. Semicolons / ellipsis below are
+  // still warned (not auto-fixed).
   slides.filter(s => s.slideNum > 0).forEach(slide => {
     if (slide.body.includes(';')) warnings.push(`Slide ${slide.slideNum}: semicolon (banned)`);
     if (slide.body.includes('...') || slide.body.includes('…')) warnings.push(`Slide ${slide.slideNum}: ellipsis (banned)`);
@@ -4403,6 +4559,11 @@ export async function extractAuditResults(data: VerifiedData, grokText: string):
 // ── 19. finalAssembly (n8n: "Final Assembly") ────────────────────────────────
 
 export async function finalAssembly(data: AuditedData): Promise<FinalOutput> {
+  // Single, final em-dash strip — runs ONCE here, after all generation,
+  // fact-correction, and audit rewrites are complete, so no later stage can
+  // re-introduce one. MSN style bans the em-dash; this is the authoritative pass.
+  const cleanedArticle = stripEmDashesFromArticle(data.articleText).text;
+
   const researchScore = data.researchOk ? 80 : 50;
   const factCheckScore = data.perplexityVerification?.score ?? 50;
   const structuralScore = data.structuralValidation?.status === 'PASSED' ? 100 : data.structuralValidation?.status === 'WARNINGS' ? 70 : 40;
@@ -4464,7 +4625,7 @@ ${moderationReport}
 
   return {
     title: data.title, category: data.category, slideCount: data.slideCount, writerName: data.writerName,
-    articleText: data.articleText,
+    articleText: cleanedArticle,
     originalArticleText: data.originalArticleText || data.articleText,
     auditReport, qualityScore, researchScore,
     verificationScore: factCheckScore, structuralScore, originalityScore: plagiarismScore,
@@ -4795,7 +4956,7 @@ export async function mergeSubjectiveResearch(
 
 // ── S4. buildSubjectivePrompt (n8n: inlined in "Claude - Subjective Writer") ──
 
-export async function buildSubjectivePrompt(data: SubjectiveMergedData): Promise<SubjectivePromptData> {
+export async function buildSubjectivePrompt(data: SubjectiveMergedData, statmuse?: { block: string; url: string }): Promise<SubjectivePromptData> {
   const claudeSystemPrompt = `You are an expert MSN Slideshow writer for an American audience. You specialise in subjective, voice-driven articles — quotes collections, opinion rankings, nostalgic throwbacks, and personality-driven lists.
 
 Write in authentic American English — conversational, active voice, warm and human.
@@ -4883,6 +5044,8 @@ THE FEELING ENGINE — SUBJECTIVE WRITING VOICE
 
 You are not summarising facts. You are making readers FEEL something. Every slide must create an emotional response — not describe one.
 
+SCOPE: These voice rules govern the CONTENT slides (Slide 2 onward). The intro (Slide 1) follows its own section below — flowing, polished prose, never the short-fragment rhythm described here.
+
 THE CORE PRINCIPLE: Show, don't tell. Never write 'this was emotional' or 'this was powerful.' Instead, put the reader inside the moment so they feel it themselves.
 
 EMOTIONAL ARCHITECTURE — rotate through these textures:
@@ -4898,6 +5061,14 @@ RHYTHM RULES:
 - Never let two consecutive slides have the same emotional texture or sentence rhythm.
 - The reader should feel a tempo shift every 2-3 slides.
 
+CONTINUITY & HUMANITY — every slide is a tiny story about a person:
+- Within a slide, sentences must CONNECT — each one picks up something from the one before and carries it forward. A slide of three unrelated statements is a list, not writing.
+- Shape each slide as a miniature arc: a setup, the moment, and why it lingers. The reader should feel they lived a beat of this person's story, not skimmed their profile.
+- Write the human, not the highlight reel. What did this cost them, mean to them, change for them? One genuine human detail beats three achievements.
+- Let one emotional thread run through the whole slideshow, so the slides read as chapters of one piece rather than disconnected entries.
+
+NO TEMPLATE WRITING: When slides cover similar items, do NOT reuse one sentence skeleton with only the names/details swapped. Each slide must be built differently — vary the opening, the order details arrive in, and the sentence shape. If you could produce slides 2–N by filling blanks in a single template, rewrite them.
+
 THE RESONANCE TEST: After writing each slide, ask: 'Would someone want to screenshot this and send it to a friend?' If no, the slide lacks voice. Rewrite.
 
 WHAT TO AVOID:
@@ -4905,6 +5076,7 @@ WHAT TO AVOID:
 - Cheerleader voice: 'What an incredible, amazing performance!'
 - Greeting card voice: 'His words touched millions of hearts around the world.'
 - Resume voice: listing achievements without making them mean anything.
+- Template voice: the same sentence skeleton repeated across slides with only the details changed.
 - Explaining emotions instead of creating them: 'This quote is powerful because...' — NO. Make the reader feel why without telling them.
 
 ═══════════════════════════════════════════════════════════════
@@ -4970,7 +5142,7 @@ META: [Max 120 characters — intriguing hook, not a CTA, not a title paraphrase
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[40-60 words — substantial, intriguing setup with strong claims; NO stats or numbers at all; end on a thesis line; no generic openers, no items named]
+[40-60 words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; NO stats or numbers at all; end on a graceful thesis line; no generic openers, no items named]
 
 SLIDE 2
 [Creative title]
@@ -4985,23 +5157,26 @@ SOURCES:
 INTRO SLIDE (Slide 1) — 40-60 WORDS
 ═══════════════════════════════════════════════════════════════
 
-The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene, stake out a strong claim, and frame what's at stake, WITHOUT handing over any data. Write it in a real human voice: a sharp, opinionated columnist talking to a friend who loves this topic — not a press release. The stats are the payoff that lives INSIDE the slides; the intro's only job is to make the reader crave them. A thin, vague, or hedged intro fails.
+The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene with sweep and atmosphere, frame what's at stake, and make the reader crave the breakdown that follows, WITHOUT handing over any data. The stats are the payoff that lives INSIDE the slides. A thin, vague, or hedged intro fails.
 
-Model the energy of this example:
-"The schedule just dropped, and front offices everywhere are quietly panicking. After an offseason of blockbuster trades, fresh draft picks, and a few desperate gambles, the gap between the real contenders and the pretenders has never looked this stark. A handful of rosters are stacked to chase a ring while everyone else tells themselves it's a rebuild. Here is how every team actually stacks up in the title race."
-Note: it sounds like a person with a take — confident, a little wry, real stakes and tension — and it closes on a thesis line that frames what the piece delivers WITHOUT a single number.
+WRITE IT AS FLOWING PROSE — THIS IS NON-NEGOTIABLE. The intro is full, graceful sentences that build on each other: polished magazine-style writing with momentum. The clipped fragment rhythm used in content slides does NOT belong in the intro. Never open with stacked short declaratives ("Team A built a dynasty. Team B matched it. Team C shocked everyone.") — that reads broken and choppy here.
+
+Model this example:
+"Winning a Lombardi Trophy is the ultimate gridiron dream. Since the turn of the century, the NFL has seen dominant dynasties, jaw-dropping upsets, and legendary quarterbacks cement their legacies on the sport's biggest stage. From powerhouse runs to nail-biting overtime thrillers, here is a breakdown of every single team to capture football immortality since 2000."
+Note what makes it work: it FLOWS — every sentence feeds the next; it builds atmosphere through evocative specifics (dynasties, upsets, legacies) WITHOUT naming a single team or revealing a single stat (a bare year reference like "since 2000" is fine); and it closes on a graceful thesis line that promises the payoff without giving any of it away.
 
 Your intro MUST:
-- Open with a strong, specific claim or tension about the topic — establish why this matters NOW
-- Build genuine context, stakes, and drama — give the reader something to chew on
-- Be SUBSTANTIAL — confident claims, not generic background or hedged filler
+- Open with a strong, evocative claim about why this topic matters — the dream, the stakes, the drama
+- Build genuine context and atmosphere (the trend, the era, the tension) — give the reader something to chew on
+- Flow as connected, polished prose — each sentence builds on the last; no choppy fragments
 - Create real intrigue — the reader must feel they have to open the slideshow to get the payoff
-- End with a thesis-style line that frames what the slideshow delivers (like the example's last sentence)
+- End with a graceful thesis-style line that frames what the slideshow delivers (like the example's last sentence)
 
 Your intro must NOT:
-- Contain ANY stat or specific number — no figures, distances, velocities, totals, scores, records, percentages, or rankings. ZERO. The numbers live inside the slides; the intro is pure intrigue.
-- Name any items from the list
+- Contain ANY stat or specific number — no figures, distances, velocities, totals, scores, records, percentages, or rankings. ZERO. The numbers live inside the slides; the intro is pure intrigue. (A bare year like "since 2000" is the only exception.)
+- Name any items from the list — not even as scene-setting in the opening lines (naming the headline teams/players up front is the most common failure)
 - Reveal the #1 pick or any rankings
+- Be built from stacked short fragments — the staccato rhythm belongs to content slides, never the intro
 - Use "let's dive in" / "we'll explore" or a literal call-to-action ("Scroll to see...", "Click", "Read on", "Keep reading", "See where ... lands")
 - Use generic openers ("Since the dawn of...", "In today's world...")
 - Paraphrase the title anywhere
@@ -5108,7 +5283,7 @@ Count every word silently before outputting each slide (the count must NEVER app
     ? `\n\nMANDATORY ITEMS — these override the scraped source's item list (non-negotiable):\n${data.mustIncludeItems.map((item, i) => `${i + 1}. ${item}`).join('\n')}\n\nEvery mandatory item MUST get its own slide, even if it does not appear in TIER 1A. Do NOT substitute any with a different item from the source. Fill remaining slots (up to ${data.slideCount} total) with the best-fit entries.`
     : '';
 
-  const factContextBlock = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${data.combinedFactRepresentation}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}`;
+  const factContextBlock = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${injectStatmuseTier(data.combinedFactRepresentation, statmuse)}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}`;
 
   const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
 
@@ -5149,7 +5324,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters — intriguing hook, not a CTA, not a title paraphrase]
-3. SLIDE 1 — the intro (40-60 words, substantial and intriguing)
+3. SLIDE 1 — the intro (40-60 words, flowing polished prose — substantial and intriguing, no choppy fragments)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -5291,13 +5466,12 @@ export async function generateSubjectiveWithGrok(systemPrompt: string, userPromp
 // ── S8. validateSubjective (n8n: "Validate Output - Subjective") ──────────────
 
 export async function validateSubjective(data: SubjectiveGeneratedData): Promise<SubjectiveValidatedData> {
-  let articleText = data.articleText;
+  const articleText = data.articleText;
   const errors: string[] = [];
   const warnings: string[] = [];
-  // Em-dash is AUTO-FIXED (replaced with comma) before any other check, so the
-  // corrected text flows into the Grok style audit and final output.
-  const emDashFix = stripEmDashesFromArticle(articleText);
-  if (emDashFix.changed) articleText = emDashFix.text;
+  // Em-dashes are stripped once at the very end (finalAssemblySubjective), after
+  // all generation and audit rewrites — not here. See validateStructure for the
+  // rationale.
   const lowerArticle = articleText.toLowerCase();
 
   const bannedPhrases = [
@@ -5363,6 +5537,9 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
 
   for (const rawLine of articleText.split('\n')) {
     const line = rawLine.trim().replace(/\*\*/g, '').trim();
+    // SOURCES ends the slides — stop so its URL/attribution lines never get
+    // folded into the last slide body and inflate its word count.
+    if (/^SOURCES/i.test(line)) break;
     const m = line.match(/^SLIDE\s*(\d+)/i);
     if (m) {
       flushSlide();
@@ -5371,7 +5548,7 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
       // countdowns ("SLIDE 9 … SLIDE 1") and would otherwise produce a
       // duplicate "1" that misclassifies the rank-1 item as a second intro.
       slideNum += 1;
-    } else if (slideNum > 0 && line && !line.startsWith('SOURCES') && !line.startsWith('META:')) {
+    } else if (slideNum > 0 && line && !line.startsWith('META:')) {
       if (!slideTitleSet) {
         // first non-empty line after the SLIDE marker is the title
         slideTitleSet = true;
@@ -5605,6 +5782,10 @@ export async function extractSubjectiveAudit(data: SubjectiveValidatedData, grok
 // ── S11. finalAssemblySubjective ──────────────────────────────────────────────
 
 export async function finalAssemblySubjective(data: SubjectiveAuditedData): Promise<FinalOutput> {
+  // Single, final em-dash strip — runs ONCE here, after all generation and audit
+  // rewrites. See finalAssembly for the rationale.
+  const cleanedArticle = stripEmDashesFromArticle(data.articleText).text;
+
   // Subjective quality: research 25% + structural 35% + style audit 40%.
   // No fact-verification score (we don't fact-check subjective claims).
   const researchScore = data.researchOk ? 80 : 50;
@@ -5658,7 +5839,7 @@ ${moderationReport}
 
   return {
     title: data.title, category: data.category, slideCount: data.slideCount, writerName: data.writerName,
-    articleText: data.articleText,
+    articleText: cleanedArticle,
     originalArticleText: data.originalArticleText || data.articleText,
     auditReport, qualityScore, researchScore,
     verificationScore: styleScore, structuralScore, originalityScore: styleScore,

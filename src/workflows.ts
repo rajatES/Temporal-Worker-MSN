@@ -21,6 +21,7 @@ import { STAGE_DEFS, STAGE_DEFS_SUBJECTIVE } from './types';
 const {
   prepareInputAndAnalyze,
   firecrawlScrape,
+  statmuseResearch,
   analyzeSourceAlignment,
   buildResearchStrategy,
   atomizeFacts,
@@ -573,23 +574,34 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
       'tiktok.com', 'pinterest.com', 'quora.com', 'youtube.com', 'youtu.be',
       'nytimes.com', 'wsj.com', 'bloomberg.com', 'theathletic.com', 'linkedin.com',
     ];
+    // Returns '' when no usable citation exists — a homepage fallback yields
+    // navigation junk, not article content, so skip the scrape instead.
     function pickCitationSubj(citations: string[], primary: string, skip: string[]): string {
-      const excluded = [...skipDomains, ...skip];
+      const excluded = [...skipDomains, ...skip].filter(Boolean);
       return citations.find(
         u => u?.startsWith('http') && u !== primary && !excluded.some(d => u.toLowerCase().includes(d))
-      ) ?? 'https://www.espn.com';
+      ) ?? '';
     }
     const cite1Url = pickCitationSubj(merged.citations, merged.primarySourceUrl, []);
     const cite2Url = pickCitationSubj(merged.citations, merged.primarySourceUrl, [cite1Url]);
     let cite1Markdown = '';
     let cite2Markdown = '';
-    try { cite1Markdown = await firecrawlScrape(cite1Url); } catch { /* skip */ }
-    try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip */ }
-    complete('scraping_citations', `${cite1Url.split('/')[2]} + ${cite2Url.split('/')[2]}`);
+    if (cite1Url) { try { cite1Markdown = await firecrawlScrape(cite1Url); } catch { /* skip */ } }
+    if (cite2Url) { try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip */ } }
+
+    // StatMuse live-stat scrape — sports categories only ("Sports - …"). Injected
+    // as TIER 1S (above Perplexity for numbers). Non-blocking on any failure.
+    let statmuse = { block: '', url: '' };
+    if (merged.isSports) {
+      try { statmuse = await statmuseResearch(merged.category, merged.title); } catch { /* non-blocking */ }
+    }
+
+    const scrapedLabel = [cite1Url, cite2Url].filter(Boolean).map(u => u.split('/')[2]).join(' + ') || 'no citations to scrape';
+    complete('scraping_citations', statmuse.block ? `${scrapedLabel} + statmuse` : scrapedLabel);
 
     // Stage 7: build prompt
     activate('building_prompt');
-    const prompted = await buildSubjectivePrompt(merged as any);
+    const prompted = await buildSubjectivePrompt(merged as any, statmuse);
     complete('building_prompt', `source quality: ${merged.sourceQuality}`);
 
     // Stage 8: generate (Claude → Grok fallback)
@@ -745,7 +757,9 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
     // Stage 12: Slide enrichment (Claude Haiku structured-field extraction)
     activate('enriching', 'Extracting image search fields…');
-    const parsedForEnrich = splitIntroAndContent(parseSlides(audited.articleText)).content
+    // Use final.articleText — finalAssemblySubjective applied the single,
+    // authoritative em-dash strip, so enriched slides and result are clean.
+    const parsedForEnrich = splitIntroAndContent(parseSlides(final.articleText)).content
       .map(s => ({ title: s.title, description: s.body }));
 
     let enrichment: EnrichmentResult | null = null;
@@ -756,7 +770,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
       warn('enriching', 'Enrichment failed — using fallback');
     }
 
-    workflowResult = buildWorkflowResult(audited.articleText, final, enrichment);
+    workflowResult = buildWorkflowResult(final.articleText, final, enrichment);
     complete('complete');
     return workflowResult;
   }
@@ -916,11 +930,14 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     'nytimes.com', 'wsj.com', 'bloomberg.com', 'theathletic.com', 'linkedin.com',
   ];
 
+  // Returns '' when no usable citation exists — scraping a homepage fallback
+  // (e.g. espn.com) yields navigation junk, not article content, so we skip
+  // instead. With real Perplexity citations now extracted, this is rare.
   function pickCitation(citations: string[], primary: string, skip: string[]): string {
-    const excluded = [...skipDomains, ...skip];
+    const excluded = [...skipDomains, ...skip].filter(Boolean);
     return citations.find(
       u => u?.startsWith('http') && u !== primary && !excluded.some(d => u.toLowerCase().includes(d))
-    ) ?? 'https://www.espn.com';
+    ) ?? '';
   }
 
   const cite1Url = pickCitation(mergedData.citations, mergedData.primarySourceUrl, []);
@@ -928,13 +945,23 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
   let cite1Markdown = '';
   let cite2Markdown = '';
-  try { cite1Markdown = await firecrawlScrape(cite1Url); } catch { /* skip on failure */ }
-  try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip on failure */ }
-  complete('scraping_citations', `${cite1Url.split('/')[2]} + ${cite2Url.split('/')[2]}`);
+  if (cite1Url) { try { cite1Markdown = await firecrawlScrape(cite1Url); } catch { /* skip on failure */ } }
+  if (cite2Url) { try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip on failure */ } }
+
+  // StatMuse live-stat scrape — sports categories only ("Sports - …"). Injected
+  // as TIER 1S (above Perplexity for numbers). Non-blocking: any failure or
+  // unsupported question leaves research exactly as it was.
+  let statmuse = { block: '', url: '' };
+  if (mergedData.isSports) {
+    try { statmuse = await statmuseResearch(mergedData.category, mergedData.title); } catch { /* non-blocking */ }
+  }
+
+  const scrapedLabel = [cite1Url, cite2Url].filter(Boolean).map(u => u.split('/')[2]).join(' + ') || 'no citations to scrape';
+  complete('scraping_citations', statmuse.block ? `${scrapedLabel} + statmuse` : scrapedLabel);
 
   // ── Stage 7: Build Claude prompt ─────────────────────────────────────────────
   activate('building_prompt');
-  const promptData = await buildClaudePrompt(mergedData, cite1Markdown, cite2Markdown);
+  const promptData = await buildClaudePrompt(mergedData, cite1Markdown, cite2Markdown, statmuse);
   complete('building_prompt');
 
   // ── Stage 8 + 9: Article generation → Structural validation ─────────────────
@@ -1224,7 +1251,9 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
   // ── Stage 13: Slide enrichment (Claude Haiku structured-field extraction) ───
   activate('enriching', 'Extracting image search fields…');
-  const parsedForEnrich = splitIntroAndContent(parseSlides(auditedData.articleText)).content
+  // Use final.articleText — finalAssembly applied the single, authoritative
+  // em-dash strip, so both the enriched slides and the published result are clean.
+  const parsedForEnrich = splitIntroAndContent(parseSlides(final.articleText)).content
     .map(s => ({ title: s.title, description: s.body }));
 
   let enrichment: EnrichmentResult | null = null;
@@ -1235,7 +1264,7 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     warn('enriching', 'Enrichment failed — using fallback');
   }
 
-  workflowResult = buildWorkflowResult(auditedData.articleText, final, enrichment);
+  workflowResult = buildWorkflowResult(final.articleText, final, enrichment);
   complete('complete');
   return workflowResult;
 }
