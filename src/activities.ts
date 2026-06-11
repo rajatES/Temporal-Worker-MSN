@@ -1001,7 +1001,7 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   const numberMatch = title.match(/(\d+)\s+/);
   const promisedCount = numberMatch ? parseInt(numberMatch[1]) : entityCount;
   const mustIncludeExplicitOrder = detectMustIncludeExplicitOrder(userContext ?? '');
-  const isRanking = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title) || mustIncludeExplicitOrder;
+  const isRanking = /\b(top|best|greatest|worst|most|ranks?|ranked|ranking|highest|lowest)\b/i.test(title) || mustIncludeExplicitOrder;
   const isListicle = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
   const isTimeBased = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
   const emotionMatch = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
@@ -4719,7 +4719,7 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
   // ── Title analysis ────────────────────────────────────────────────────────
   const numberMatch = title.match(/(\d+)\s+/);
   const promisedCount = numberMatch ? parseInt(numberMatch[1]) : entityCount;
-  const isRanking = /\b(top|best|greatest|worst|most|ranked|ranking|highest|lowest)\b/i.test(title);
+  const isRanking = /\b(top|best|greatest|worst|most|ranks?|ranked|ranking|highest|lowest)\b/i.test(title);
   const isListicle = /\b(\d+)\s+(things?|ways?|reasons?|facts?|moments?|players?|movies?|shows?|athletes?|teams?)/i.test(title);
   const isTimeBased = /\b(history|all[- ]time|ever|classic|legendary|iconic|memorable)\b/i.test(title);
   const emotionMatch = title.match(/\b(shocking|surprising|unbelievable|amazing|incredible|heartbreaking|hilarious|controversial|unexpected|memorable|iconic|legendary)\b/i);
