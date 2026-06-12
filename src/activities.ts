@@ -1450,6 +1450,23 @@ export function buildStatmuseQuestion(title: string): string {
   return q;
 }
 
+/** Pull the ranking dimension — the stat axis the article ranks on — out of a
+ *  title, so per-entity queries can ask StatMuse for exactly that number instead
+ *  of a generic stat dump. "Top QBs by passing yards" → "passing yards". Returns
+ *  '' when the title names no stat dimension (then per-entity mode asks the generic
+ *  "stats" question). Conservative on purpose: a wrong guess just misses and falls
+ *  back to the generic query, so false positives are harmless. */
+export function extractStatmuseDimension(title: string): string {
+  const q = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const m = q.match(/\bby\s+(?:the\s+)?(?:most\s+|total\s+|fewest\s+|best\s+)?(.+?)((?:\s+(?:since|from|over|during|in|this|last)\s+.+)?)$/);
+  if (!m) return '';
+  const dim = m[1].trim();
+  if (dim.length < 4) return '';
+  // Reject "by"-tails that aren't stats (rankers, vague qualifiers).
+  if (/^(far|now|then|default|any\s|a\s|the\s|experts?|fans?|critics?|analysts?|writers?|position|team|conference|division|age|now)\b/.test(dim)) return '';
+  return dim;
+}
+
 /** Detect StatMuse's fallback "player directory" tables — alphabetical name
  *  listings (often with empty stat cells) served when it can't really answer
  *  the question. A genuine answer table is sorted by the stat, never by name. */
@@ -1587,11 +1604,11 @@ const STATMUSE_ENTITY_CAP = 40;
 const STATMUSE_CONCURRENCY = 5;
 const STATMUSE_DEADLINE_MS = 120_000;
 
-/** Scrape one entity's season stat card. Returns '' on any miss: scrape failure,
- *  "can't answer" page, thin/projected data, or an answer that isn't actually
- *  about this entity (StatMuse sometimes answers a near-miss question). */
-async function statmuseEntityScrape(league: string, name: string, season: string): Promise<string> {
-  const q = `${name} ${season} stats`.toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+/** Scrape one entity's stat card for a single phrasing. Returns '' on any miss:
+ *  scrape failure, "can't answer" page, thin/projected data, or an answer that
+ *  isn't actually about this entity (StatMuse sometimes answers a near-miss). */
+async function statmuseAsk(league: string, name: string, phrase: string): Promise<string> {
+  const q = phrase.toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').replace(/\s+/g, ' ').trim();
   const url = `https://www.statmuse.com/${league}/ask/${q.replace(/ /g, '-')}`;
   const resp = await axios.post(
     'https://api.firecrawl.dev/v2/scrape',
@@ -1609,6 +1626,19 @@ async function statmuseEntityScrape(league: string, name: string, season: string
   return block.length > 700 ? block.slice(0, 700) + '…' : block;
 }
 
+/** Scrape one entity's stat card, asking for the article's ranking dimension when
+ *  one is known ("josh allen 2025 passing yards") so the slide's headline stat is
+ *  the exact number the article ranks on — not a generic dump. Falls back to the
+ *  generic "{name} {season} stats" query when the dimension query misses, so
+ *  dimension-matching only ever adds focus, never costs coverage. */
+async function statmuseEntityScrape(league: string, name: string, season: string, dimension: string): Promise<string> {
+  if (dimension) {
+    const focused = await statmuseAsk(league, name, `${name} ${season} ${dimension}`);
+    if (focused) return focused;
+  }
+  return statmuseAsk(league, name, `${name} ${season} stats`);
+}
+
 /** Per-entity StatMuse research: when the writer already supplied the list, the
  *  right question is not the title — it's each listed entity's season stats.
  *  Queries every entity individually and assembles one block in the writer's
@@ -1618,6 +1648,7 @@ async function statmusePerEntityResearch(
   league: string,
   entityNames: string[],
   season: string,
+  dimension: string,
 ): Promise<{ block: string; url: string }> {
   const empty = { block: '', url: '' };
   const names = entityNames.slice(0, STATMUSE_ENTITY_CAP);
@@ -1631,7 +1662,7 @@ async function statmusePerEntityResearch(
     while (next < names.length && Date.now() - started < STATMUSE_DEADLINE_MS) {
       const name = names[next++];
       try {
-        const block = await statmuseEntityScrape(league, name, season);
+        const block = await statmuseEntityScrape(league, name, season, dimension);
         if (block) results.push({ name, block });
         else console.log(`[statmuseResearch] No usable answer for "${name}"`);
       } catch (err: unknown) {
@@ -1640,7 +1671,7 @@ async function statmusePerEntityResearch(
     }
   };
   await Promise.all(Array.from({ length: STATMUSE_CONCURRENCY }, workerLoop));
-  console.log(`[statmuseResearch] Per-entity mode: ${results.length}/${names.length} entities answered (season: ${season || 'unspecified'})`);
+  console.log(`[statmuseResearch] Per-entity mode: ${results.length}/${names.length} entities answered (season: ${season || 'unspecified'}${dimension ? `, dimension: ${dimension}` : ''})`);
   // Floor scales with list size: a 3-entity list with 2 answers is still worth a
   // tier; a 32-entity list with 2 answers is not.
   if (results.length < Math.min(3, Math.ceil(names.length / 2))) return empty;
@@ -1648,7 +1679,7 @@ async function statmusePerEntityResearch(
   const order = new Map(names.map((n, i) => [n, i]));
   results.sort((a, b) => (order.get(a.name) ?? 0) - (order.get(b.name) ?? 0));
   const block = [
-    `Per-entity ${season ? `${season} season ` : ''}stats, queried individually from StatMuse for each entity on the writer's list:`,
+    `Per-entity ${season ? `${season} season ` : ''}${dimension ? `${dimension} & supporting ` : ''}stats, queried individually from StatMuse for each entity on the writer's list:`,
     ...results.map(r => `\n• ${r.name}\n${r.block}`),
   ].join('\n');
   return {
@@ -1676,7 +1707,8 @@ export async function statmuseResearch(
   const entityNames = [...new Set(mustIncludeItems.map(mustIncludeEntityName).filter(Boolean))];
   if (entityNames.length >= 3) {
     const season = pickStatmuseSeason(title, opts?.userContext, opts?.seasonHint);
-    return statmusePerEntityResearch(league, entityNames, season);
+    const dimension = extractStatmuseDimension(title);
+    return statmusePerEntityResearch(league, entityNames, season, dimension);
   }
 
   const question = buildStatmuseQuestion(title);
