@@ -637,7 +637,9 @@ function parseWordCountOverride(userContext: string): { min: number; max: number
 // Broad enough to catch any writer-invented heading prefix with a number.
 const HEADING_PREFIX_RE = /^(?:slide|part|section|chapter|item|entry|topic|point)\s+\d+\s*[:.)–—-]\s*/i;
 // Standard list markers: "1.", "1)", "#1", "- ", "* ", "•"
-const LIST_MARKER_RE = /^(\d{1,3}[.)]\s*|#\d+[.):]?\s*|[-*•]\s+)/;
+// `(?!\d)` after the rank punctuation: "3.5mm jack" is a decimal, not list item
+// number 3 — without the lookahead the marker strip mangles it to "5mm jack".
+const LIST_MARKER_RE = /^(\d{1,3}[.)](?!\d)\s*|#\d+[.):]?\s*|[-*•]\s+)/;
 // Emoji section-header detection — \p{Emoji_Presentation} avoids false-
 // positives on ASCII digits 0-9 (which are in the broader \p{Emoji} set
 // because they form keycap sequences like 4️⃣).
@@ -732,37 +734,56 @@ function extractByHeadingMarkers(lines: string[]): string[] {
   return items;
 }
 
-function parseMustIncludeItems(raw: string): string[] {
+export function parseMustIncludeItems(raw: string): string[] {
   if (!raw || !raw.trim()) return [];
 
   const allLines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-  // ── Phase 0.5: Ranked tab-separated list (N\tName per line) ─────────────
-  // Writers often paste directly from a spreadsheet: "7\tCam Smith".
-  // Each line has exactly one tab. The multi-tab check for isTsv (Phase 1)
-  // won't fire, so without this path the items fall into flat-list parsing
-  // which then deduplicates — silently dropping the same player at two ranks.
-  // Here we skip dedup so a player at rank 3 AND rank 7 gets two slides.
-  const rankedTabLines = allLines.filter(l => /^\d{1,3}\t\S/.test(l));
-  if (rankedTabLines.length >= 3 && rankedTabLines.length >= allLines.length * 0.8) {
+  // ── Phase 0.5: Explicitly ranked list — one "RANK NAME" item per line ────
+  // Writers paste ranked lists from spreadsheets or notes in many shapes:
+  //   "7\tCam Smith"   "25. William Byron"   "25) Name"   "25: Name"
+  //   "25 - Name"      "#25 Name"            "#25. Name"
+  // When a strong majority of lines carry a rank marker, every LINE is one
+  // item — including the same name ranked at TWO positions (a driver with two
+  // standout seasons, a player on two lists). The generic paths below all run
+  // deduplicateItems(), which would silently drop the second occurrence; that
+  // single dropped row makes mustIncludeItems shorter than slideCount, and for
+  // a ranked countdown the off-by-one cascades: every later rank shifts up one
+  // slot and the final #1 — the article's headline payoff — gets filled with a
+  // fabricated/substituted name. So this path preserves duplicates, tagging a
+  // repeat with "(rank N)". That suffix is a pipeline-wide convention:
+  // slideEntityKey strips it, mustIncludeRepeatsEntities relies on it to flag
+  // intentional repeats, and the batch builders relax their no-repeat rule on it.
+  const matchRankedLine = (line: string): RegExpMatchArray | null =>
+    line.match(/^#(\d{1,3})[.):]?\s+(.+)$/) ||                 // "#25 Name" / "#25. Name"
+    line.match(/^(\d{1,3})(?:\t\s*|[.):]\s+|\s*[-–—]\s+)(.+)$/); // "25\tName" / "25. Name" / "25) Name" / "25: Name" / "25 - Name"
+  const rankedLines = allLines.filter(l => matchRankedLine(l));
+  if (rankedLines.length >= 3 && rankedLines.length >= allLines.length * 0.8) {
     const rankedItems: string[] = [];
     const seenRankedNames = new Map<string, string>();
     for (const line of allLines) {
-      const m = line.match(/^(\d{1,3})\t(.+)$/);
+      const m = matchRankedLine(line);
       if (!m) continue;
       const rank = m[1];
-      const name = m[2].trim();
+      // Multi-column tab rows ("5\tName\t2014"): the first tab field is the
+      // name, the rest is context. Key the dedup on the NAME alone so the same
+      // name at two ranks is recognized even when its per-row context differs.
+      const [rawName, ...ctxParts] = m[2].split('\t').map(s => s.trim()).filter(Boolean);
+      const name = stripHeadingPrefix((rawName ?? '').trim());
       if (!name || name.length <= 2 || isSkippableLine(name)) continue;
+      const context = ctxParts.join(', ');
       const nameLower = name.toLowerCase();
+      let display: string;
       if (seenRankedNames.has(nameLower)) {
-        // Same player at a different rank position — keep both, disambiguate with rank
-        rankedItems.push(`${name} (rank ${rank})`);
+        // Same entry ranked at a second position — keep both, disambiguate with rank
+        display = `${name} (rank ${rank})`;
       } else {
         seenRankedNames.set(nameLower, rank);
-        rankedItems.push(name);
+        display = name;
       }
+      rankedItems.push(context ? `${display} — ${context}` : display);
     }
-    return rankedItems;
+    if (rankedItems.length >= 3) return rankedItems;
   }
 
   // ── Phase 0: Detect structured heading+paragraph input ───────────────
@@ -797,6 +818,17 @@ function parseMustIncludeItems(raw: string): string[] {
 
   const extracted: string[] = [];
 
+  // Tables and TSVs carry a rank column too — the same intentional-duplicate
+  // case as Phase 0.5 applies. Track seen names per parse; a repeated name with
+  // a known rank gets the "(rank N)" tag so the final deduplicateItems() pass
+  // (whose normalizer keeps digit-bearing parentheticals) cannot collapse it.
+  const seenRowNames = new Map<string, string>();
+  const tagRepeat = (name: string, rank: string | null): string | null => {
+    const key = name.toLowerCase();
+    if (!seenRowNames.has(key)) { seenRowNames.set(key, rank ?? ''); return name; }
+    return rank ? `${name} (rank ${rank})` : null;   // repeat without a rank → accidental, let dedup drop it
+  };
+
   if (isTable) {
     for (const line of allLines) {
       // Skip separator rows: | -- | --- | etc.
@@ -812,9 +844,14 @@ function parseMustIncludeItems(raw: string): string[] {
       let nameParts: string[] = [];
       let contextParts: string[] = [];
       let seenName = false;
+      let rank: string | null = null;
 
       for (const cell of cells) {
-        if (/^\d{1,3}$/.test(cell) || /^#\d+$/.test(cell)) continue;
+        const rankCell = cell.match(/^#?(\d{1,3})$/);
+        if (rankCell) {
+          if (rank === null) rank = rankCell[1];
+          continue;
+        }
         if (/^\d{4}(\s*[–\-]\s*\d{4})?$/.test(cell)) {
           contextParts.push(cell);
           continue;
@@ -828,7 +865,9 @@ function parseMustIncludeItems(raw: string): string[] {
       }
 
       if (nameParts.length === 0) continue;
-      const name = nameParts.join(' ').trim();
+      const baseName = nameParts.join(' ').trim();
+      const name = tagRepeat(baseName, rank);
+      if (!name) continue;
       const context = contextParts.filter(c => c.length > 0).join(', ').trim();
       const item = context ? `${name} — ${context}` : name;
       if (item.length > 2) extracted.push(item);
@@ -841,11 +880,16 @@ function parseMustIncludeItems(raw: string): string[] {
       if (/^(#|rank|no\.?|number|pos\.?|position|sr\.?|team|name|player)$/i.test(cols[0])) continue;
       if (cols.every(c => /^[a-z\s.()\/&]+$/i.test(c) && !/\d{4}/.test(c) && c.length < 30)) continue;
       let nameCol = cols[0];
-      if (/^\d{1,3}$/.test(nameCol) || /^#\d+$/.test(nameCol)) {
+      let rank: string | null = null;
+      const rankCol = cols[0].match(/^#?(\d{1,3})$/);
+      if (rankCol) {
+        rank = rankCol[1];
         nameCol = cols[1] ?? '';
       }
-      const name = nameCol.trim();
-      if (name.length > 2) extracted.push(name);
+      const baseName = nameCol.trim();
+      if (baseName.length <= 2) continue;
+      const name = tagRepeat(baseName, rank);
+      if (name) extracted.push(name);
     }
   } else {
     // ── Phase 2: Flat list (numbered, bulleted, comma-separated, plain) ──
@@ -1305,6 +1349,44 @@ function detectStatmuseLeague(category: string, title: string): string | null {
   return null;
 }
 
+/** Turn an article title into a question StatMuse can actually answer. StatMuse
+ *  handles "most <stat> by <subject> since <year>" but NOT "ranking <subject> by
+ *  <stat>" — ranking phrasing makes it fall back to an alphabetical player
+ *  directory instead of a leaderboard. Reorder ranking titles into the
+ *  leaderboard form; leave everything else as-is. */
+function buildStatmuseQuestion(title: string): string {
+  const q = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const m = q.match(/^(?:ranking|rank(?:ed)?|top(?:\s+\d+)?|best)\s+(.+?)\s+(?:ranked\s+)?by\s+(?:most\s+|total\s+)?(.+?)((?:\s+(?:since|from|over|during|in)\s+.+)?)$/);
+  if (m) return `most ${m[2]} by ${m[1]}${m[3]}`.replace(/\s+/g, ' ').trim();
+  return q;
+}
+
+/** Detect StatMuse's fallback "player directory" tables — alphabetical name
+ *  listings (often with empty stat cells) served when it can't really answer
+ *  the question. A genuine answer table is sorted by the stat, never by name. */
+function isStatmuseDirectoryListing(block: string): boolean {
+  const rows = block.split('\n').filter(l => l.startsWith('|') && !/^[|\s:-]+$/.test(l));
+  const dataRows = rows.slice(1); // first |-row is the header
+  if (dataRows.length < 5) return false; // too small to judge — keep it
+  const lastNames: string[] = [];
+  let statlessRows = 0;
+  for (const row of dataRows) {
+    const cells = row.split('|').map(c => c.trim());
+    const nameIdx = cells.findIndex(c => /[a-z]{2,}/i.test(c));
+    if (nameIdx === -1) continue;
+    const words = cells[nameIdx].toLowerCase().split(/\s+/);
+    lastNames.push(words[words.length - 1]);
+    if (!/\d/.test(cells[nameIdx + 1] ?? '')) statlessRows++;
+  }
+  if (lastNames.length < 5) return false;
+  if (statlessRows / lastNames.length > 0.3) return true; // mostly empty stat cells
+  let sortedPairs = 0;
+  for (let i = 1; i < lastNames.length; i++) {
+    if (lastNames[i] >= lastNames[i - 1]) sortedPairs++;
+  }
+  return sortedPairs / (lastNames.length - 1) >= 0.9; // names in alphabetical order
+}
+
 /** Reduce a StatMuse page to its answer sentence + stat table. Strips images and
  *  link markup, drops nav junk, caps table size so the block stays prompt-sized. */
 function cleanStatmuseMarkdown(md: string): string {
@@ -1339,7 +1421,7 @@ export async function statmuseResearch(category: string, title: string): Promise
     return empty;
   }
 
-  const question = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const question = buildStatmuseQuestion(title);
   if (!question) return empty;
   const url = `https://www.statmuse.com/${league}/ask/${question.replace(/ /g, '-')}`;
 
@@ -1360,6 +1442,10 @@ export async function statmuseResearch(category: string, title: string): Promise
     const block = cleanStatmuseMarkdown(md);
     if (block.length < 80) {
       console.log(`[statmuseResearch] Answer too thin after cleaning (${block.length} chars): ${url}`);
+      return empty;
+    }
+    if (isStatmuseDirectoryListing(block)) {
+      console.log(`[statmuseResearch] Discarding alphabetical directory listing (not a real answer): ${url}`);
       return empty;
     }
     console.log(`[statmuseResearch] ${url}: ${md.length} chars raw → ${block.length} chars cleaned`);
@@ -1694,6 +1780,12 @@ function mergeAtomizedItems(items: AtomizedFact[]): AtomizedFact[] {
   return merged;
 }
 
+// Structural / navigational headings that must NOT be treated as list-item
+// entities — they signal nav, sidebars, sharing widgets, comments, or article
+// meta-sections. Used both when deciding whether a `##`-heading split is a real
+// entity list and when extracting an item name from a bare heading.
+const STRUCTURAL_HEADING_RE = /\b(comments?|related\s+articles?|related\s+stories|about\s+the\s+author|newsletter|sign\s*up|subscribe|trending|popular|more\s+from|the\s+latest|recommended|replies|editor'?s?\s*picks?|see\s+also|references?|footnotes?|table\s+of\s+contents|advertisement|sponsored|share(?:\s+this)?|topics?|follow\s+us|categories|tags)\b/i;
+
 export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
   // Multi-source equality: each scraped URL is an equally authoritative Tier 1A
   // source. We atomize each independently, then merge facts by item name so
@@ -1754,9 +1846,17 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
 
       // Strategy 3: ## headers with linked or plain "Entity: Subject" format
       // e.g. "## [Arizona Cardinals](url): Karlos Dansby" or "## Arizona Cardinals: Karlos Dansby"
+      // Only count NON-structural headings toward the threshold: a page like the
+      // NFLPA Top-50 list carries just "## Topics" and "## Share" above a bare
+      // numbered list, and counting those two used to satisfy >=3 and swallow the
+      // entire 50-name list into a single section (observed: 50 names → 3 items).
       if (sections.length < 3) {
         const entitySections = sourceContent.split(/(?=##\s*\[?[A-Z])/);
-        if (entitySections.length >= 3) {
+        const realEntityCount = entitySections.filter(s => {
+          const h = s.match(/^##\s*\[?([^\]\n]+)/);
+          return h && !STRUCTURAL_HEADING_RE.test(h[1]);
+        }).length;
+        if (realEntityCount >= 3) {
           sections = entitySections;
         }
       }
@@ -1773,21 +1873,31 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
 
       // Strategy 5: Bare numbered list items — "1. Name" or "1) Name" at line
       // start WITHOUT heading markers (#). Catches plain-text listicles.
+      // Tolerate markdown emphasis / link markers between the number and the name
+      // ("01. **Josh Allen**", "1. [Aaron Judge](url)") — without this the bold
+      // `**` prefix defeats the [A-Z] lookahead and the list never splits.
       if (sections.length < 3) {
-        const bareNumberedSections = sourceContent.split(/(?=\n\d{1,3}[.)]\s+[A-Z])/);
+        const bareNumberedSections = sourceContent.split(/(?=\n\d{1,3}[.)]\s+[*_"'\[]*[A-Z])/);
         if (bareNumberedSections.length >= 3) {
           sections = bareNumberedSections;
         }
       }
     }
 
-    sections.forEach((section, sectionIdx) => {
+    sections.forEach((rawSection, sectionIdx) => {
+      // The section splitters above use `(?=\n…)` lookaheads, so every section
+      // keeps a leading newline. Strip it so the `^`-anchored name extractors
+      // (numbered/bold Patterns C–F) match — otherwise "\n01. **Josh Allen**"
+      // fails `^\d`, every item falls back to "Item N", and fact-less entries get
+      // dropped (observed: a 50-name list collapsed to 2 items).
+      const section = rawSection.replace(/^\s+/, '');
       if (section.trim().length < 30) return;
 
       // Extract item number and name with multiple patterns
       let itemNumber = sectionIdx + 1;
       let itemName = `Item ${sectionIdx + 1}`;
       let content = section;
+      let bareListItem = false;   // set by Pattern F — enables trailing-team capture
 
       // Pattern A: "N of M" counter line followed by ## heading
       const nOfMMatch = section.match(/(\d{1,3})\s+of\s+\d{1,3}\s*\n+##\s*\[?([^\]\n]+)\]?(?:\([^)]*\))?[:\s]*(.+?)(?:\n|$)/);
@@ -1825,10 +1935,6 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
       // ── Fallback patterns for lifestyle/entertainment/pop-culture sources ──
       // These fire only when Patterns A-C left the itemName as the default
       // "Item N", meaning the heading format is non-sports/non-numbered.
-
-      // Common structural headings that should NOT become item names — they
-      // signal navigation, comments, sidebars, or article meta-sections.
-      const STRUCTURAL_HEADING_RE = /\b(comments?|related\s+articles?|related\s+stories|about\s+the\s+author|newsletter|sign\s*up|subscribe|trending|popular|more\s+from|the\s+latest|recommended|replies|editor'?s?\s*picks?|see\s+also|references?|footnotes?|table\s+of\s+contents|advertisement|sponsored|share\s+this)\b/i;
 
       // Pattern D: Bare ## heading — lifestyle, entertainment, pop-culture
       // sources using plain "## Name" or "## Name (Alias)" headings without
@@ -1878,6 +1984,7 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
           if (sepMatch && sepMatch[1].length > 2) heading = sepMatch[1].trim();
           itemName = heading;
           content = section.replace(/^\d{1,3}[.)]\s+[^\n]*\n/, '');
+          bareListItem = true;
         }
       }
 
@@ -1888,6 +1995,17 @@ export async function atomizeFacts(data: SourcedData): Promise<AtomizedData> {
         .replace(/^[A-Z][\w. ]+(?:\/|-)?(?:Getty Images|Icon Sportswire|Imagn Images|USA TODAY Sports|Allsport|Getty|AP Photo|Icon SMI)[^\n]*\s*/gm, '')
         .trim();
       const facts: AtomizedFact['facts'] = [];
+
+      // Bare "N. Name\n Team" roster entries (e.g. the NFLPA sales list): the only
+      // content under the name is a short proper-noun team line. Capture it as an
+      // affiliation fact so the item carries a real datum instead of being empty.
+      if (bareListItem) {
+        const firstLine = content.split('\n').map(l => l.trim()).find(Boolean) ?? '';
+        if (firstLine && firstLine.length <= 40 && !/\d/.test(firstLine)
+            && /^[A-Z][A-Za-z'.&-]+(?:\s+[A-Z][A-Za-z'.&-]+){0,4}$/.test(firstLine)) {
+          facts.push({ type: 'affiliation', value: firstLine });
+        }
+      }
 
       type StatDef = { pattern: RegExp; type: string };
       const statPatterns: StatDef[] = [
@@ -2110,8 +2228,9 @@ function extractPerplexityCitations(resp: PerplexityRaw | undefined, answer: str
   const seen = new Set<string>();
   const add = (raw: string | undefined): void => {
     if (!raw) return;
-    // Trim markdown/punctuation that clings to inline URLs (e.g. "url.**" or "url),").
-    const url = raw.trim().replace(/[)\]>.,;:'"*`]+$/, '');
+    // Trim markdown/punctuation that clings to inline URLs (e.g. "url.**", "url),"
+    // or a half-captured footnote like "url[5").
+    const url = raw.trim().replace(/\[\d*$/, '').replace(/[)\]>.,;:'"*`]+$/, '');
     if (/^https?:\/\//i.test(url) && !seen.has(url)) { seen.add(url); found.push(url); }
   };
 
@@ -2122,7 +2241,7 @@ function extractPerplexityCitations(resp: PerplexityRaw | undefined, answer: str
 
   // 2. Fallback — harvest every URL embedded in the answer body (Source URL lines,
   //    footnote URLs, or bare links), in document order.
-  const re = /https?:\/\/[^\s)<>\]"'*`]+/g;
+  const re = /https?:\/\/[^\s)<>[\]"'*`]+/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(answer)) !== null) add(m[0]);
   return found;
@@ -2623,6 +2742,21 @@ export async function mergeResearch(data: ResearchedData, retryResp?: Perplexity
 
 // ── 9. buildClaudePrompt (n8n: "Build Claude Prompt") ────────────────────────
 
+/** Detect a time window promised by the title ("Since 2016", "From 2010",
+ *  "2016-2024", "Last 5 Years"). When found, the prompt gets a hard constraint
+ *  so ranked items never come from seasons outside the promised window — a
+ *  failure observed in production ("Since 2016" articles ranking 2006-2010
+ *  seasons pulled from an all-years source table). */
+function detectTitleTimeWindow(title: string, currentYear: number): { label: string; startYear: number } | null {
+  let m = title.match(/\b(?:since|from|after)\s+((?:19|20)\d{2})\b/i);
+  if (m) return { label: m[0], startYear: parseInt(m[1]) };
+  m = title.match(/\b((?:19|20)\d{2})\s*[-–—]\s*(?:19|20)\d{2}\b/);
+  if (m) return { label: m[0], startYear: parseInt(m[1]) };
+  m = title.match(/\b(?:last|past)\s+(\d{1,2})\s+years?\b/i);
+  if (m) return { label: m[0], startYear: currentYear - parseInt(m[1]) };
+  return null;
+}
+
 export async function buildClaudePrompt(data: MergedData, citation1Markdown: string, citation2Markdown: string, statmuse?: { block: string; url: string }): Promise<PromptData> {
   function truncate(text: string, maxWords: number): string {
     const words = text.split(/\s+/);
@@ -2643,6 +2777,7 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
   const ta = data.titleAnalysis;
   const fc = data.formatConfig;
   const tc = data.temporalContext;
+  const titleTimeWindow = detectTitleTimeWindow(data.title, tc.currentYear);
   const writingStyleBlock = data.writingStyle ? `\n\nWRITING STYLE INFLUENCE (from writer): ${data.writingStyle}\nApply this style naturally throughout the slideshow.` : '';
 
   // Detect whether the writer explicitly fixed the mustInclude slide order.
@@ -2666,12 +2801,28 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
     }
   }
 
+  // Reconcile the mandatory-item count against the requested slide count. The
+  // must-include list is a FLOOR (these items must appear), not necessarily the
+  // full set: it may be shorter than slideCount, in which case the remaining
+  // slots are filled from the source. When it EQUALS slideCount the list is the
+  // complete set — say so explicitly, so a single missing/extra row can never
+  // make the model invent a fill-in (the failure mode when a ranked #1 slot got
+  // a fabricated name after a duplicate was dropped upstream).
+  const fillGap = data.hasMustInclude ? data.slideCount - data.mustIncludeItems.length : 0;
+  const slotNote = !data.hasMustInclude
+    ? ''
+    : fillGap > 0
+      ? `\n\nSLOT COUNT: ${data.mustIncludeItems.length} mandatory item(s) listed, but you MUST produce ${data.slideCount} content slides. Each mandatory item gets its own slide; fill the remaining ${fillGap} slide(s) with the best additional ${ta.isRanking ? 'entries' : 'items'} drawn from the primary source first, then Perplexity/citations — never invented.${ta.isRanking ? ' Slot any filled entries into correct ranking order alongside the mandatory ones; never push a mandatory item out of its rank.' : ''}`
+      : fillGap < 0
+        ? `\n\nSLOT COUNT: ${data.mustIncludeItems.length} mandatory items listed but only ${data.slideCount} content slides requested. Include the ${data.slideCount} highest-priority mandatory items in order; do NOT exceed ${data.slideCount} content slides.`
+        : `\n\nSLOT COUNT: ${data.mustIncludeItems.length} mandatory items for exactly ${data.slideCount} content slides — this list IS the complete set. Do NOT add, drop, substitute, merge, or invent any item. One slide per listed item, no more and no fewer.`;
+
   const mandatoryItemsBlock = data.hasMustInclude
     ? `\nMANDATORY ITEMS — ${hasExplicitMustIncludeOrder
         ? 'already in FINAL SLIDE ORDER as specified by the writer (do NOT reorder)'
         : 'these override Tier 1A item selection'} (every one MUST get its own slide, even if not in Tier 1A):\n${data.mustIncludeItems.map((m, i) => `${i + 1}. ${m}`).join('\n')}\n${hasExplicitMustIncludeOrder
         ? `\n⚠️ ORDERING IS FIXED — Write slides in exactly this order. Do NOT reorder items based on Tier 1A rankings, narrative arc, or title subject prominence.\n${titleSubjectNote}`
-        : 'Do NOT substitute any mandatory item with a different item from the source. If a mandatory item lacks Tier 1A data, use Tier 1B/2/3 instead. Any tier headers or section labels in this list (e.g. "Tier 2 - Strong Contenders") are organizational groupings, NOT items — never give them their own slide.'}`
+        : 'Do NOT substitute any mandatory item with a different item from the source. If a mandatory item lacks Tier 1A data, use Tier 1B/2/3 instead. Any tier headers or section labels in this list (e.g. "Tier 2 - Strong Contenders") are organizational groupings, NOT items — never give them their own slide.'}${slotNote}`
     : '';
 
   const wordCountOverrideBlock = data.userWordCountOverride
@@ -2684,161 +2835,61 @@ This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCount
 Count every word silently before outputting each slide (the count must NEVER appear in the output). Rewrite if out of range.`
     : '';
 
-  const claudeSystemPrompt = `You are an expert MSN Slideshow writer for American audiences covering ${data.category}.
+  const claudeSystemPrompt = `You are a veteran features writer producing MSN slideshows for American audiences covering ${data.category}. You write like a sharp human columnist with real opinions and an ear for rhythm: specific, confident, warm, never mechanical. Every factual claim you make traces to the sources below.
 
 ${tc.dateAnchor}
 ${tc.seasonAnchor}${writingStyleBlock}
 
 ═══════════════════════════════════════════════════════════════
-SOURCE HIERARCHY — ABSOLUTE LAW (READ FIRST, OBEY ALWAYS)
+SOURCE & FACT RULES — ABSOLUTE LAW
 ═══════════════════════════════════════════════════════════════
 
-You will receive content in tiers. The hierarchy is non-negotiable:
+Content arrives in tiers. The hierarchy is non-negotiable.
 
-▓▓▓ TIER 1A: FACT AUTHORITY ▓▓▓
-This is your source of truth for numbers, names, dates, rankings, achievements, and quotes. Treat it as a reference, not a template. The facts are yours to use. The phrasing is not.
-
-Rules for Tier 1A:
-- If Tier 1A says "Player X had 42 TDs," write 42. Not "over 40," not "around 40."
-- If Tier 1A orders items 1-25, the article orders them 1-25. No re-ranking.
-- If Tier 1A lists 10 facts about an item, you may use any subset of those 10.
+TIER 1A — FACT AUTHORITY
+Your source of truth for numbers, names, dates, rankings, achievements, and quotes.
+- Exact figures only: if Tier 1A says 42 touchdowns, write 42. Not "over 40", not "around 40".
+- Its list order is final. No re-ranking, no substitutions. Use any subset of its facts per item.
+- AFFILIATION / DRAFT / TRANSACTIONS / POSITION / STATUS lines are AUTHORITATIVE for current team, draft pick, recent trades, and role — they override anything in your training.
+- CONTEXT lines are fact reference only: pull details from them, never their phrasing.
+- Read Tier 1A to learn the facts, never to learn how to phrase them. Build every sentence fresh, then verify the facts against Tier 1A afterward.
 - If Tier 1A contradicts anything else, Tier 1A wins. Always.
-- You read Tier 1A to learn the facts. You do not read Tier 1A to learn how to phrase them. Build each sentence fresh, then verify the facts against Tier 1A afterward.
-- Tier 1A items may include AFFILIATION / DRAFT / TRANSACTIONS / POSITION / STATUS lines. These are AUTHORITATIVE for current team, draft pick, recent trades, and role — override anything in your training that disagrees.
-- Some items may also have a CONTEXT line. CONTEXT is a fact reference only — pull factual details (team, role, recent events) from it if needed, but NEVER mirror its sentence structure or phrasing. Same 6-word Google-search test applies.
 
-▓▓▓ TIER 1B: USER CONTEXT — WRITER-PROVIDED DATA (USE ACTIVELY) ▓▓▓
-The writer pasted this manually. It may contain additional facts, stats, angles, emphasis instructions, and context that MUST be used in the article.
+TIER 1B — USER CONTEXT, WRITER-PROVIDED (USE ACTIVELY)
+The writer pasted this by hand. It mixes DATA and INSTRUCTIONS — treat them differently:
+- DATA (stats, names, dates, rankings, achievements, quotes) = authoritative facts. Use them in the relevant slides; if Tier 1B adds stats to a Tier 1A item, work them in. Discarding Tier 1B data is a failure — the writer provided it to be used.
+- INSTRUCTIONS (tone, emphasis, angles, things to avoid) = directives that shape how you write. Never quote an instruction as if it were slide content ("Focus on playoffs" guides fact selection; it never appears in a slide).
+- If Tier 1B contradicts a specific number in Tier 1A, Tier 1A wins. Everything else in Tier 1B stands as fact.
 
-CRITICAL — DATA vs. INSTRUCTIONS:
-TIER 1B may contain BOTH data and instructions. You must distinguish between them:
-- DATA (stats, names, dates, rankings, achievements, quotes) = use as FACTS in the relevant slides.
-- INSTRUCTIONS (tone preferences, what to emphasize, things to avoid, formatting notes, angles to take) = follow as DIRECTIVES that shape how you write. Never quote an instruction as if it were a fact in a slide.
-Example of data: "Patrick Mahomes threw 4,183 yards" → use as a fact.
-Example of instruction: "Focus on playoff performances" → follow this when choosing which facts to highlight, but do not write "The writer noted to focus on playoff performances" in a slide.
+TIER 2 — SUPPLEMENTARY CONTEXT (FRAMING ONLY, 35% MAX)
+For tone, mood, era-framing, and why-it-matters context. NEVER a source for stats, dates, percentages, dollar amounts, rankings, recent claims, or quotes. [STAT] placeholders mark removed conflicting stats — never invent a value for them. At least 60% of every slide's substance must be Tier 1A/1B facts; a slide built entirely on Tier 2 framing is a failure.
 
-Rules for Tier 1B:
-- Every fact, stat, or data point in Tier 1B is AUTHORITATIVE. Use it in the relevant slide.
-- If Tier 1B provides additional stats about an item already in Tier 1A, ADD those stats to the slide. Do not ignore them.
-- If Tier 1B mentions items, angles, or details not in Tier 1A, INCLUDE them in the article.
-- If Tier 1B contains instructions (tone, what to emphasize, what to avoid), FOLLOW them as directives.
-- If Tier 1B directly contradicts a specific number in Tier 1A, Tier 1A wins. For everything else, Tier 1B stands as fact.
-- DO NOT discard Tier 1B content. The writer provided it for a reason. If you wrote the article without using Tier 1B data or following Tier 1B instructions, you failed.
-
-▓▓▓ TIER 2: SUPPLEMENTARY TONE & CONTEXT (35% MAX) ▓▓▓
-This is for tone, mood, framing, and subjective angles. NEVER a fact source for stats, dates, or recent claims.
-
-Rules for Tier 2:
-- USE for: tone calibration, historical framing, comparisons across eras, why something matters in the category, subjective takes, mood
-- DO NOT pull from Tier 2: stats, dates, recent claims, percentages, dollar amounts, rankings, or direct quotes
-- Stats that conflicted with Tier 1A/1B have already been replaced with [STAT] — do not invent values for those placeholders
-- Tier 2 should inform AT MOST 35% of your contextual material. The bulk of every slide comes from Tier 1A/1B facts.
-- If Tier 1A and Tier 2 disagree on anything factual, Tier 1A wins
-
-▓▓▓ TIER 3: NEUTRAL PUBLIC FACTS (LAST RESORT, MARK WITH [*]) ▓▓▓
-Only for genuinely neutral facts that are not in Tier 1A, 1B, and are common knowledge.
-
-Allowed Tier 3 examples:
-- Team city ("the Kansas City Chiefs")
-- League name ("in the NBA")
-- Standard role ("the point guard")
-- Sport's basic rules
-
-NEVER allowed as Tier 3:
-- Any stat, even if "well-known"
-- Career totals, championships, awards
-- Years, dates, seasons
-- Quotes
-- Rankings or comparisons
-
-Mark every Tier 3 use with [*] inline.
+TIER 3 — NEUTRAL PUBLIC FACTS (LAST RESORT, MARK WITH [*])
+Only genuine common knowledge: a team's city, the league name, a standard role, the sport's basic rules. NEVER stats, career totals, awards, years, dates, quotes, or rankings — no matter how well-known. Mark every Tier 3 use with [*] inline.
 
 ═══════════════════════════════════════════════════════════════
-ANTI-HALLUCINATION PROTOCOL — NON-NEGOTIABLE
+THE FIVE-STEP CHECK — RUN SILENTLY BEFORE EACH SLIDE
 ═══════════════════════════════════════════════════════════════
 
-Before writing each slide, do this internal check:
+1. IDENTIFY the item in Tier 1A and Tier 1B.
+2. INVENTORY every fact they give you about it. That is the slide's complete fact pool.
+3. SELECT the 2-4 strongest: most specific, most surprising, most central to the angle (let Tier 1B instructions guide the choice).
+4. WRITE from only those facts plus connective tissue (verbs, transitions, framing).
+5. VERIFY: every specific claim traces to Tier 1A/1B, and no Tier 1B instruction got quoted as content. Anything that fails gets deleted. No "but it's true". No exceptions.
 
-STEP 1 — IDENTIFY: What is this slide about? Find the matching item in Tier 1A and Tier 1B.
+WHEN DATA IS THIN: check Tier 1B before settling for less. If both tiers are thin, write a shorter, sharper slide and reach the word range with stronger writing (better verbs, contrast, framing), never with invented facts. A 38-word slide of pure truth beats a 48-word slide with one fabricated detail. If the tiers give you only one fact, build the whole slide around that one fact.
 
-STEP 2 — INVENTORY: List every fact Tier 1A gives you about this item, THEN every fact (not instruction) Tier 1B gives you. Combined, that is your complete fact pool for this slide. Tier 1B instructions shape your writing but are not facts to include.
-
-STEP 3 — SELECT: Pick the 2-4 strongest facts from your inventory. Strength means: most specific, most surprising, most central to the slideshow's angle. If Tier 1B instructions tell you to emphasize certain aspects, let that guide your selection.
-
-STEP 4 — WRITE: Build the slide using ONLY those selected facts plus connective tissue (verbs, transitions, framing).
-
-STEP 5 — VERIFY: Re-read the slide. For every specific claim ask: "Is this in my Tier 1A or Tier 1B fact inventory?"
-- If YES: keep it
-- If NO: delete it
-- No exceptions, no "but it's true," no "but it makes the slide better"
-- Also check: "Did I accidentally quote a Tier 1B instruction as content?" If yes, remove it.
-
-WHEN TIER 1A IS THIN FOR AN ITEM:
-- Check Tier 1B for additional facts about this item before writing a shorter slide
-- If Tier 1B has relevant data, USE it to build a fuller slide
-- If BOTH Tier 1A and 1B are thin, write a shorter, sharper slide using only what they provide
-- Use stronger writing (better verbs, contrast, rhythm) to reach 35-50 words — not more facts
-- A 38-word slide of pure truth beats a 48-word slide with one invented detail
-- If Tier 1A and 1B truly only give you one fact, build the slide around that one fact with framing
-
-WHAT YOU MUST NEVER DO:
-- Invent a stat to round out a slide
-- Pull a "well-known" career number from training when it's not in Tier 1A or 1B
-- Add a championship, award, or milestone not mentioned in Tier 1A or 1B
-- Quote anyone unless the quote is verbatim in Tier 1A or 1B
-- Reorder, re-rank, or substitute items from Tier 1A's list
-- Fill word count by adding fabricated context
-- Ignore Tier 1B data that the writer provided
-- Write a Tier 1B instruction into a slide as if it were a fact or quote
+NEVER: invent or "recall" a stat, championship, award, or milestone not in Tier 1A/1B, no matter how well-known. Never quote anyone unless the quote is verbatim in Tier 1A/1B. Never reorder, re-rank, or substitute Tier 1A's items. Never pad word count with fabricated context.
 
 ═══════════════════════════════════════════════════════════════
-ABSOLUTE OUTPUT RULE
+ORIGINALITY — FACTS ARE YOURS, LANGUAGE IS NOT
 ═══════════════════════════════════════════════════════════════
 
-You MUST always produce the complete slideshow. No exceptions.
-
-These responses are FORBIDDEN:
-- "I need more data before I can proceed"
-- "The fact database is insufficient"
-- "I cannot write this without X"
-- Asking clarifying questions instead of writing slides
-- Any response that is not the full formatted slideshow
-
-If Tier 1A is thin, check Tier 1B. If both are thin, write tighter slides using only their facts. Never substitute training knowledge for Tier 1A/1B data. A complete article built strictly on Tier 1A + 1B — even if some slides are shorter or simpler — is the correct output. Always.
-
-═══════════════════════════════════════════════════════════════
-ORIGINALITY REQUIREMENTS — WRITING FRESH FROM FACTS
-═══════════════════════════════════════════════════════════════
-
-The Tier 1A block includes the FULL CLEANED SOURCE article. You have the original
-writing in front of you — and that is precisely WHY plagiarism risk is now highest.
-You are writing ORIGINAL content using Tier 1A and 1B FACTS. You are NOT paraphrasing.
-
-THE RULE: Facts are yours to use. Language is NOT.
-- Use any stat, date, name, achievement, ranking, or quote from Tier 1A or 1B
-- Write every sentence fresh — no copying phrases from the source
-- If you find yourself swapping synonyms, you're paraphrasing — rewrite completely
-- If you find yourself echoing the source's sentence rhythm, restructure completely
-
-When using a Tier 1A or 1B fact, vary how you present it:
-- RESTRUCTURE: if the source uses one long sentence, try two short ones
-- ADD A LAYER: pair the fact with a sharp observation the source doesn't make
-
-THE 60:40 RULE — TIER 1A vs TIER 2 BALANCE:
-- At least 60% of every slide's substance comes from Tier 1A / Tier 1B FACTS
-  (numbers, names, dates, rankings, achievements, direct stats from the primary source)
-- At MOST 40% may be Tier 2 framing (tone, mood, era-context, why-it-matters)
-- Tier 2 is NOT a fact source — never pull stats, dates, recent claims, or quotes
-  from Tier 2 into a slide
-- If a slide is 100% Tier 2 framing with no Tier 1A/1B facts, that slide is a FAILURE
-
-Quick checks before moving on:
-1. 6-word Google test: if any 6-word string of your sentence could be Google-searched
-   and land on the source article, rewrite that string
-2. Synonym-swap test: read each sentence next to the source — if it's the same shape
-   with different words, it's a paraphrase. Rewrite from the facts, not from the line
-3. Fact-density test: count the Tier 1A/1B facts in your slide. If it's < 2, the slide
-   is leaning on Tier 2 framing too hard — pull in another concrete fact
+The Tier 1A block includes the FULL cleaned source article. Having the original writing in front of you is exactly why plagiarism risk is highest. You are writing ORIGINAL content FROM facts, not paraphrasing the source.
+- 6-word test: if any 6 consecutive words of yours could be Google-searched straight to the source article, rewrite that string.
+- Synonym-swap test: the source's sentence shape with swapped words is still a paraphrase. Rebuild from the fact, not from the line.
+- If the source spends one long sentence on a fact, try two short ones. Pair facts with a sharp observation the source never makes.
+- Fact-density test: a slide with fewer than 2 Tier 1A/1B facts is leaning on framing too hard — pull in another concrete fact.
 
 ═══════════════════════════════════════════════════════════════
 TITLE-BODY CORRELATION (Highest Priority)
@@ -2853,16 +2904,16 @@ EVERY promise in this title MUST be delivered:
 ${ta.secondaryAngle ? `- Secondary angle: ${ta.secondaryAngle}` : ''}
 - If title makes a claim, literally substantiate it in the body using Tier 1A/1B facts
 - Negative keywords in the title must find their place in the copy verbatim
+${titleTimeWindow ? `- TIME WINDOW — HARD CONSTRAINT: the title promises "${titleTimeWindow.label}". Every ranked item and its headline stat MUST come from a season/event in ${titleTimeWindow.startYear} or later. A performance from before ${titleTimeWindow.startYear} is a FACTUAL ERROR no matter how famous it is — your fact sources may contain older data; skip it. Before writing each slide, check its year against ${titleTimeWindow.startYear}.` : ''}
 
 ═══════════════════════════════════════════════════════════════
-WORD COUNTS (STRICT - Count every word)
+STRUCTURE & COUNTS (validated by an automated counter)
 ═══════════════════════════════════════════════════════════════
 
-- Meta Description: MAX 120 characters
-- Intro slide (Slide 1): 40-60 words (substantial and intriguing — never thin)
-- Content slides: 35-50 words (aim for 40-45)
-- If over or under, rewrite until it fits. Do not approximate.
-- NEVER pad word count with invented facts. Use stronger writing instead.
+- Meta Description: MAX 120 characters.
+- Intro slide (Slide 1): 40-60 words HARD CAP. That is 3 sentences — 4 short ones at most. Substantial and intriguing — never thin.
+- Content slides: 35-50 words HARD CAP (aim for 40-45), 2-4 sentences — and VARY the sentence count from slide to slide. Slides over the cap are flagged as ERRORS, not suggestions. When in doubt, write SHORTER.
+- If over or under, rewrite until it fits. Never pad with invented facts — use stronger writing.
 - Count every word and character SILENTLY. The counts must NEVER appear in the output (no "(48 words)", no "(98 characters)").
 - Produce EXACTLY ${data.slideCount} content slides (plus the 1 intro). No more, no fewer.
 - Tier headers, section dividers, and category labels (e.g. "Tier 2 - Strong Contenders") are organizational only. NEVER output them as a slide.
@@ -2872,10 +2923,8 @@ META DESCRIPTION
 ═══════════════════════════════════════════════════════════════
 
 Max 120 characters. Intriguing. Angle-focused. Has a hook.
-Cannot be: CTA, reveal the main angle, paraphrased title.
-
-AI patterns to NEVER use: "Discover the...", "Explore the top...", "Find out why...", "You won't want to miss..."
-
+Cannot be: a CTA, a reveal of the main angle, a paraphrased title.
+Never use: "Discover the...", "Explore the top...", "Find out why...", "You won't want to miss...".
 Good pattern: [Specific unexpected fact from Tier 1A or 1B]. [Implied question].
 
 ═══════════════════════════════════════════════════════════════
@@ -2915,64 +2964,59 @@ Your intro must NOT:
 - Invent a hard stat that is not present in Tier 1A or 1B
 
 ═══════════════════════════════════════════════════════════════
-WRITING VOICE — THE SPICY WRITER FACTOR
+THE WRITING — THIS IS WHERE THE ARTICLE LIVES OR DIES
 ═══════════════════════════════════════════════════════════════
 
-You are not summarizing facts. You are REACTING to them. Write like a sharp, witty sports columnist or pop culture critic who genuinely cares about the subject and has opinions — but whose every factual claim traces back to Tier 1A or 1B.
+The format is rigid: short slides, hard word caps. All the life comes from how differently you build each one. A reader should never be able to tell that slide 14 was written by the same routine that wrote slide 3. These rules govern the CONTENT slides (Slide 2 onward); the intro follows its own section above.
 
-SCOPE: These voice rules govern the CONTENT slides (Slide 2 onward). The intro (Slide 1) follows its own section above — flowing, polished prose, never the gut-punch fragment rhythm below.
+ONE IDEA PER SLIDE
+Find the single most interesting true thing about this item — the detail you would actually text a friend — and build the slide around it. Other facts support that idea. A slide that tries to say everything says nothing.
 
-THE ENERGY RULES:
-- Lead with what made YOU react. If a Tier 1A/1B stat shocked you, let that shock hit the reader first.
-- One-sentence gut punches are your weapon. "38 years old. 40 touchdowns. Zero signs of slowing down." (assuming all numbers from Tier 1A/1B)
-- Contrast is your best friend. Set up expectation, then break it — using Tier 1A/1B facts.
-- Specificity IS creativity. Pull the specific from Tier 1A/1B, then frame it sharply.
+SENTENCES THAT CONNECT
+Each sentence picks up what the previous one left and moves it forward. Three unrelated statements in a row is a list, not writing. Read each slide back in your head: it should sound like a person talking, not a database printing.
 
-RHYTHM AND PACING:
-- Alternate sentence lengths deliberately. Short punch. Then longer context. Then short again.
-- Never let two slides have the same energy.
-- The reader should feel a tempo change every 2-3 slides.
+WRITE THE PERSON, NOT JUST THE NUMBERS
+Maximum 2 stats per slide, and every stat needs framing: why it matters, when it happened, who it affected, or what it led to. Include at least one beat about who this player or item actually IS — role, reputation, story arc. The numbers prove the point; the point is about a person. Let facts create the emotion: never say "amazing", show the stat that is amazing. Active voice, no cliches.
 
-NO TEMPLATE WRITING — CRITICAL WHEN SLIDES COVER SIMILAR ITEMS:
-When the slides describe similar things (home runs, games, players, gadgets, cars), the BIGGEST failure mode is reusing one sentence skeleton for every item with only the numbers swapped — e.g. "[Name] [verb] a [X]-foot blast that registered [Y] mph with a [Z]-degree launch angle." That reads as robotic stat-dumping and gets flagged.
-- Each slide must be BUILT DIFFERENTLY: vary the opening, change the order facts arrive in, change the sentence shape. Lead with the date on one, the reaction on the next, the opponent on another.
-- If you could generate slides 2–N by filling blanks in a single template, you have FAILED. Rewrite them.
-- Put the same stat in a different grammatical position each time (subject, object, aside) so no two slides rhyme structurally.
+VARY THE BUILD — THE #1 DEFENSE AGAINST AI-FEEL
+Never build two consecutive slides the same way, and never start two consecutive slides with the same word or grammatical construction. Rotate your LEAD across the deck:
+- THE MOMENT: drop the reader into a specific scene, game, or date
+- THE NUMBER: open cold with the stat, then make it mean something
+- THE PERSON: who they are or what they carry, then the payoff
+- THE CONTRAST: what was expected, against what actually happened
+- THE AFTERMATH: start with the consequence, work back to the cause
+- THE CLAIM: a flat, confident take you immediately back with facts
+Vary sentence count too: some slides run two long sentences, others four short ones, others one of each. Put recurring stat types in different grammatical positions (subject, object, aside) so no two slides rhyme structurally. If slides 2 through ${data.slideCount + 1} could be generated by filling blanks in one template, the article has FAILED — rewrite.
 
-EMOTIONAL TEXTURE (rotate through):
-- DISBELIEF, RESPECT, HUMOR (light), TENSION, NOSTALGIA
+ENDINGS
+End on a fact, an image, a consequence, or a pointed observation — and vary which. Never close two consecutive slides with a "wider meaning" line.
 
-WHAT TO AVOID:
-- Wikipedia voice: "He is widely regarded as one of the greatest..."
-- Cheerleader voice: "What an incredible, amazing, stunning performance!"
-- Resume voice: stat-dumping without framing
-- Template voice: the same sentence skeleton repeated across slides with only the numbers changed
+AI TELLS — these patterns expose machine writing. Hunt them down before output:
+1. Trailing participle closers: ", cementing his legacy", ", proving the doubters wrong". Maximum ONE in the whole article. Zero is better.
+2. "isn't just X, it's Y" and "more than just" constructions.
+3. Stacked staccato fragments as a default rhythm ("38 years old. 40 touchdowns. Zero doubt."). Allowed at most twice in the whole deck, where the punch is genuinely earned.
+4. A rhetorical question opening a slide.
+5. Decorative noun triads ("grit, grind, and glory").
+6. Empty closers ("It was a night to remember."). If the last sentence adds no new information, cut it.
+7. Wikipedia voice ("widely regarded as"), cheerleader voice ("incredible, stunning"), resume voice (stat-dumping without framing).
 
-THE GOLDEN RULE: Every slide should make someone want to text their friend about it. AND every fact must come from Tier 1A or 1B.
+CONSISTENCY TO THE LAST SLIDE
+Quality decay is the most common failure. Before writing Slide 1, find each slide's anchor fact in Tier 1A/1B and confirm the LAST slide's anchor is as specific as slide 3's. After writing, re-read the second half in isolation: any slide that embarrasses you next to slide 3 gets rebuilt from more Tier 1A/1B facts (never invented ones). No filler slides, ever.
 
-═══════════════════════════════════════════════════════════════
-CONTENT SLIDES — 5Ws + 1H Framework
-═══════════════════════════════════════════════════════════════
+SLIDE TITLES
+3-8 words, plain and intriguing — say the thing with an angle. No colon constructions ("Name: A Legacy Forged"), no pun quota, never one title shape repeated across the deck. Never open the slide body with the same words as its title.
 
-Every slide must answer the RELEVANT questions for that item using Tier 1A/1B:
-WHO / WHAT / WHEN / WHERE / WHY / HOW
+EXAMPLES — craft reference ONLY. The facts in them are illustrative and must NEVER appear in your article.
 
-You don't need all six — but the ones that matter MUST be answered using Tier 1A/1B facts.
+Weak (machine-feel):
+"Patrick Mahomes threw for 5,250 yards and 41 touchdowns in 2022. The performance earned him a second MVP award, cementing his status as the league's premier quarterback. It was another dominant chapter in his career."
+Why it fails: stat dump, trailing participle, empty closer. Twenty slides built like this read robotic no matter how good the facts are.
 
-═══════════════════════════════════════════════════════════════
-STATS NEED CONTEXT — MAX 2 STATS PER SLIDE
-═══════════════════════════════════════════════════════════════
-
-Every stat (from Tier 1A/1B) needs ONE of these as framing:
-- WHY it matters
-- WHEN it happened
-- WHO it affected
-- WHAT it led to
-
-The framing can come from your writing voice. The stat itself must be Tier 1A/1B.
-
-SAY SOMETHING ABOUT THE SUBJECT, NOT JUST THE NUMBERS:
-Every slide must include at least one line about WHO this player/item actually is — their role, reputation, story arc, or what this moment means for them. A slide that is just stats stitched together with transitions is a failure, even if every number is correct. The numbers prove the point; the point is about a person. Write the person first, then let the stat land the punch.
+Strong — three different builds:
+"Game 7 in Cleveland, one minute left, tie game. Kyrie Irving rose over Stephen Curry and buried the three that ended a 52-year title drought. The city had waited generations for one make and got the biggest one in league history."
+"Nobody drafted Kurt Warner, and for two years he stocked grocery shelves in Iowa for $5.50 an hour. Then 1999 happened. He threw 41 touchdowns, won league MVP, and walked off the Super Bowl field with its top honor too."
+"The scouting report said too small and too slow for Sunday football. Six rings later, that report reads like a comedy script. Tom Brady turned a sixth-round grudge into the longest revenge tour the sport has seen."
+Notice: different leads (moment, person, contrast), different sentence counts, different endings, zero filler — and every claim concrete.
 
 ${fc.isMultiSlideFormat ? `
 ═══════════════════════════════════════════════════════════════
@@ -2990,39 +3034,6 @@ CORRELATION WRITING
 Every slide must CONNECT two things using Tier 1A/1B facts about both.
 FORMULA: [Entity A's Tier 1A/1B trait] + [How it addresses Entity B's Tier 1A/1B need] + [Tier 1A/1B evidence]
 ` : ''}
-
-═══════════════════════════════════════════════════════════════
-QUALITY CONSISTENCY ENGINE
-═══════════════════════════════════════════════════════════════
-
-Quality decay is the most common failure. Combat it with these rules.
-
-PRE-WRITING PLANNING (MANDATORY before writing Slide 1):
-1. Read ALL Tier 1A and Tier 1B content completely
-2. Separate Tier 1B into DATA (facts to use) and INSTRUCTIONS (directives to follow)
-3. For EACH slide, identify the single strongest Tier 1A/1B fact that will anchor it
-4. Check Tier 1B for additional facts that can enrich each slide
-5. Verify slide 15's anchor is as specific as slide 3's
-6. If ANY slide has no Tier 1A/1B anchor, write a shorter slide — do NOT pull from Tier 2 or training
-7. Do NOT begin writing until every slide has a Tier 1A/1B anchor (or an acknowledged short-slide plan)
-
-THREE TESTS — every slide must pass ALL:
-TEST 1 — STRANGER TEST: Reading only this slide, would someone learn one specific real thing?
-TEST 2 — SIDE-BY-SIDE TEST: Is this as specific as slide 3?
-TEST 3 — SOURCE TEST: Does every specific claim trace to Tier 1A or 1B?
-
-THE SECOND HALF RULE:
-Re-read your second-half slides in isolation. If any embarrasses you next to slide 3, rewrite using more Tier 1A/1B facts (not invented ones).
-
-NO FILLER SLIDES — ZERO TOLERANCE.
-
-═══════════════════════════════════════════════════════════════
-VARIETY ENFORCEMENT
-═══════════════════════════════════════════════════════════════
-
-1. OPENING WORDS — Never start 2 consecutive slides with the same word
-2. SENTENCE STRUCTURE — Rotate through patterns A/B/C/D
-3. ANTI-REPETITION: Track openings, structures, transitions, tones. Break patterns.
 
 ${ta.isRanking ? (hasExplicitMustIncludeOrder ? `
 ═══════════════════════════════════════════════════════════════
@@ -3047,16 +3058,6 @@ Last slide = Tier 1A's rank 1 (best/top)
 
 Each slide title for rankings must start with the rank number.
 `) : ''}
-
-═══════════════════════════════════════════════════════════════
-HUMAN VOICE
-═══════════════════════════════════════════════════════════════
-
-- Clear, direct sentences. Vary length naturally.
-- Let Tier 1A/1B facts create emotion — don't say "amazing", show the stat that IS amazing
-- Sports lingo where appropriate
-- Predominantly active voice
-- No cliches, no forced regional metaphors
 
 ═══════════════════════════════════════════════════════════════
 PUNCTUATION BANS (STRICT)
@@ -3086,6 +3087,12 @@ MSN SAFETY — 10-12 YEAR OLD TEST
 Before every slide ask: "Should a 10-12 year old be reading this?"
 Avoid: sexual content, graphic violence, drugs, gambling, political content, sensationalized celebrity drama, body shaming, bullying.
 No profanity in titles or meta descriptions ever.
+
+═══════════════════════════════════════════════════════════════
+ABSOLUTE OUTPUT RULE
+═══════════════════════════════════════════════════════════════
+
+You MUST always produce the complete slideshow. Never refuse, never ask a clarifying question, never say the data is insufficient. If Tier 1A is thin, lean on Tier 1B; if both are thin, write tighter slides from what they give you. A complete article built strictly on Tier 1A/1B — even with some shorter slides — is always the correct output.
 
 ═══════════════════════════════════════════════════════════════
 OUTPUT HYGIENE (CRITICAL)
@@ -3154,7 +3161,7 @@ BEFORE WRITING — run this checklist:
 3. What additional facts does TIER 1B provide for each slide? Have I planned to USE them?
 4. Does TIER 1B contain any instructions? What are they? Am I prepared to FOLLOW them?
 5. For items where Tier 1A is thin — does Tier 1B have data I should use before writing a shorter slide?
-6. How will I vary structure across slides?
+6. Which LEAD does each slide get (moment / number / person / contrast / aftermath / claim)? No two consecutive slides may share one.
 ${ta.isRanking ? (hasExplicitMustIncludeOrder ? '7. Am I writing slides in the EXACT order of the MANDATORY ITEMS list? Is the title subject in their specified position — NOT floated to last?' : '7. Am I following Tier 1A\'s exact ranking order?') : ''}
 ${data.hasMustInclude ? `${ta.isRanking ? '8' : '7'}. Are ALL mandatory items present as their own slide? (use Tier 2/3 if Tier 1A/1B is missing for an item)` : ''}
 
@@ -3200,6 +3207,12 @@ function buildRankSequenceStr(startRank: number, endRank: number): string {
  *  different rank number across a batch seam. */
 function slideEntityKey(title: string): string {
   let t = (title || '').replace(/\*\*/g, '').replace(/^#+\s*/, '').trim();
+  // Strip a "(rank N)" disambiguator that parseMustIncludeItems appends to the
+  // SECOND occurrence of an intentionally repeated entry (a player/driver ranked
+  // at two positions). Without this the repeat keys as "name rank N" ≠ "name",
+  // so mustIncludeRepeatsEntities fails to flag the intentional repeat and the
+  // stitch backstop silently drops the second slide.
+  t = t.replace(/\s*\(rank\s*\d+\)\s*/i, ' ').trim();
   // Strip a leading rank marker: "20.", "20)", "20:", "#20 ", "No. 20", "20 -"
   // (separator may be punctuation OR just whitespace, e.g. "#16 Eury Pérez").
   t = t.replace(/^(?:no\.?\s*)?#?\s*\d{1,3}(?:\s*[.):\-–—]\s*|\s+)/i, '');
@@ -3226,6 +3239,10 @@ function mustIncludeRepeatsEntities(items?: string[]): boolean {
     if (!line || line === '---') continue;
     // Strip a leading "Slide N —/-/–/:/." marker so only the entity text remains.
     line = line.replace(/^slide\s*\d+\s*[—\-–:.]\s*/i, '');
+    // Strip the " — context" tail the table parser appends ("Name (rank 6) — 2021,
+    // Chevrolet") so the same entity at two ranks keys identically even when the
+    // per-row context differs.
+    line = line.split(' — ')[0].trim();
     const key = slideEntityKey(line);
     // Ignore non-entity boilerplate: the intro, separators, and the
     // "here are all N slides" header line.
@@ -3308,11 +3325,19 @@ Produce, in this exact order and nothing else:
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
     const { titles, openings } = extractBatchContinuity(priorBatchText);
+    // When the mandatory list intentionally ranks the same entity at two
+    // positions (e.g. a driver with two standout seasons), the blanket
+    // "no same person twice" rule would make this batch refuse the legitimate
+    // second slide. Relax it to a no-ACCIDENTAL-repeat rule in that case.
+    const repeatsAllowed = mustIncludeRepeatsEntities(data.mustIncludeItems);
+    const repeatRule = repeatsAllowed
+      ? 'Do NOT write any of them again UNLESS the MANDATORY ITEMS list ranks that same name at a second position — in that case you MUST write it again at its other rank. No other repeats or near-duplicates.'
+      : 'Do NOT write any of them again (no repeats, no near-duplicates, no same person under a different rank).';
     assignment = `This is BATCH ${spec.batchIndex + 1} of ${spec.totalBatches} — a CONTINUATION of an in-progress slideshow.
 Do NOT write a TITLE, META, intro, or SOURCES. Output ONLY SLIDE blocks.
 Produce the NEXT ${spec.contentCount} content slides — presentation positions ${spec.contentStart} to ${rangeEnd} of ${spec.totalContent} — continuing the EXACT ranking/presentation order from where the previous batch stopped.
 
-ALREADY WRITTEN — these items are DONE. Do NOT write any of them again (no repeats, no near-duplicates, no same person under a different rank):
+ALREADY WRITTEN — these items are DONE. ${repeatRule}
 ${titles.map((t, i) => `${i + 1}. ${t}`).join('\n') || '(none)'}
 
 OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
@@ -3340,6 +3365,7 @@ CRITICAL REMINDERS:
 - Every specific claim must trace to TIER 1A or TIER 1B.
 - Content slides must be ${wcRange} words. Count silently — never print the count.
 - ${isRankCountdown ? 'Use the exact rank numbers listed above for this batch. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : ta.isRanking ? 'Follow the ranking order exactly. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : 'Keep slide order consistent with the source. Never repeat an item already written in an earlier batch.'}
+- VARY THE BUILD: never construct two consecutive slides the same way — rotate leads (moment / number / person / contrast / aftermath / claim) and sentence counts, including across the batch boundary.
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
 Write this batch now.`;
@@ -3779,6 +3805,14 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   openingWords.forEach(w => wordCounts[w] = (wordCounts[w] ?? 0) + 1);
   const overused = Object.entries(wordCounts).filter(([, c]) => c > 2).map(([w, c]) => `"${w}" (${c}x)`);
   if (overused.length) warnings.push(`Repetitive openings: ${overused.join(', ')}`);
+  const consecutiveOpen = [...new Set(openingWords.filter((w, i) => i > 0 && w === openingWords[i - 1]))];
+  if (consecutiveOpen.length) warnings.push(`Consecutive slides open with the same word: ${consecutiveOpen.join(', ')}`);
+
+  // AI-tell: trailing-participle constructions (", cementing his legacy") read
+  // machine-made when they recur — the writing prompt allows at most one.
+  const participleTails = contentSlideArr.reduce((n, s) =>
+    n + (s.body.match(/,\s*(?:proving|cementing|showing|making|earning|capping|solidifying|marking|signaling|underscoring|highlighting)\s/gi)?.length ?? 0), 0);
+  if (participleTails >= 3) warnings.push(`AI-tell: ${participleTails} trailing-participle constructions (", proving/cementing/making...") across slides`);
 
   // Plagiarism
   const sigs = data.sourceSignatures ?? [];
@@ -4076,6 +4110,25 @@ HARD RULES:
 
 // ── 16. processVerification (n8n: "Process Fact Check Results") ──────────────
 
+/** Detect a CORRECTION_REPLACE that is really an instruction to a human editor
+ *  rather than concrete replacement text. Grok sometimes can't supply the real
+ *  value and emits something like "[Correct player per list, e.g. next eligible
+ *  QB or per full ranking]" or "[insert actual rank]". Applying these verbatim
+ *  publishes bracketed placeholder junk into the article (seen in production:
+ *  a slide titled "19. [Correct player per list]"). When detected we skip the
+ *  correction entirely so the ORIGINAL — real — text is kept instead. */
+function isPlaceholderCorrection(replace: string): boolean {
+  const t = replace.trim();
+  if (!t) return true;
+  // A bracketed span with internal whitespace is an editor note, not a value.
+  // Legit markers/citations have no spaces inside the brackets: [STAT], [*], [3].
+  if (/\[[^\]]*\s[^\]]*\]/.test(t)) return true;
+  // Bare editor-instruction phrasing Grok falls back to when it lacks the value.
+  if (/\b(?:correct|appropriate|actual|real|next eligible|per (?:the )?(?:full )?(?:list|ranking)|fill in|insert|placeholder|tbd|unknown|see source|n\/a)\b/i.test(t)
+      && /\b(?:player|rank|name|value|team|entry|here|above|below)\b/i.test(t)) return true;
+  return false;
+}
+
 export async function processVerification(data: ClaimedData, verifyResp: unknown): Promise<VerifiedData> {
   const resp = verifyResp as Record<string, unknown>;
   let text = '';
@@ -4100,7 +4153,7 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
   text = text.replace(/\*\*/g, '');
 
   // Extract URLs from text (citation gathering)
-  const urlMatches = [...text.matchAll(/https?:\/\/[^\s)>\"\]]+/g)];
+  const urlMatches = [...text.matchAll(/https?:\/\/[^\s)>[\]\"]+/g)];
   const citations = [...new Set(urlMatches.map(m => m[0]))].slice(0, 10);
 
   // ── Parse fact-check section (CLAIM/STATUS/CORRECTION_FIND/CORRECTION_REPLACE) ──
@@ -4148,6 +4201,11 @@ export async function processVerification(data: ClaimedData, verifyResp: unknown
         if (!cleanFind.trim()) {
           correctionsSkipped++;
           correctionLog.push(`SKIP claim ${claimIdx - 1}: empty CORRECTION_FIND`);
+        } else if (isPlaceholderCorrection(cleanReplace)) {
+          // Grok gave an editor instruction instead of a real value — applying it
+          // would paste placeholder junk into the article. Keep the original text.
+          correctionsSkipped++;
+          correctionLog.push(`SKIP claim ${claimIdx - 1}: placeholder REPLACE rejected, original kept: "${cleanReplace.slice(0, 80)}"`);
         } else {
           // Whitespace-tolerant find/replace that PRESERVES original whitespace
           // structure (newlines, tabs) in the matched span.
@@ -4299,6 +4357,8 @@ PART A — AUDIT CHECKLIST (evaluate each rule)
    - No cheerleader voice
    - No stat-dumping
    - No two consecutive slides starting with the same word
+   - No template construction (consecutive slides built on the same sentence skeleton)
+   - No repeated trailing-participle closers (", cementing...", ", proving...") across slides
 
 8. MSN SAFETY (10-12 year old test)
 
@@ -4957,9 +5017,8 @@ export async function mergeSubjectiveResearch(
 // ── S4. buildSubjectivePrompt (n8n: inlined in "Claude - Subjective Writer") ──
 
 export async function buildSubjectivePrompt(data: SubjectiveMergedData, statmuse?: { block: string; url: string }): Promise<SubjectivePromptData> {
-  const claudeSystemPrompt = `You are an expert MSN Slideshow writer for an American audience. You specialise in subjective, voice-driven articles — quotes collections, opinion rankings, nostalgic throwbacks, and personality-driven lists.
-
-Write in authentic American English — conversational, active voice, warm and human.
+  const subjTimeWindow = detectTitleTimeWindow(data.title, data.temporalContext.currentYear);
+  const claudeSystemPrompt = `You are a veteran features writer producing subjective, voice-driven MSN slideshows for an American audience — quotes collections, opinion rankings, nostalgic throwbacks, and personality-driven lists. You write like a sharp human columnist with real warmth and real opinions: specific, confident, conversational, never mechanical. Authentic American English, active voice.
 
 ═══════════════════════════════════════════════════════════════
 SOURCE HIERARCHY — ABSOLUTE LAW
@@ -5039,45 +5098,54 @@ Quick checks before moving on:
    with different words, it's a paraphrase. Rewrite from the facts, not from the line
 
 ═══════════════════════════════════════════════════════════════
-THE FEELING ENGINE — SUBJECTIVE WRITING VOICE
+THE WRITING — THIS IS WHERE THE ARTICLE LIVES OR DIES
 ═══════════════════════════════════════════════════════════════
 
-You are not summarising facts. You are making readers FEEL something. Every slide must create an emotional response — not describe one.
+You are not summarising facts. You are making readers FEEL something — and the way to do it is craft, not adjectives. These rules govern the CONTENT slides (Slide 2 onward); the intro follows its own section below.
 
-SCOPE: These voice rules govern the CONTENT slides (Slide 2 onward). The intro (Slide 1) follows its own section below — flowing, polished prose, never the short-fragment rhythm described here.
+SHOW, DON'T TELL
+Never write 'this was emotional' or 'this quote is powerful.' Put the reader inside the moment so they feel it themselves. Write the human, not the highlight reel: what did this cost them, mean to them, change for them? One genuine human detail beats three achievements.
 
-THE CORE PRINCIPLE: Show, don't tell. Never write 'this was emotional' or 'this was powerful.' Instead, put the reader inside the moment so they feel it themselves.
+ONE IDEA PER SLIDE, SHAPED AS A TINY ARC
+Find the single most resonant true thing about this item and build the slide around it: a setup, the moment, and why it lingers. Sentences must CONNECT — each picks up what the last one left and carries it forward. Three unrelated statements is a list, not writing. Let one emotional thread run through the whole slideshow so the slides read as chapters of one piece.
 
-EMOTIONAL ARCHITECTURE — rotate through these textures:
-- REVERENCE: the weight of what this person did, said, or meant. Slow the pace. Let the fact breathe.
-- INTIMACY: write as if you and the reader both remember this moment. Fan-to-fan closeness.
-- SURPRISE: lead with the unexpected angle. The thing about this item that makes someone say 'wait, really?'
-- WARMTH: genuine affection without sentimentality. The difference between loving something and gushing about it.
-- GRAVITY: for the moments that genuinely changed something. Let the consequence land.
+EMOTIONAL PALETTE — range, not rotation duty:
+Reverence, intimacy, surprise, warmth, gravity. Let each item choose its feeling — never force a sequence — but no two consecutive slides may land the same one, and the reader should feel a tempo shift every 2-3 slides.
 
-RHYTHM RULES:
-- Short sentence. Then a longer one that builds. Then short again. The rhythm IS the emotion.
-- One-line gut punches are your weapon: set up context, then land the fact.
-- Never let two consecutive slides have the same emotional texture or sentence rhythm.
-- The reader should feel a tempo shift every 2-3 slides.
+VARY THE BUILD — THE #1 DEFENSE AGAINST AI-FEEL
+Never build two consecutive slides the same way, and never start two consecutive slides with the same word or grammatical construction. Rotate your LEAD across the deck:
+- THE QUOTE: open on the words themselves, or a striking fragment of them
+- THE MOMENT: drop the reader into a specific scene or memory
+- THE PERSON: who they are or what they carry, then the payoff
+- THE CONTRAST: what everyone assumed, against what was true
+- THE AFTERMATH: what changed once it happened
+- THE CLAIM: a flat, confident take you immediately back up
+Vary sentence count too: some slides run two long sentences, others four short ones, others one of each. If slides 2 through ${data.slideCount + 1} could be produced by filling blanks in one template, the article has FAILED — rewrite.
 
-CONTINUITY & HUMANITY — every slide is a tiny story about a person:
-- Within a slide, sentences must CONNECT — each one picks up something from the one before and carries it forward. A slide of three unrelated statements is a list, not writing.
-- Shape each slide as a miniature arc: a setup, the moment, and why it lingers. The reader should feel they lived a beat of this person's story, not skimmed their profile.
-- Write the human, not the highlight reel. What did this cost them, mean to them, change for them? One genuine human detail beats three achievements.
-- Let one emotional thread run through the whole slideshow, so the slides read as chapters of one piece rather than disconnected entries.
+ENDINGS
+End on an image, a fact, a consequence, or a pointed observation — and vary which. Never close two consecutive slides with a 'wider meaning' line.
 
-NO TEMPLATE WRITING: When slides cover similar items, do NOT reuse one sentence skeleton with only the names/details swapped. Each slide must be built differently — vary the opening, the order details arrive in, and the sentence shape. If you could produce slides 2–N by filling blanks in a single template, rewrite them.
+AI TELLS — these patterns expose machine writing. Hunt them down before output:
+1. Trailing participle closers: ', cementing his legacy', ', inspiring millions'. Maximum ONE in the whole article. Zero is better.
+2. 'isn't just X, it's Y' and 'more than just' constructions.
+3. Stacked staccato fragments as a default rhythm. Allowed at most twice in the whole deck, where the punch is genuinely earned.
+4. A rhetorical question opening a slide.
+5. Decorative noun triads ('grit, grind, and glory').
+6. Empty closers ('His words still resonate today.'). If the last sentence adds nothing new, cut it.
+7. Wikipedia voice ('widely regarded as'), cheerleader voice ('incredible, amazing'), greeting-card voice ('touched millions of hearts'), resume voice (achievements with no meaning), explaining the emotion ('This quote is powerful because...').
 
-THE RESONANCE TEST: After writing each slide, ask: 'Would someone want to screenshot this and send it to a friend?' If no, the slide lacks voice. Rewrite.
+THE RESONANCE TEST: after each slide, ask 'Would someone screenshot this and send it to a friend?' If no, the slide lacks voice. Rewrite.
 
-WHAT TO AVOID:
-- Wikipedia voice: 'He is widely regarded as one of the greatest...'
-- Cheerleader voice: 'What an incredible, amazing performance!'
-- Greeting card voice: 'His words touched millions of hearts around the world.'
-- Resume voice: listing achievements without making them mean anything.
-- Template voice: the same sentence skeleton repeated across slides with only the details changed.
-- Explaining emotions instead of creating them: 'This quote is powerful because...' — NO. Make the reader feel why without telling them.
+EXAMPLES — craft reference ONLY. The facts in them are illustrative and must NEVER appear in your article.
+
+Weak (machine-feel):
+'Michael Jordan's words about failure continue to inspire millions around the world. His message reminds us that setbacks are simply stepping stones on the road to greatness. Few athletes have ever embodied this mindset so completely.'
+Why it fails: explains the emotion instead of creating it, zero grounding detail, three interchangeable sentences that could describe anyone.
+
+Strong — two different builds:
+'"Pressure is a privilege." Billie Jean King won 39 Grand Slam titles believing exactly that. Decades later her line hangs inside the stadium that bears her name, where every US Open champion walks past it on the way to the court.'
+'Every kid who grew up in the nineties knows the sound a Blockbuster case made when it snapped shut. Friday night meant walking those blue carpet aisles twice before committing. The movie barely mattered. The choosing was the whole point.'
+Notice: different leads, different sentence counts, concrete grounding details, and the feeling is created, never announced.
 
 ═══════════════════════════════════════════════════════════════
 ARTICLE TYPE GUIDANCE
@@ -5192,6 +5260,7 @@ Every promise in the title MUST be delivered:
 - Emotions in title = show WHO felt it, WHEN, WHY — backed by a source fact
 - Main angle and secondary angle both substantiated
 - Negative keywords in title appear verbatim in the body
+${subjTimeWindow ? `- TIME WINDOW — HARD CONSTRAINT: the title promises "${subjTimeWindow.label}". Every item and its key facts MUST come from a season/event in ${subjTimeWindow.startYear} or later. Anything from before ${subjTimeWindow.startYear} is a FACTUAL ERROR no matter how famous it is — your fact sources may contain older data; skip it. Before writing each slide, check its year against ${subjTimeWindow.startYear}.` : ''}
 
 ═══════════════════════════════════════════════════════════════
 MUST-INCLUDE ITEMS — OVERRIDES TIER 1A ITEM SELECTION
@@ -5211,32 +5280,25 @@ WORD COUNTS — STRICT
 ═══════════════════════════════════════════════════════════════
 
 META: max 120 characters
-Slide 1 (Intro): 40-60 words (substantial and intriguing — no stats)
-All content slides: 35-50 words (aim for 40-45)
+Slide 1 (Intro): 40-60 words HARD CAP. That is 3 sentences — 4 short ones at most. A 5-sentence intro is ALWAYS over the cap. (Substantial and intriguing — no stats.)
+All content slides: 35-50 words HARD CAP (aim for 40-45), 2-4 sentences — and VARY the sentence count from slide to slide.
+These caps are validated by an automated counter after you finish — slides over the cap are flagged as ERRORS, not suggestions. When in doubt, write SHORTER.
 
 ═══════════════════════════════════════════════════════════════
 SLIDE TITLES
 ═══════════════════════════════════════════════════════════════
 
-Short, creative, close to the theme.
+3-8 words, plain and intriguing — say the thing with an angle. No colon constructions ('Name: A Legacy'), no pun quota, never one title shape repeated across the deck.
 For RANKING articles: start with rank number, list in REVERSE ORDER (slide 2 = lowest rank, last slide = #1).
 Never start the description with the slide title words.
 
 ═══════════════════════════════════════════════════════════════
-VARIETY ENFORCEMENT
-═══════════════════════════════════════════════════════════════
-
-Never start two consecutive slides with the same word or grammatical construction.
-Rotate emotional textures — no two adjacent slides should have the same energy.
-Vary sentence length deliberately across slides.
-
-═══════════════════════════════════════════════════════════════
-QUALITY CONSISTENCY
+CONSISTENCY TO THE LAST SLIDE
 ═══════════════════════════════════════════════════════════════
 
 Every slide must have equal information density. If slide 3 has a year + specific moment + context, slide 15 cannot be vague interpretation.
-Re-read all slides back-to-back. Any slide weaker than its neighbours must be rewritten.
-A shorter honest slide beats a longer half-true one.
+Re-read the second half in isolation; rebuild any slide weaker than its neighbours.
+A shorter honest slide beats a longer half-true one. No filler slides, ever.
 
 ═══════════════════════════════════════════════════════════════
 PUNCTUATION BANS
@@ -5285,7 +5347,7 @@ Count every word silently before outputting each slide (the count must NEVER app
 
   const factContextBlock = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${injectStatmuseTier(data.combinedFactRepresentation, statmuse)}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}`;
 
-  const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
+  const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n8. Which LEAD does each slide get (quote / moment / person / contrast / aftermath / claim)? No two consecutive slides may share one.\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
 
   return { ...data, claudeSystemPrompt, claudeUserPrompt, factContextBlock };
 }
@@ -5329,11 +5391,16 @@ Produce, in this exact order and nothing else:
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
     const { titles, openings } = extractBatchContinuity(priorBatchText);
+    // Same intentional-repeat relaxation as the objective batch builder.
+    const repeatsAllowed = mustIncludeRepeatsEntities(data.mustIncludeItems);
+    const repeatRule = repeatsAllowed
+      ? 'Do NOT write any of them again UNLESS the MANDATORY ITEMS list ranks that same name at a second position — in that case you MUST write it again at its other rank. No other repeats or near-duplicates.'
+      : 'Do NOT write any of them again (no repeats, no near-duplicates, no same person under a different rank).';
     assignment = `This is BATCH ${spec.batchIndex + 1} of ${spec.totalBatches} — a CONTINUATION of an in-progress slideshow.
 Do NOT write a TITLE, META, intro, or SOURCES. Output ONLY SLIDE blocks.
 Produce the NEXT ${spec.contentCount} content slides — presentation positions ${spec.contentStart} to ${rangeEnd} of ${spec.totalContent} — continuing the EXACT order from where the previous batch stopped.
 
-ALREADY WRITTEN — these items are DONE. Do NOT write any of them again (no repeats, no near-duplicates, no same person under a different rank):
+ALREADY WRITTEN — these items are DONE. ${repeatRule}
 ${titles.map((t, i) => `${i + 1}. ${t}`).join('\n') || '(none)'}
 
 OPENING WORDS ALREADY USED — do NOT start a slide with any of these:
@@ -5361,6 +5428,7 @@ CRITICAL REMINDERS:
 - Content slides must be ${wcRange} words. Count silently — never print the count.
 - ${isRankCountdown ? 'Use the exact rank numbers listed above for this batch. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : ta.isRanking ? 'List in REVERSE ranking order. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : 'Keep slide order consistent with the source. Never repeat an item already written in an earlier batch.'}
 - Keep the ${data.toneDial} tone and the subjective voice throughout.
+- VARY THE BUILD: never construct two consecutive slides the same way — rotate leads (quote / moment / person / contrast / aftermath / claim) and sentence counts, including across the batch boundary.
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
 Write this batch now.`;
@@ -5578,6 +5646,13 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
   openingWords.forEach(w => wordCounts[w] = (wordCounts[w] ?? 0) + 1);
   const overused = Object.entries(wordCounts).filter(([, c]) => c > 2).map(([w, c]) => `"${w}" (${c}x)`);
   if (overused.length) warnings.push(`Repetitive openings: ${overused.join(', ')}`);
+  const consecutiveOpen = [...new Set(openingWords.filter((w, i) => i > 0 && w === openingWords[i - 1]))];
+  if (consecutiveOpen.length) warnings.push(`Consecutive slides open with the same word: ${consecutiveOpen.join(', ')}`);
+
+  // AI-tell: trailing-participle constructions (", cementing his legacy") read
+  // machine-made when they recur — the writing prompt allows at most one.
+  const participleTails = (articleText.match(/,\s*(?:proving|cementing|showing|making|earning|capping|solidifying|marking|signaling|underscoring|highlighting|inspiring)\s/gi) ?? []).length;
+  if (participleTails >= 3) warnings.push(`AI-tell: ${participleTails} trailing-participle constructions (", proving/cementing/inspiring...") across slides`);
 
   // Must-include coverage
   if (data.mustIncludeItems.length > 0) {
