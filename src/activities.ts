@@ -1,4 +1,4 @@
-﻿import axios from 'axios';
+import axios from 'axios';
 import * as dotenv from 'dotenv';
 import {
   FormInput, PreparedData, SourcedData, AtomizedData, ResearchedData,
@@ -1386,10 +1386,29 @@ export async function firecrawlScrape(url: string, onlyMainContent = true): Prom
 // For sports-category articles we ask it the article title as a question and, when
 // it can answer, get back a clean current leaderboard/stat table — far more
 // reliable for NUMBERS than Perplexity prose. The result is injected into the
-// fact database as TIER 1S (above Perplexity, below the writer's own sources).
-// StatMuse can't answer everything (e.g. hit-distance queries return HTTP 422
-// with a "Sorry, I can't answer" page) — every failure path returns an empty
-// block so the pipeline falls back to the existing research flow unchanged.
+// fact database as TIER 1S: above Perplexity for numbers, but ALWAYS below the
+// writer's own source (1A), user context (1B), and must-include list — StatMuse
+// may fill stat gaps for entities already in the article, never change who is
+// in it or in what order.
+// Two modes:
+//   • PER-ENTITY (must-include list of 3+): the writer already decided who is in
+//     the article, so the title is only context — league + season — and StatMuse
+//     is asked for each listed entity's season stat card individually
+//     ("josh-allen-2025-stats"). Results assemble into one block in list order.
+//   • TITLE-QUESTION (no list): the title is asked as a single leaderboard
+//     question, as before.
+// StatMuse can't answer everything, and a wrong answer is worse than none (a
+// 32-QB opinion-ranking title once came back as a single Russell Wilson fantasy
+// projection that ended up published). Three guard layers keep it honest:
+//   1. Question: skip opinion/power-ranking titles StatMuse cannot answer
+//      (title-question mode only — per-entity questions are always answerable).
+//   2. Cleaning: keep only the answer region — the page chrome below it
+//      (suggested questions, news, league-leader widgets, standings) is served
+//      with every answer regardless of the question.
+//   3. Validation: discard projections/forecasts, answers that aren't about the
+//      asked entity, and title-mode answers that don't cover the writer's list.
+// Every failure path returns an empty block so the pipeline falls back to the
+// existing research flow unchanged.
 
 /** Map an MSN category (+ title keywords for "Sports - Other") to a StatMuse
  *  league domain. Returns null for non-sports categories and for sports StatMuse
@@ -1414,13 +1433,18 @@ function detectStatmuseLeague(category: string, title: string): string | null {
   return null;
 }
 
-/** Turn an article title into a question StatMuse can actually answer. StatMuse
- *  handles "most <stat> by <subject> since <year>" but NOT "ranking <subject> by
- *  <stat>" — ranking phrasing makes it fall back to an alphabetical player
- *  directory instead of a leaderboard. Reorder ranking titles into the
- *  leaderboard form; leave everything else as-is. */
-function buildStatmuseQuestion(title: string): string {
+/** Turn an article title into a question StatMuse can actually answer — or ''
+ *  when it can't answer it at all. StatMuse handles "most <stat> by <subject>
+ *  since <year>" but NOT "ranking <subject> by <stat>" — ranking phrasing makes
+ *  it fall back to an alphabetical player directory instead of a leaderboard.
+ *  Reorder ranking titles into the leaderboard form; leave everything else as-is.
+ *  Opinion rankings ("power rankings", "[opinion]", "worst to best" with no stat
+ *  dimension) have no statistical answer — asking anyway gets back a one-player
+ *  fantasy lookup or a directory, both worse than nothing. */
+export function buildStatmuseQuestion(title: string): string {
   const q = title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (/\bopinion\b|\bpower rankings?\b/.test(q)) return '';
+  if (/\b(worst to best|best to worst)\b/.test(q) && !/\bby\b/.test(q)) return '';
   const m = q.match(/^(?:ranking|rank(?:ed)?|top(?:\s+\d+)?|best)\s+(.+?)\s+(?:ranked\s+)?by\s+(?:most\s+|total\s+)?(.+?)((?:\s+(?:since|from|over|during|in)\s+.+)?)$/);
   if (m) return `most ${m[2]} by ${m[1]}${m[3]}`.replace(/\s+/g, ' ').trim();
   return q;
@@ -1452,32 +1476,193 @@ function isStatmuseDirectoryListing(block: string): boolean {
   return sortedPairs / (lastNames.length - 1) >= 0.9; // names in alphabetical order
 }
 
-/** Reduce a StatMuse page to its answer sentence + stat table. Strips images and
- *  link markup, drops nav junk, caps table size so the block stays prompt-sized. */
-function cleanStatmuseMarkdown(md: string): string {
+/** Markers for the page chrome StatMuse appends below every answer regardless of
+ *  the question: suggested-question bullets, league-leader widgets, standings
+ *  tables, news, scores & schedule. Once any of these appears, the actual answer
+ *  is over — everything below is furniture that once poisoned an article with
+ *  simulated standings data. */
+const STATMUSE_CHROME_RES: RegExp[] = [
+  /^-\s.*\?$/,                       // suggested-question bullets ("- Which team has…?")
+  /leaders\s*\*\*/i,                 // league-leader widgets ("Pass Yards Leaders **4,707**")
+  /scores\s*&\s*schedule/i,
+  /^\|\s*(AFC|NFC)\s/i,              // NFL standings tables
+  /^\|[^|]*\|\s*W\s*\|\s*L\s*\|/i,   // generic standings header (| … | W | L |)
+  /^##\s/,                           // section headings below the answer
+];
+
+/** Reduce a StatMuse page to its answer region: the answer sentence plus the
+ *  first stat table. Strips images and link markup, stops at the first chrome
+ *  marker or second table, caps table size so the block stays prompt-sized. */
+export function cleanStatmuseMarkdown(md: string): string {
   const noImages = md
     .replace(/\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)/g, '')   // linked images
     .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                 // bare images
     .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');             // links → text
   const out: string[] = [];
   let tableRows = 0;
+  let sawTable = false;
+  let sawSeparator = false;
+  let pastFirstTable = false;
   for (const raw of noImages.split('\n')) {
     const line = raw.trim();
     if (!line) continue;
+    if (STATMUSE_CHROME_RES.some(re => re.test(line))) break;
     if (line.startsWith('|')) {
+      if (pastFirstTable) break;     // a second table is page furniture, not the answer
+      // Player pages append a game-log table directly under the season table with
+      // no gap — a second |---| separator row means a new table started.
+      const isSeparator = /^\|[\s|:-]+\|?$/.test(line);
+      if (isSeparator && sawSeparator) { out.pop(); break; } // pop that table's header row
+      if (isSeparator) sawSeparator = true;
+      sawTable = true;
       if (tableRows < 45) { out.push(line.replace(/\s+/g, ' ')); tableRows++; }
       continue;
     }
-    // Narrative answer lines carry a number and a real sentence; nav links don't.
+    if (sawTable) pastFirstTable = true;
+    // Narrative answer lines carry a number and a real sentence; nav junk doesn't.
     if (/\d/.test(line) && line.split(/\s+/).length >= 5 && !/sign in|toggle theme|trending/i.test(line)) {
-      out.push(line);
+      out.push(line.replace(/^#+\s*/, ''));
     }
   }
   const result = out.join('\n');
   return result.length > 7000 ? result.slice(0, 7000) + '\n[truncated]' : result;
 }
 
-export async function statmuseResearch(category: string, title: string): Promise<{ block: string; url: string }> {
+/** Extract the entity name from a must-include item: strip "(rank N)" suffixes
+ *  and anything after a dash separator ("Josh Allen — Buffalo Bills" → "Josh Allen"). */
+export function mustIncludeEntityName(item: string): string {
+  return item.replace(/\s*\(rank \d+\)\s*$/i, '').split(/\s+[—–-]\s+/)[0].trim();
+}
+
+/** Fold diacritics so "Jokić" matches "jokic" — StatMuse renders accented names,
+ *  writer lists usually don't (and vice versa). */
+function foldDiacritics(s: string): string {
+  return Array.from(s.normalize('NFD')).filter(c => { const n = c.charCodeAt(0); return n < 0x300 || n > 0x36f; }).join('');
+}
+
+/** The surname-ish match token for an entity: last word that isn't a generational
+ *  suffix, punctuation stripped, diacritics folded. "Michael Penix Jr." → "penix". */
+function entityMatchToken(name: string): string {
+  const words = foldDiacritics(name.toLowerCase()).split(/\s+/)
+    .map(w => w.replace(/[^a-z0-9]/g, ''))
+    .filter(w => w && !/^(jr|sr|ii|iii|iv|v)$/.test(w));
+  return words[words.length - 1] ?? '';
+}
+
+/** A StatMuse answer is only useful when it covers the writer's list. With a
+ *  multi-entity must-include list, an answer naming fewer than two of those
+ *  entities is answering some OTHER question — keep nothing rather than inject
+ *  an off-topic "authoritative" stat block. Lists under 3 items (or none) give
+ *  nothing to judge against, so the block is kept. */
+export function statmuseCoversMustInclude(block: string, mustIncludeItems: string[]): boolean {
+  const names = mustIncludeItems.map(i => mustIncludeEntityName(i).toLowerCase()).filter(Boolean);
+  if (names.length < 3) return true;
+  const blockLower = foldDiacritics(block.toLowerCase());
+  let hits = 0;
+  for (const name of names) {
+    const last = entityMatchToken(name);
+    if (last && last.length >= 3 && blockLower.includes(last)) hits++;
+    if (hits >= 2) return true;
+  }
+  return false;
+}
+
+/** Pick the season the per-entity questions should ask about. An explicit year
+ *  in the title wins, then a year tied to "season"/"stats" in the writer's
+ *  context, then the sport-aware season computed by prepareInput*'s temporal
+ *  context (currentSeason: the in-progress season mid-season, the just-completed
+ *  one in the offseason — both are what a "right now" article wants). */
+export function pickStatmuseSeason(title: string, userContext?: string, seasonHint?: string): string {
+  const t = title.match(/\b(20\d{2}(?:-\d{2})?)\b/);
+  if (t) return t[1];
+  const u = (userContext ?? '').match(/\b(20\d{2}(?:-\d{2})?)\b[^.]{0,30}?\b(?:season|stats)\b/i);
+  if (u) return u[1];
+  return seasonHint ?? '';
+}
+
+// Per-entity mode bounds: cap the list so cost and wall-clock stay sane, run a
+// small concurrent pool, and stop launching new scrapes near the activity's
+// 3-minute startToCloseTimeout so partial results return instead of timing out.
+const STATMUSE_ENTITY_CAP = 40;
+const STATMUSE_CONCURRENCY = 5;
+const STATMUSE_DEADLINE_MS = 120_000;
+
+/** Scrape one entity's season stat card. Returns '' on any miss: scrape failure,
+ *  "can't answer" page, thin/projected data, or an answer that isn't actually
+ *  about this entity (StatMuse sometimes answers a near-miss question). */
+async function statmuseEntityScrape(league: string, name: string, season: string): Promise<string> {
+  const q = `${name} ${season} stats`.toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+  const url = `https://www.statmuse.com/${league}/ask/${q.replace(/ /g, '-')}`;
+  const resp = await axios.post(
+    'https://api.firecrawl.dev/v2/scrape',
+    { url, formats: ['markdown'], onlyMainContent: true, blockAds: true, removeBase64Images: true, waitFor: 3000 },
+    { headers: { Authorization: `Bearer ${FIRECRAWL_KEY}` }, timeout: 25_000 },
+  );
+  const statusCode = resp.data?.data?.metadata?.statusCode;
+  const md: string = resp.data?.data?.markdown ?? resp.data?.markdown ?? '';
+  if (statusCode !== 200 || !md || /sorry, i can.{0,3}t answer/i.test(md)) return '';
+  const block = cleanStatmuseMarkdown(md);
+  if (block.length < 40) return '';
+  if (/\bprojected\b/i.test(block)) return '';
+  const token = entityMatchToken(name);
+  if (token.length >= 3 && !foldDiacritics(block.toLowerCase()).includes(token)) return '';
+  return block.length > 700 ? block.slice(0, 700) + '…' : block;
+}
+
+/** Per-entity StatMuse research: when the writer already supplied the list, the
+ *  right question is not the title — it's each listed entity's season stats.
+ *  Queries every entity individually and assembles one block in the writer's
+ *  list order. Individual misses are skipped; fewer than 3 hits returns empty
+ *  (not worth a tier). */
+async function statmusePerEntityResearch(
+  league: string,
+  entityNames: string[],
+  season: string,
+): Promise<{ block: string; url: string }> {
+  const empty = { block: '', url: '' };
+  const names = entityNames.slice(0, STATMUSE_ENTITY_CAP);
+  if (entityNames.length > names.length) {
+    console.log(`[statmuseResearch] Entity list capped at ${STATMUSE_ENTITY_CAP} (${entityNames.length} supplied)`);
+  }
+  const started = Date.now();
+  const results: Array<{ name: string; block: string }> = [];
+  let next = 0;
+  const workerLoop = async () => {
+    while (next < names.length && Date.now() - started < STATMUSE_DEADLINE_MS) {
+      const name = names[next++];
+      try {
+        const block = await statmuseEntityScrape(league, name, season);
+        if (block) results.push({ name, block });
+        else console.log(`[statmuseResearch] No usable answer for "${name}"`);
+      } catch (err: unknown) {
+        console.log(`[statmuseResearch] Scrape failed for "${name}": ${axios.isAxiosError(err) ? err.message : String(err)}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: STATMUSE_CONCURRENCY }, workerLoop));
+  console.log(`[statmuseResearch] Per-entity mode: ${results.length}/${names.length} entities answered (season: ${season || 'unspecified'})`);
+  // Floor scales with list size: a 3-entity list with 2 answers is still worth a
+  // tier; a 32-entity list with 2 answers is not.
+  if (results.length < Math.min(3, Math.ceil(names.length / 2))) return empty;
+
+  const order = new Map(names.map((n, i) => [n, i]));
+  results.sort((a, b) => (order.get(a.name) ?? 0) - (order.get(b.name) ?? 0));
+  const block = [
+    `Per-entity ${season ? `${season} season ` : ''}stats, queried individually from StatMuse for each entity on the writer's list:`,
+    ...results.map(r => `\n• ${r.name}\n${r.block}`),
+  ].join('\n');
+  return {
+    block: block.length > 16000 ? block.slice(0, 16000) + '\n[truncated]' : block,
+    url: `https://www.statmuse.com/${league}`,
+  };
+}
+
+export async function statmuseResearch(
+  category: string,
+  title: string,
+  mustIncludeItems: string[] = [],
+  opts?: { seasonHint?: string; userContext?: string },
+): Promise<{ block: string; url: string }> {
   const empty = { block: '', url: '' };
   const league = detectStatmuseLeague(category, title);
   if (!league) return empty;
@@ -1486,8 +1671,19 @@ export async function statmuseResearch(category: string, title: string): Promise
     return empty;
   }
 
+  // Per-entity mode: with a real must-include list, the title is context (league,
+  // season), not the question — ask StatMuse about each listed entity instead.
+  const entityNames = [...new Set(mustIncludeItems.map(mustIncludeEntityName).filter(Boolean))];
+  if (entityNames.length >= 3) {
+    const season = pickStatmuseSeason(title, opts?.userContext, opts?.seasonHint);
+    return statmusePerEntityResearch(league, entityNames, season);
+  }
+
   const question = buildStatmuseQuestion(title);
-  if (!question) return empty;
+  if (!question) {
+    console.log(`[statmuseResearch] Title has no statistical answer (opinion/power ranking) — skipping: ${title}`);
+    return empty;
+  }
   const url = `https://www.statmuse.com/${league}/ask/${question.replace(/ /g, '-')}`;
 
   try {
@@ -1513,6 +1709,17 @@ export async function statmuseResearch(category: string, title: string): Promise
       console.log(`[statmuseResearch] Discarding alphabetical directory listing (not a real answer): ${url}`);
       return empty;
     }
+    // Projections are forecasts, not results — presenting them as season stats
+    // is exactly the "got the numbers wrong" failure. Real result pages never
+    // say "projected".
+    if (/\bprojected\b/i.test(block)) {
+      console.log(`[statmuseResearch] Discarding projection/forecast data (not actual results): ${url}`);
+      return empty;
+    }
+    if (!statmuseCoversMustInclude(block, mustIncludeItems)) {
+      console.log(`[statmuseResearch] Discarding — answer does not cover the writer's must-include list: ${url}`);
+      return empty;
+    }
     console.log(`[statmuseResearch] ${url}: ${md.length} chars raw → ${block.length} chars cleaned`);
     return { block, url };
   } catch (err: unknown) {
@@ -1524,19 +1731,23 @@ export async function statmuseResearch(category: string, title: string): Promise
 
 /** Insert the StatMuse block into a fact representation as TIER 1S, directly above
  *  the TIER 2 (Perplexity) section. Carries its own self-contained priority rules
- *  so both the objective and subjective prompts get identical tiering: 1A/1B still
- *  win where they cover a fact; TIER 1S beats TIER 2 on every number; TIER 2 keeps
- *  its existing context/anti-plagiarism role. */
+ *  so both the objective and subjective prompts get identical tiering: TIER 1S is a
+ *  PRIMARY verified stat/context source the writer draws on actively for numbers,
+ *  trends, and comparisons, and it beats TIER 2 on any stat. The writer's data
+ *  (1A source, 1B context, must-include list) still wins on specific conflicts, and
+ *  TIER 1S can NEVER add, drop, or re-rank an entity — it enriches chosen slides,
+ *  never decides which slides exist. */
 function injectStatmuseTier(factRepresentation: string, statmuse?: { block: string; url: string }): string {
   if (!statmuse?.block) return factRepresentation;
   const tier = `═══════════════════════════════════════════════════════════════
-TIER 1S: STATMUSE LIVE STAT DATA — AUTHORITATIVE FOR NUMBERS
+TIER 1S: STATMUSE LIVE STAT DATA — VERIFIED STAT & CONTEXT SOURCE
 ═══════════════════════════════════════════════════════════════
 
-Live, queried-for-this-exact-topic stat data from StatMuse (${statmuse.url}).
-• For every NUMBER — stats, totals, rankings, leaderboard values — TIER 1S OUTRANKS TIER 2 (Perplexity). If they disagree on a number, TIER 1S wins. Always.
-• TIER 1A and TIER 1B still outrank TIER 1S where they cover the same fact.
-• TIER 2 keeps its existing role: tone, mood, framing, and context per its own rules. TIER 1S replaces only the numbers, never the narrative.
+Live, verified stat data from StatMuse (${statmuse.url}), queried for this topic. This is a PRIMARY research source — draw on it actively, the way you would Perplexity context, to ground and enrich the article with real current numbers, trends, and comparisons.
+• USE IT FOR INSIGHT, not just gap-filling: for every entity in the article that appears here, weave its real numbers into that slide — supporting stats, season totals, rate/efficiency figures, year-over-year or peer comparisons, and the context those numbers imply (a career year, a slump, a record pace). This is exactly the kind of concrete, verifiable detail that lifts a slide above generic praise.
+• TRUSTED FOR NUMBERS: for any stat, TIER 1S outranks TIER 2 (Perplexity) — if they disagree on a number, TIER 1S wins. Prefer pulling stats from here over inventing them or carrying them from training data.
+• SUBORDINATE TO THE WRITER ON SPECIFICS: TIER 1A (writer's source), TIER 1B (user context), and the MUST-INCLUDE list ALWAYS outrank TIER 1S. If TIER 1S disagrees with any of them on a specific number, ranking, or who belongs in the article — the writer's data wins and the TIER 1S version is ignored.
+• NEVER use TIER 1S to add an entity to the article, drop one, or change the writer's ranking or order. Who is in the article, and in what order, comes from TIER 1A/1B and the must-include list ONLY. StatMuse enriches the slides the writer chose; it never decides which slides exist.
 • Same anti-plagiarism rules apply: use the data, never the phrasing.
 
 ${statmuse.block}

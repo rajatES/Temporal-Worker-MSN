@@ -521,6 +521,43 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     } else {
       sourcedData = await buildResearchStrategy(prepared as any);
     }
+
+    // ── Human review: poor source alignment ───────────────────────────────────
+    // Parity with the objective pipeline (which pauses <40). The subjective flow
+    // used to sail past a failed/empty scrape: a JS-rendered page that returns
+    // only a "[Visit](url)" stub scores alignment 0, and the pipeline silently
+    // fell back to Perplexity — fabricating rankings the writer never sourced,
+    // even when they asked for "no external research". Pause here instead so a
+    // human can supply a working URL or consciously accept research-only mode.
+    if (prepared.hasValidUserSource && sourcedData.sourceAnalysis.alignmentScore < 40) {
+      warn('analyzing', `Low alignment: ${sourcedData.sourceAnalysis.alignmentScore}/100`);
+      const decision = await askHuman({
+        id: `poor-source-${Date.now()}`,
+        type: 'poor_source',
+        message: 'Source alignment is low — the page may have failed to load or may not match the article title.',
+        details: [
+          `Alignment score: ${sourcedData.sourceAnalysis.alignmentScore}/100`,
+          `Status: ${sourcedData.sourceAnalysis.status}`,
+          `Scraped content: ${primaryMarkdown.length} chars`,
+          `Recommendation: ${sourcedData.sourceAnalysis.recommendation}`,
+        ],
+        options: [
+          { label: 'Continue anyway (may use external research)', value: 'continue' },
+          { label: 'Swap to research-only mode (no user source)', value: 'research_only' },
+          {
+            label: 'Provide a better source URL',
+            value: 'new_source',
+            requiresInput: true,
+            inputPlaceholder: 'Paste a better source URL…',
+          },
+        ],
+      });
+      if (decision.choice === 'research_only') {
+        sourcedData = await buildResearchStrategy(prepared as any);
+      }
+      // 'new_source' with additionalInput would need a re-scrape — handled in a
+      // future iteration; for now fall through to continue with original data.
+    }
     complete('analyzing', `alignment ${sourcedData.sourceAnalysis.alignmentScore}/100 · ${sourcedData.sourceAnalysis.status}`);
 
     // Stage 4: fact atomization (reuse objective activity)
@@ -564,6 +601,37 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     } else {
       merged = await mergeSubjectiveResearch(researchedData as any, undefined, primaryMarkdown);
     }
+
+    // ── Human review: thin research ────────────────────────────────────────────
+    // Parity with the objective pipeline. Thin research after a failed source
+    // scrape is the warning sign that the article will be built on little or
+    // nothing — surface it rather than generating from air.
+    if (!merged.researchOk) {
+      warn('researching', 'Research thin');
+      const decision = await askHuman({
+        id: `thin-research-${Date.now()}`,
+        type: 'thin_research',
+        message: 'Research is thin — the article may lack depth or rely on fabricated detail.',
+        details: [
+          `Research word count: ${merged.researchWordCount}`,
+          `Citations found: ${merged.citations.length}`,
+          researchedData.retryReason ?? 'No retry reason captured',
+        ],
+        options: [
+          { label: 'Proceed with thin research', value: 'continue' },
+          { label: 'Abort and try a different source', value: 'abort' },
+          {
+            label: 'Add context to supplement research',
+            value: 'add_context',
+            requiresInput: true,
+            inputPlaceholder: 'Add extra context or facts…',
+          },
+        ],
+      });
+      if (decision.choice === 'abort') {
+        throw new Error('Workflow aborted by human: thin research');
+      }
+    }
     complete('researching', `${merged.researchWordCount} words · ${merged.citations.length} citations`);
 
     // Stage 6: citation scraping
@@ -590,10 +658,16 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     if (cite2Url) { try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip */ } }
 
     // StatMuse live-stat scrape — sports categories only ("Sports - …"). Injected
-    // as TIER 1S (above Perplexity for numbers). Non-blocking on any failure.
+    // as TIER 1S: above Perplexity for numbers, below the writer's source/context/
+    // must-include list. Non-blocking on any failure.
     let statmuse = { block: '', url: '' };
     if (merged.isSports) {
-      try { statmuse = await statmuseResearch(merged.category, merged.title); } catch { /* non-blocking */ }
+      try {
+        statmuse = await statmuseResearch(merged.category, merged.title, merged.mustIncludeItems ?? [], {
+          seasonHint: merged.temporalContext?.currentSeason,
+          userContext: merged.userContext,
+        });
+      } catch { /* non-blocking */ }
     }
 
     const scrapedLabel = [cite1Url, cite2Url].filter(Boolean).map(u => u.split('/')[2]).join(' + ') || 'no citations to scrape';
@@ -724,6 +798,27 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     // Stage 9: validate structure
     activate('validating');
     const validated = await validateSubjective(generated as any);
+
+    // ── Human review: structural / safety errors ──────────────────────────────
+    // Parity with the objective pipeline. Subjective hard errors (e.g. an MSN
+    // safety word the auto-fixer can't resolve) previously just set a FAILED
+    // status and shipped anyway — pause so an editor decides.
+    if (validated.errors.length > 0) {
+      warn('validating', `${validated.errors.length} errors`);
+      const decision = await askHuman({
+        id: `validation-errors-${Date.now()}`,
+        type: 'validation_errors',
+        message: 'The generated article has structural or safety errors.',
+        details: validated.errors.slice(0, 5),
+        options: [
+          { label: 'Continue with errors (will be flagged)', value: 'continue' },
+          { label: 'Abort', value: 'abort' },
+        ],
+      });
+      if (decision.choice === 'abort') {
+        throw new Error('Workflow aborted by human: subjective validation errors');
+      }
+    }
     complete('validating', `${validated.slideResults.length} slides · ${validated.errors.length} errors · ${validated.warnings.length} warnings`);
 
     // Stage 10: Grok style audit
@@ -753,6 +848,30 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     // Stage 11: final assembly
     activate('creating_docs', 'Assembling output…');
     const final = await finalAssemblySubjective(audited);
+
+    // ── Human review: low quality score ───────────────────────────────────────
+    // Parity with the objective pipeline (<55 threshold).
+    if (final.qualityScore < 55) {
+      warn('creating_docs', `Low quality score: ${final.qualityScore}/100`);
+      const decision = await askHuman({
+        id: `low-quality-${Date.now()}`,
+        type: 'low_quality',
+        message: `Quality score is ${final.qualityScore}/100 — below the 55-point threshold.`,
+        details: [
+          `Research score: ${final.researchScore}`,
+          `Structural score: ${final.structuralScore}`,
+          `Originality score: ${final.originalityScore}`,
+          final.flagsForReview || 'No specific flags',
+        ],
+        options: [
+          { label: 'Use it anyway', value: 'continue' },
+          { label: 'Abort', value: 'abort' },
+        ],
+      });
+      if (decision.choice === 'abort') {
+        throw new Error(`Workflow aborted by human: quality score ${final.qualityScore}/100`);
+      }
+    }
     complete('creating_docs', `score ${final.qualityScore}/100 · moderation ${audited.moderationVerdict ?? 'PASS'} (${(audited.moderationFlags ?? []).length} flags)`);
 
     // Stage 12: Slide enrichment (Claude Haiku structured-field extraction)
@@ -949,11 +1068,17 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   if (cite2Url) { try { cite2Markdown = await firecrawlScrape(cite2Url); } catch { /* skip on failure */ } }
 
   // StatMuse live-stat scrape — sports categories only ("Sports - …"). Injected
-  // as TIER 1S (above Perplexity for numbers). Non-blocking: any failure or
-  // unsupported question leaves research exactly as it was.
+  // as TIER 1S: above Perplexity for numbers, below the writer's source/context/
+  // must-include list. Non-blocking: any failure or unsupported question leaves
+  // research exactly as it was.
   let statmuse = { block: '', url: '' };
   if (mergedData.isSports) {
-    try { statmuse = await statmuseResearch(mergedData.category, mergedData.title); } catch { /* non-blocking */ }
+    try {
+      statmuse = await statmuseResearch(mergedData.category, mergedData.title, mergedData.mustIncludeItems ?? [], {
+        seasonHint: mergedData.temporalContext?.currentSeason,
+        userContext: mergedData.userContext,
+      });
+    } catch { /* non-blocking */ }
   }
 
   const scrapedLabel = [cite1Url, cite2Url].filter(Boolean).map(u => u.split('/')[2]).join(' + ') || 'no citations to scrape';
