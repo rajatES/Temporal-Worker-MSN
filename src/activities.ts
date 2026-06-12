@@ -734,8 +734,27 @@ function extractByHeadingMarkers(lines: string[]): string[] {
   return items;
 }
 
+/**
+ * True when the must-include field contains writer INSTRUCTIONS prose rather
+ * than a list of items ("The intro should be punchy. Take games from both
+ * sources..."). Comma-splitting such prose manufactures garbage mandatory
+ * items ("punchy") that the prompt then demands a slide for. The prepare
+ * activities fold detected prose into userContext (Tier 1B) instead, where
+ * the data-vs-instructions handling already exists.
+ */
+export function looksLikeInstructionProse(raw: string): boolean {
+  const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0 || lines.length > 8) return false;        // long inputs are lists
+  const text = lines.join(' ');
+  const sentences = (text.match(/[.!?](\s|$)/g) ?? []).length;
+  if (sentences < 2) return false;                                  // list items rarely form sentences
+  if (text.split(/\s+/).length / lines.length < 12) return false;   // short lines = items
+  return /\b(should|must|make sure|make (a|the|this)|avoid|ensure|keep (the|it|in)|mention|focus on|do not|don['']t|please)\b/i.test(text);
+}
+
 export function parseMustIncludeItems(raw: string): string[] {
   if (!raw || !raw.trim()) return [];
+  if (looksLikeInstructionProse(raw)) return [];
 
   const allLines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
@@ -784,6 +803,38 @@ export function parseMustIncludeItems(raw: string): string[] {
       rankedItems.push(context ? `${display} — ${context}` : display);
     }
     if (rankedItems.length >= 3) return rankedItems;
+  }
+
+  // ── Phase 0.6: Vertical table paste — rank and name on ALTERNATING lines ──
+  // Copying an HTML table puts each cell on its own line:
+  //   "Rank\nDriver\n\n1\nChase Elliott\n\n2\nChristopher Bell\n..."
+  // No line carries both rank and name, so Phase 0.5 can't see it — and the
+  // structured-block path below reads the bare number as a too-short "heading"
+  // and discards the whole pair (a June 2026 run reduced a pasted 20-driver
+  // table to ["Rank"]). Detect the alternating shape directly. Ties (two names
+  // at the same rank) survive naturally; the same name at two ranks gets the
+  // "(rank N)" tag per the pipeline-wide convention.
+  const VERTICAL_HEADER_RE = /^(#|rank(ing)?|no\.?|number|pos\.?|position|sr\.?|name|driver|player|team|title|entry|item)$/i;
+  const verticalLines = allLines.filter(l => !VERTICAL_HEADER_RE.test(l));
+  const verticalPairs: Array<{ rank: string; name: string }> = [];
+  for (let i = 0; i < verticalLines.length - 1; i++) {
+    const rankM = verticalLines[i].match(/^#?(\d{1,3})$/);
+    if (rankM && !/^#?\d{1,3}$/.test(verticalLines[i + 1])) {
+      verticalPairs.push({ rank: rankM[1], name: verticalLines[i + 1] });
+      i++; // consume the name line
+    }
+  }
+  if (verticalPairs.length >= 3 && verticalPairs.length * 2 >= verticalLines.length * 0.8) {
+    const verticalItems: string[] = [];
+    const seenVerticalNames = new Set<string>();
+    for (const { rank, name } of verticalPairs) {
+      const cleaned = stripHeadingPrefix(name);
+      if (!cleaned || cleaned.length <= 2 || isSkippableLine(cleaned)) continue;
+      const key = cleaned.toLowerCase();
+      verticalItems.push(seenVerticalNames.has(key) ? `${cleaned} (rank ${rank})` : cleaned);
+      seenVerticalNames.add(key);
+    }
+    if (verticalItems.length >= 3) return verticalItems;
   }
 
   // ── Phase 0: Detect structured heading+paragraph input ───────────────
@@ -893,6 +944,13 @@ export function parseMustIncludeItems(raw: string): string[] {
     }
   } else {
     // ── Phase 2: Flat list (numbered, bulleted, comma-separated, plain) ──
+    // Comma-splitting is only valid when commas are the list SEPARATOR — a
+    // single line ("A, B, C") or most lines carrying commas. In a one-item-
+    // per-line list, a comma inside a line is part of the title ("More Than a
+    // Married Couple, but Not Lovers"); splitting it corrupts the item count,
+    // and the SLOT COUNT reconciliation then tells the model to drop an item.
+    const commaLineCount = allLines.filter(l => l.includes(',')).length;
+    const commaSplitAllowed = allLines.length === 1 || commaLineCount > allLines.length / 2;
     for (const line of allLines) {
       let cleaned = line.replace(LIST_MARKER_RE, '').trim();
       if (!cleaned) continue;
@@ -914,8 +972,8 @@ export function parseMustIncludeItems(raw: string): string[] {
 
       // Comma-separated items (but not commas inside parentheses).
       const commaParts = cleaned.split(/,(?!\d{3}(?:\D|$))(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
-      if (commaParts.length >= 3 ||
-        (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2))) {
+      if (commaSplitAllowed && (commaParts.length >= 3 ||
+        (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2)))) {
         for (const part of commaParts) {
           if (part.length > 2) extracted.push(stripLeadingRank(part));
         }
@@ -1081,10 +1139,17 @@ export async function prepareInputAndAnalyze(input: FormInput): Promise<Prepared
   // When the writer specifies ascending order (shortest first), reverse the list now
   // so mustIncludeItems is already in the correct final slide order throughout the pipeline.
   if (mustIncludeExplicitOrder) mustIncludeItems = [...mustIncludeItems].reverse();
-  const userWordCountOverride = parseWordCountOverride(userContext);
+  // Writers sometimes paste INSTRUCTIONS (or a format we can't parse) into the
+  // must-include field. When it yields no items, fold the raw text into
+  // userContext so it still reaches the model as Tier 1B guidance instead of
+  // silently disappearing.
+  const effectiveUserContext = (mustIncludeRaw ?? '').trim() && mustIncludeItems.length === 0
+    ? [userContext, (mustIncludeRaw ?? '').trim()].filter(Boolean).join('\n\n')
+    : userContext;
+  const userWordCountOverride = parseWordCountOverride(effectiveUserContext);
 
   return {
-    title, category, slideCount, writerName, userContext, writingStyle,
+    title, category, slideCount, writerName, userContext: effectiveUserContext, writingStyle,
     userPrimaryUrl, userSecondaryUrls, hasValidUserSource, isUserUrlRestricted,
     restrictedDomains: RESTRICTED_DOMAINS, mustIncludeItems,
     hasMustInclude: mustIncludeItems.length > 0,
@@ -3172,6 +3237,7 @@ CRITICAL REMINDERS:
 - Tier 2 (Perplexity, citations) is for tone/context only, NEVER facts
 - If Tier 1A and 1B don't have a fact, the article doesn't have that fact
 - Shorter true slides beat longer half-true slides
+- WORD CAPS ARE HARD: intro 40-60 words, every content slide ${data.userWordCountOverride ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}` : '35-50'} words. Count silently before finishing each slide and rewrite if over. These caps override any other length guidance, including writer notes.
 - Output the complete slideshow no matter what — never refuse, never ask for clarification
 ${wordCountOverrideBlock}
 
@@ -4734,7 +4800,7 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
   const sourcesRaw = (input.sourcesRaw ?? '').trim();
   const mustIncludeRaw = (input.mustIncludeRaw ?? '').trim();
   const writingStyle = (input.writingStyle ?? '').trim();
-  const userContext = (input.userContext ?? '').trim();
+  let userContext = (input.userContext ?? '').trim();
 
   if (!title) throw new Error('Slideshow Title is required.');
   if (!category) throw new Error('Topic Category is required.');
@@ -4817,6 +4883,12 @@ export async function prepareInputSubjective(input: FormInput): Promise<Subjecti
 
   const mustIncludeItems = parseMustIncludeItems(mustIncludeRaw);
   const hasMustInclude = mustIncludeItems.length > 0;
+  // Same fallback as the objective flow: a must-include field that yields no
+  // items (instructions prose, unparseable paste) is folded into userContext
+  // so the writer's text still reaches the model as Tier 1B guidance.
+  if ((mustIncludeRaw ?? '').trim() && !hasMustInclude) {
+    userContext = [userContext, mustIncludeRaw.trim()].filter(Boolean).join('\n\n');
+  }
   const userWordCountOverride = parseWordCountOverride(userContext);
 
   // ── Primary query (used by Perplexity research) ───────────────────────────
@@ -5347,7 +5419,7 @@ Count every word silently before outputting each slide (the count must NEVER app
 
   const factContextBlock = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${injectStatmuseTier(data.combinedFactRepresentation, statmuse)}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}`;
 
-  const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n8. Which LEAD does each slide get (quote / moment / person / contrast / aftermath / claim)? No two consecutive slides may share one.\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
+  const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n8. Which LEAD does each slide get (quote / moment / person / contrast / aftermath / claim)? No two consecutive slides may share one.\n9. WORD CAPS ARE HARD: intro 40-60 words, every content slide ${data.userWordCountOverride ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}` : '35-50'} words. Count silently before finishing each slide and rewrite if over. These caps override any other length guidance, including writer notes.\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
 
   return { ...data, claudeSystemPrompt, claudeUserPrompt, factContextBlock };
 }
