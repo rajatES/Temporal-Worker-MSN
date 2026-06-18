@@ -1,9 +1,7 @@
 import {
   proxyActivities,
   defineQuery,
-  defineSignal,
   setHandler,
-  condition,
 } from '@temporalio/workflow';
 import type * as activities from './activities';
 import type {
@@ -11,8 +9,6 @@ import type {
   WorkflowResult,
   WorkflowProgress,
   Stage,
-  HumanReviewRequest,
-  HumanDecision,
 } from './types';
 import { STAGE_DEFS, STAGE_DEFS_SUBJECTIVE } from './types';
 
@@ -75,10 +71,9 @@ const {
   retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2, maximumInterval: '60s' },
 });
 
-// ── Query + Signal definitions (module-level, deterministic) ─────────────────
+// ── Query definition (module-level, deterministic) ───────────────────────────
 
 export const getProgressQuery = defineQuery<WorkflowProgress>('getProgress');
-export const humanDecisionSignal = defineSignal<[HumanDecision]>('humanDecision');
 
 // ── Shared post-processing helpers (used by both modes) ──────────────────────
 
@@ -415,8 +410,6 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   // ── Stage state ──────────────────────────────────────────────────────────────
   const stages: Stage[] = stageDefs.map(s => ({ ...s, status: 'pending' as const }));
   let currentStageId = stageDefs[0].id;
-  let humanReviewRequest: HumanReviewRequest | null = null;
-  let humanDecisionReceived: HumanDecision | null = null;
   let workflowResult: WorkflowResult | undefined;
 
   const idx = (id: string) => stages.findIndex(s => s.id === id);
@@ -454,34 +447,15 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     }
   };
 
-  // Pauses the stage, waits for human signal (30min timeout → auto-continue)
-  const askHuman = async (request: HumanReviewRequest): Promise<HumanDecision> => {
-    humanReviewRequest = request;
-    const i = idx(currentStageId);
-    if (i >= 0) stages[i].status = 'awaiting_human';
-    humanDecisionReceived = null;
-
-    const gotDecision = await condition(() => humanDecisionReceived !== null, '30 minutes');
-    humanReviewRequest = null;
-
-    if (!gotDecision || humanDecisionReceived === null) {
-      return { requestId: request.id, choice: 'continue' };
-    }
-    return humanDecisionReceived;
-  };
-
   // ── Register handlers BEFORE any await ───────────────────────────────────────
+  // humanReviewRequest is always null; field retained for UI compatibility.
   setHandler(getProgressQuery, (): WorkflowProgress => ({
     stages,
     currentStageId,
-    humanReviewRequest,
+    humanReviewRequest: null,
     isComplete: stages[idx('complete')]?.status === 'complete',
     result: workflowResult,
   }));
-
-  setHandler(humanDecisionSignal, (decision: HumanDecision) => {
-    humanDecisionReceived = decision;
-  });
 
   // ════════════════════════════════════════════════════════════════════════════
   // SUBJECTIVE MODE — voice-driven, no fact verification, no human pauses.
@@ -522,41 +496,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
       sourcedData = await buildResearchStrategy(prepared as any);
     }
 
-    // ── Human review: poor source alignment ───────────────────────────────────
-    // Parity with the objective pipeline (which pauses <40). The subjective flow
-    // used to sail past a failed/empty scrape: a JS-rendered page that returns
-    // only a "[Visit](url)" stub scores alignment 0, and the pipeline silently
-    // fell back to Perplexity — fabricating rankings the writer never sourced,
-    // even when they asked for "no external research". Pause here instead so a
-    // human can supply a working URL or consciously accept research-only mode.
     if (prepared.hasValidUserSource && sourcedData.sourceAnalysis.alignmentScore < 40) {
       warn('analyzing', `Low alignment: ${sourcedData.sourceAnalysis.alignmentScore}/100`);
-      const decision = await askHuman({
-        id: `poor-source-${Date.now()}`,
-        type: 'poor_source',
-        message: 'Source alignment is low — the page may have failed to load or may not match the article title.',
-        details: [
-          `Alignment score: ${sourcedData.sourceAnalysis.alignmentScore}/100`,
-          `Status: ${sourcedData.sourceAnalysis.status}`,
-          `Scraped content: ${primaryMarkdown.length} chars`,
-          `Recommendation: ${sourcedData.sourceAnalysis.recommendation}`,
-        ],
-        options: [
-          { label: 'Continue anyway (may use external research)', value: 'continue' },
-          { label: 'Swap to research-only mode (no user source)', value: 'research_only' },
-          {
-            label: 'Provide a better source URL',
-            value: 'new_source',
-            requiresInput: true,
-            inputPlaceholder: 'Paste a better source URL…',
-          },
-        ],
-      });
-      if (decision.choice === 'research_only') {
-        sourcedData = await buildResearchStrategy(prepared as any);
-      }
-      // 'new_source' with additionalInput would need a re-scrape — handled in a
-      // future iteration; for now fall through to continue with original data.
     }
     complete('analyzing', `alignment ${sourcedData.sourceAnalysis.alignmentScore}/100 · ${sourcedData.sourceAnalysis.status}`);
 
@@ -602,35 +543,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
       merged = await mergeSubjectiveResearch(researchedData as any, undefined, primaryMarkdown);
     }
 
-    // ── Human review: thin research ────────────────────────────────────────────
-    // Parity with the objective pipeline. Thin research after a failed source
-    // scrape is the warning sign that the article will be built on little or
-    // nothing — surface it rather than generating from air.
     if (!merged.researchOk) {
       warn('researching', 'Research thin');
-      const decision = await askHuman({
-        id: `thin-research-${Date.now()}`,
-        type: 'thin_research',
-        message: 'Research is thin — the article may lack depth or rely on fabricated detail.',
-        details: [
-          `Research word count: ${merged.researchWordCount}`,
-          `Citations found: ${merged.citations.length}`,
-          researchedData.retryReason ?? 'No retry reason captured',
-        ],
-        options: [
-          { label: 'Proceed with thin research', value: 'continue' },
-          { label: 'Abort and try a different source', value: 'abort' },
-          {
-            label: 'Add context to supplement research',
-            value: 'add_context',
-            requiresInput: true,
-            inputPlaceholder: 'Add extra context or facts…',
-          },
-        ],
-      });
-      if (decision.choice === 'abort') {
-        throw new Error('Workflow aborted by human: thin research');
-      }
     }
     complete('researching', `${merged.researchWordCount} words · ${merged.citations.length} citations`);
 
@@ -799,25 +713,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     activate('validating');
     const validated = await validateSubjective(generated as any);
 
-    // ── Human review: structural / safety errors ──────────────────────────────
-    // Parity with the objective pipeline. Subjective hard errors (e.g. an MSN
-    // safety word the auto-fixer can't resolve) previously just set a FAILED
-    // status and shipped anyway — pause so an editor decides.
     if (validated.errors.length > 0) {
       warn('validating', `${validated.errors.length} errors`);
-      const decision = await askHuman({
-        id: `validation-errors-${Date.now()}`,
-        type: 'validation_errors',
-        message: 'The generated article has structural or safety errors.',
-        details: validated.errors.slice(0, 5),
-        options: [
-          { label: 'Continue with errors (will be flagged)', value: 'continue' },
-          { label: 'Abort', value: 'abort' },
-        ],
-      });
-      if (decision.choice === 'abort') {
-        throw new Error('Workflow aborted by human: subjective validation errors');
-      }
     }
     complete('validating', `${validated.slideResults.length} slides · ${validated.errors.length} errors · ${validated.warnings.length} warnings`);
 
@@ -849,28 +746,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     activate('creating_docs', 'Assembling output…');
     const final = await finalAssemblySubjective(audited);
 
-    // ── Human review: low quality score ───────────────────────────────────────
-    // Parity with the objective pipeline (<55 threshold).
     if (final.qualityScore < 55) {
       warn('creating_docs', `Low quality score: ${final.qualityScore}/100`);
-      const decision = await askHuman({
-        id: `low-quality-${Date.now()}`,
-        type: 'low_quality',
-        message: `Quality score is ${final.qualityScore}/100 — below the 55-point threshold.`,
-        details: [
-          `Research score: ${final.researchScore}`,
-          `Structural score: ${final.structuralScore}`,
-          `Originality score: ${final.originalityScore}`,
-          final.flagsForReview || 'No specific flags',
-        ],
-        options: [
-          { label: 'Use it anyway', value: 'continue' },
-          { label: 'Abort', value: 'abort' },
-        ],
-      });
-      if (decision.choice === 'abort') {
-        throw new Error(`Workflow aborted by human: quality score ${final.qualityScore}/100`);
-      }
     }
     complete('creating_docs', `score ${final.qualityScore}/100 · moderation ${audited.moderationVerdict ?? 'PASS'} (${(audited.moderationFlags ?? []).length} flags)`);
 
@@ -932,36 +809,9 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
   complete('scraping_source', `score ${sourcedData.sourceAnalysis.alignmentScore}/100`);
 
-  // ── Human review: poor source alignment ─────────────────────────────────────
   activate('analyzing');
   if (sourcedData.sourceAnalysis.alignmentScore < 40) {
     warn('analyzing', `Low alignment: ${sourcedData.sourceAnalysis.alignmentScore}/100`);
-    const decision = await askHuman({
-      id: `poor-source-${Date.now()}`,
-      type: 'poor_source',
-      message: 'Source alignment is low — the scraped content may not match the article title.',
-      details: [
-        `Alignment score: ${sourcedData.sourceAnalysis.alignmentScore}/100`,
-        `Status: ${sourcedData.sourceAnalysis.status}`,
-        `Recommendation: ${sourcedData.sourceAnalysis.recommendation}`,
-      ],
-      options: [
-        { label: 'Continue anyway', value: 'continue' },
-        { label: 'Swap to research-only mode (no user source)', value: 'research_only' },
-        {
-          label: 'Provide a better source URL',
-          value: 'new_source',
-          requiresInput: true,
-          inputPlaceholder: 'Paste a better source URL…',
-        },
-      ],
-    });
-
-    if (decision.choice === 'research_only') {
-      sourcedData = await buildResearchStrategy(preparedData);
-    }
-    // 'new_source' with additionalInput would need a re-scrape — handled in the
-    // next iteration; for now fall through to continue with original data
   }
   complete('analyzing', `${sourcedData.sourceAnalysis.status}`);
 
@@ -1010,33 +860,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
 
   complete('researching', `${mergedData.researchWordCount} words · ${mergedData.citations.length} citations`);
 
-  // ── Human review: thin research after retry ──────────────────────────────────
   if (!mergedData.researchOk) {
     warn('researching', 'Research thin after retry');
-    const decision = await askHuman({
-      id: `thin-research-${Date.now()}`,
-      type: 'thin_research',
-      message: 'Perplexity research is thin even after a retry. The article may lack depth.',
-      details: [
-        `Research word count: ${mergedData.researchWordCount}`,
-        `Citations found: ${mergedData.citations.length}`,
-        researchedData.retryReason ?? 'No retry reason captured',
-      ],
-      options: [
-        { label: 'Proceed with thin research', value: 'continue' },
-        { label: 'Abort and try a different topic', value: 'abort' },
-        {
-          label: 'Add context to supplement research',
-          value: 'add_context',
-          requiresInput: true,
-          inputPlaceholder: 'Add extra context or facts…',
-        },
-      ],
-    });
-
-    if (decision.choice === 'abort') {
-      throw new Error('Workflow aborted by human: thin research');
-    }
   }
 
   // ── Stage 6: Citation scraping ───────────────────────────────────────────────
@@ -1233,31 +1058,10 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
     );
     complete('validating', `${validatedData.structuralValidation.slideCount} slides · ${hardErrors.length} errors`);
 
-    // ── Human review: structural errors ────────────────────────────────────────
     if (hardErrors.length > 0) {
       warn('validating', `${hardErrors.length} errors after auto-fix`);
-      const decision = await askHuman({
-        id: `validation-errors-${Date.now()}`,
-        type: 'validation_errors',
-        message: 'The generated article has structural errors that could not be auto-fixed.',
-        details: hardErrors.slice(0, 5),
-        options: [
-          { label: 'Continue with errors (will be flagged)', value: 'continue' },
-          ...(generationAttempt < MAX_GENERATION_ATTEMPTS
-            ? [{ label: 'Regenerate article', value: 'regenerate' }]
-            : []),
-          { label: 'Abort', value: 'abort' },
-        ],
-      });
-
-      if (decision.choice === 'abort') {
-        throw new Error('Workflow aborted by human: structural validation errors');
-      }
-      if (decision.choice === 'regenerate' && generationAttempt < MAX_GENERATION_ATTEMPTS) {
-        continue; // loop back to Stage 8
-      }
     }
-    break; // no errors, or human chose "continue" — proceed
+    break; // single pass — no regeneration retry
   }
 
   // ── Stage 10: Claim extraction + Grok fact-check ─────────────────────────────
@@ -1284,25 +1088,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   const factErrors = verifiedData.perplexityVerification.stats.incorrect;
   complete('verifying', `${verifiedData.perplexityVerification.stats.verified} verified · ${factErrors} incorrect`);
 
-  // ── Human review: multiple fact errors ───────────────────────────────────────
   if (factErrors > 2) {
     warn('verifying', `${factErrors} facts flagged as incorrect`);
-    const decision = await askHuman({
-      id: `fact-errors-${Date.now()}`,
-      type: 'fact_errors',
-      message: `Perplexity found ${factErrors} potentially incorrect facts.`,
-      details: verifiedData.perplexityVerification.results
-        .filter(r => r.status === 'incorrect')
-        .slice(0, 5)
-        .map(r => `Claim: "${r.claim}" → ${r.finding}`),
-      options: [
-        { label: 'Proceed to Grok audit (it will correct these)', value: 'continue' },
-        { label: 'Abort and restart', value: 'abort' },
-      ],
-    });
-    if (decision.choice === 'abort') {
-      throw new Error('Workflow aborted by human: too many fact errors');
-    }
   }
 
   // ── Stage 11: Claude audit + MSN moderation ────────────────────────────────────
@@ -1348,28 +1135,8 @@ export async function msnArticleGeneratorWorkflow(input: FormInput): Promise<Wor
   activate('creating_docs', 'Assembling output…');
   const final = await finalAssembly(auditedData);
 
-  // ── Human review: low quality score ──────────────────────────────────────────
   if (final.qualityScore < 55) {
     warn('creating_docs', `Low quality score: ${final.qualityScore}/100`);
-    const decision = await askHuman({
-      id: `low-quality-${Date.now()}`,
-      type: 'low_quality',
-      message: `Quality score is ${final.qualityScore}/100 — below the 55-point threshold.`,
-      details: [
-        `Research score: ${final.researchScore}`,
-        `Verification score: ${final.verificationScore}`,
-        `Structural score: ${final.structuralScore}`,
-        `Originality score: ${final.originalityScore}`,
-        final.flagsForReview || 'No specific flags',
-      ],
-      options: [
-        { label: 'Use it anyway', value: 'continue' },
-        { label: 'Abort', value: 'abort' },
-      ],
-    });
-    if (decision.choice === 'abort') {
-      throw new Error(`Workflow aborted by human: quality score ${final.qualityScore}/100`);
-    }
   }
 
   complete('creating_docs', `score ${final.qualityScore}/100`);
