@@ -591,6 +591,19 @@ SEVERITY is one of: absolute, fail, review. Always inspect the TITLE first.)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Default per-slide word caps. Writer overrides (parseWordCountOverride, below)
+// always take precedence over these — these only apply when no override is given.
+// Lowered June 2026 for tighter, punchier copy. Single source of truth so prompt
+// prose and validators can never drift apart.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DEFAULT_INTRO_WC = { min: 30, max: 50 };
+const DEFAULT_SLIDE_WC = { min: 25, max: 40 };
+const DEFAULT_SLIDE_AIM = '30-35';
+const INTRO_WC_RANGE = `${DEFAULT_INTRO_WC.min}-${DEFAULT_INTRO_WC.max}`; // "30-50"
+const SLIDE_WC_RANGE = `${DEFAULT_SLIDE_WC.min}-${DEFAULT_SLIDE_WC.max}`; // "25-40"
+
+// ─────────────────────────────────────────────────────────────────────────────
 // parseWordCountOverride — detect explicit word-count instructions in userContext
 // e.g. "40-45 words only", "max 40 words", "keep it under 45 words"
 // ─────────────────────────────────────────────────────────────────────────────
@@ -639,7 +652,7 @@ const HEADING_PREFIX_RE = /^(?:slide|part|section|chapter|item|entry|topic|point
 // Standard list markers: "1.", "1)", "#1", "- ", "* ", "•"
 // `(?!\d)` after the rank punctuation: "3.5mm jack" is a decimal, not list item
 // number 3 — without the lookahead the marker strip mangles it to "5mm jack".
-const LIST_MARKER_RE = /^(\d{1,3}[.)](?!\d)\s*|#\d+[.):]?\s*|[-*•]\s+)/;
+const LIST_MARKER_RE = /^(\d{1,3}[.)](?!\d)\s*|#\d+[.):]?\s*|[-–—*•]\s+)/;
 // Emoji section-header detection — \p{Emoji_Presentation} avoids false-
 // positives on ASCII digits 0-9 (which are in the broader \p{Emoji} set
 // because they form keycap sequences like 4️⃣).
@@ -680,6 +693,54 @@ function stripHeadingPrefix(line: string): string {
     .replace(HEADING_PREFIX_RE, '')
     .replace(LIST_MARKER_RE, '')
     .trim();
+}
+
+/**
+ * Leading run of capitalized tokens (handles initials like "A. J." and accented
+ * names like "Suárez"), stopping at the first lowercase word.
+ *   "Ross Chastain will drive the No. 1 …" → "Ross Chastain"
+ * Returns '' when the line does not begin with a proper-name run. Used to recover
+ * the subject of a sentence-form must-include row that no rank/marker pattern catches.
+ */
+function extractLeadingProperName(line: string): string {
+  const m = line.match(/^((?:[A-ZÀ-Þ][\p{L}.'’-]*|[A-Z]\.)(?:\s+(?:[A-ZÀ-Þ][\p{L}.'’-]*|[A-Z]\.)){0,4})/u);
+  return m ? m[1].trim() : '';
+}
+
+// Common sentence-initial words that are capitalized only because they start a
+// sentence — NOT a proper name. Used to avoid counting "Before the race…",
+// "Three wins…", "The scheme…" as name-led openings.
+const OPENER_STOPWORDS = new Set([
+  'the', 'a', 'an', 'this', 'that', 'these', 'those', 'his', 'her', 'their', 'its',
+  'it', 'they', 'he', 'she', 'no', 'nobody', 'when', 'where', 'what', 'why', 'how',
+  'before', 'after', 'then', 'here', 'there', 'every', 'each', 'both', 'one', 'two',
+  'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'down', 'up',
+  'back', 'now', 'today', 'first', 'last', 'in', 'on', 'at', 'for', 'with',
+]);
+
+/** True when a slide body opens with a multi-word proper name (first + last, e.g.
+ *  "Ross Chastain …") — the roster roll-call tell. A single leading capital is just
+ *  a sentence start ("Three wins…"), so a proper-name lead needs the SECOND token
+ *  capitalized too, and the first token must not be a sentence-initial stopword. */
+function opensWithProperName(body: string): boolean {
+  const toks = body.trim().split(/\s+/);
+  if (toks.length < 2) return false;
+  const clean = (w: string) => w.replace(/[^A-Za-zÀ-ÿ.'’-]/g, '');
+  const w1 = clean(toks[0]);
+  const w2 = clean(toks[1]);
+  const isCap = (w: string) => /^[A-ZÀ-Þ]/.test(w);
+  if (!w1 || !isCap(w1) || OPENER_STOPWORDS.has(w1.toLowerCase())) return false;
+  return isCap(w2);
+}
+
+/**
+ * Count how many slide bodies open with a proper name — the "roster roll-call" tell
+ * (every slide starting with the subject's name). When this is a large share of the
+ * deck, the writing has collapsed into a fill-in-the-blank template; the validators
+ * surface it as a warning.
+ */
+function countNameLedOpenings(bodies: string[]): number {
+  return bodies.filter(opensWithProperName).length;
 }
 
 /**
@@ -756,6 +817,12 @@ export function parseMustIncludeItems(raw: string): string[] {
   if (!raw || !raw.trim()) return [];
   if (looksLikeInstructionProse(raw)) return [];
 
+  // A pasted list can lose the newline between two "#N — Name" rows
+  // ("…Allgaier#1 — Brandon Jones"), collapsing two items into one. Re-split so
+  // each marker starts its own line. The lookbehind only fires mid-line — a real
+  // line-start "#N" is preceded by a newline (not \S), so well-formed rows are left alone.
+  raw = raw.replace(/(?<=\S)(#\d{1,3}\s*[-–—]\s)/g, '\n$1');
+
   const allLines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
   // ── Phase 0.5: Explicitly ranked list — one "RANK NAME" item per line ────
@@ -773,16 +840,35 @@ export function parseMustIncludeItems(raw: string): string[] {
   // repeat with "(rank N)". That suffix is a pipeline-wide convention:
   // slideEntityKey strips it, mustIncludeRepeatsEntities relies on it to flag
   // intentional repeats, and the batch builders relax their no-repeat rule on it.
+  // `[Tt]?` after the digits absorbs tie markers ("10T. Name", "5t Name"); the
+  // captured rank stays numeric. The final alternative accepts a bare SPACE after
+  // the number ("12 Logan Webb (Giants)") — common when writers paste rankings —
+  // but only when the name starts with a capital letter, so ordinary prose that
+  // happens to begin with a small number ("3 cheese pizzas") is NOT misread as a rank.
   const matchRankedLine = (line: string): RegExpMatchArray | null =>
-    line.match(/^#(\d{1,3})[.):]?\s+(.+)$/) ||                 // "#25 Name" / "#25. Name"
-    line.match(/^(\d{1,3})(?:\t\s*|[.):]\s+|\s*[-–—]\s+)(.+)$/); // "25\tName" / "25. Name" / "25) Name" / "25: Name" / "25 - Name"
+    line.match(/^#(\d{1,3})[.):]?\s+(.+)$/) ||                          // "#25 Name" / "#25. Name"
+    line.match(/^(\d{1,3})[Tt]?(?:\t\s*|[.):]\s+|\s*[-–—]\s+)(.+)$/) ||  // "25. Name" / "10T. Name" / "25) Name" / "25 - Name" / tab
+    line.match(/^(\d{1,3})[Tt]?\s+([A-ZÀ-Þ"'].*)$/);                     // "12 Logan Webb" / "10T Chris Sale" (bare space; name must be capitalized)
   const rankedLines = allLines.filter(l => matchRankedLine(l));
   if (rankedLines.length >= 3 && rankedLines.length >= allLines.length * 0.8) {
     const rankedItems: string[] = [];
     const seenRankedNames = new Map<string, string>();
     for (const line of allLines) {
       const m = matchRankedLine(line);
-      if (!m) continue;
+      if (!m) {
+        // Mixed paste: a sentence-form row names a driver without a rank marker
+        // ("Ross Chastain will drive the No. 1 …"). Recover its subject so it isn't
+        // dropped — but require ≥5 words AND a lowercase continuation after the name,
+        // so short section headers ("Cup Series", "Trucks") are NOT captured as items.
+        // Shares seenRankedNames so a name also present on a "#N" row isn't duplicated.
+        const fbName = extractLeadingProperName(line);
+        if (line.split(/\s+/).length >= 5 && fbName.length > 2 &&
+            /^[a-z]/.test(line.slice(fbName.length).trim())) {
+          const fbKey = fbName.toLowerCase();
+          if (!seenRankedNames.has(fbKey)) { seenRankedNames.set(fbKey, ''); rankedItems.push(fbName); }
+        }
+        continue;
+      }
       const rank = m[1];
       // Multi-column tab rows ("5\tName\t2014"): the first tab field is the
       // name, the rest is context. Key the dedup on the NAME alone so the same
@@ -3139,7 +3225,7 @@ export async function buildClaudePrompt(data: MergedData, citation1Markdown: str
 ═══════════════════════════════════════════════════════════════
 
 The writer EXPLICITLY requested ${data.userWordCountOverride.min}-${data.userWordCountOverride.max} words per content slide.
-This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
+This OVERRIDES the default ${SLIDE_WC_RANGE} range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
 Count every word silently before outputting each slide (the count must NEVER appear in the output). Rewrite if out of range.`
     : '';
 
@@ -3219,8 +3305,8 @@ STRUCTURE & COUNTS (validated by an automated counter)
 ═══════════════════════════════════════════════════════════════
 
 - Meta Description: MAX 120 characters.
-- Intro slide (Slide 1): 40-60 words HARD CAP. That is 3 sentences — 4 short ones at most. Substantial and intriguing — never thin.
-- Content slides: 35-50 words HARD CAP (aim for 40-45), 2-4 sentences — and VARY the sentence count from slide to slide. Slides over the cap are flagged as ERRORS, not suggestions. When in doubt, write SHORTER.
+- Intro slide (Slide 1): ${INTRO_WC_RANGE} words HARD CAP. That is 3 sentences — 4 short ones at most. Substantial and intriguing — never thin.
+- Content slides: ${SLIDE_WC_RANGE} words HARD CAP (aim for ${DEFAULT_SLIDE_AIM}), 2-4 sentences — and VARY the sentence count from slide to slide. Slides over the cap are flagged as ERRORS, not suggestions. When in doubt, write SHORTER.
 - If over or under, rewrite until it fits. Never pad with invented facts — use stronger writing.
 - Count every word and character SILENTLY. The counts must NEVER appear in the output (no "(48 words)", no "(98 characters)").
 - Produce EXACTLY ${data.slideCount} content slides (plus the 1 intro). No more, no fewer.
@@ -3236,7 +3322,7 @@ Never use: "Discover the...", "Explore the top...", "Find out why...", "You won'
 Good pattern: [Specific unexpected fact from Tier 1A or 1B]. [Implied question].
 
 ═══════════════════════════════════════════════════════════════
-INTRO SLIDE (Slide 1) — 40-60 WORDS
+INTRO SLIDE (Slide 1) — ${INTRO_WC_RANGE} WORDS
 ═══════════════════════════════════════════════════════════════
 
 The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene with sweep and atmosphere, frame what's at stake, and make the reader crave the breakdown that follows. A thin, vague, or hedged intro fails. So does an intro that hands over the payoff. The reader should finish the intro thinking "I need to see this," NOT "I already know the answer."
@@ -3295,6 +3381,24 @@ Never build two consecutive slides the same way, and never start two consecutive
 - THE AFTERMATH: start with the consequence, work back to the cause
 - THE CLAIM: a flat, confident take you immediately back with facts
 Vary sentence count too: some slides run two long sentences, others four short ones, others one of each. Put recurring stat types in different grammatical positions (subject, object, aside) so no two slides rhyme structurally. If slides 2 through ${data.slideCount + 1} could be generated by filling blanks in one template, the article has FAILED — rewrite.
+
+NO ATTRIBUTE ROLL-CALL — THE ROSTER TRAP
+When every item is the same kind of subject (a driver and a car, a player and a team, a product and a spec), the path of least resistance is to recite the SAME fields in the SAME order on every slide — "[Name] does X for [Team] at [Place], and here is one stat." A deck built that way is an automatic REWRITE, however accurate the facts.
+- Open with the subject's name on AT MOST HALF the slides. On the others, lead with the thing itself: the scene, the design, the stat, the rivalry, the backstory, the stakes.
+- Pick the SINGLE most interesting facet of THIS item and build the slide around it, then let the other fields go. One slide is the design and what it means; the next is recent form; another is the sponsor or the backstory; another a head-to-head or a place-specific angle. Not every slide needs every attribute.
+- Never repeat a fixed field sequence. If the team, the place, or the number is not this slide's point, leave it out.
+- Move the subject, the key number, and the action into different sentence positions from slide to slide, so no two slides share a skeleton.
+
+ROSTER EXAMPLE — craft reference ONLY; facts illustrative, must NEVER appear in your article.
+Weak (roll-call template — every slide identical):
+"[Name] drives the No. [N] [Sponsor] car for [Team] at [Event]. The look features [colors]. He had a solid season."
+"[Name] drives the No. [N] [Sponsor] car for [Team] at [Event]. The look features [colors]. He is chasing a title."
+Why it fails: name-first every time, the same fields in lockstep, interchangeable. Twenty of these is a spreadsheet, not an article.
+Strong — three different builds, three different leads (design / form / backstory):
+"A bald eagle stretches wing to wing across the hood, talons bared. That tribute rides with the No. 12 this weekend, a nod to the crowd packed along the fences."
+"Three top-fives in four starts says the form is real. The orange-and-black scheme stays plain on purpose and lets the run do the talking."
+"Before the sponsor signed on, the shop was a two-bay garage off a county road. The deal that paints this car bought a second transporter and a real shot at the playoffs."
+Notice: none opens with the subject's name, each leads with a different facet, and the shared fields (team, sponsor, number) sit in different places or are dropped entirely.
 
 ENDINGS
 End on a fact, an image, a consequence, or a pointed observation — and vary which. Never close two consecutive slides with a "wider meaning" line.
@@ -3421,11 +3525,11 @@ META: [Max 120 characters]
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[40-60 words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; contextual/scale stats only, NEVER a payoff/key stat; end on a graceful thesis line; no items named, no #1/rankings revealed]
+[${INTRO_WC_RANGE} words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; contextual/scale stats only, NEVER a payoff/key stat; end on a graceful thesis line; no items named, no #1/rankings revealed]
 
 SLIDE 2
 [Creative title${ta.isRanking ? ' — start with rank number from Tier 1A' : ''}]
-[35-50 words — Tier 1A/1B facts only]
+[${SLIDE_WC_RANGE} words — Tier 1A/1B facts only]
 
 ...continue numbering through SLIDE ${data.slideCount + 1}. The intro is SLIDE 1 and does NOT count toward the content total — produce EXACTLY ${data.slideCount} CONTENT slides (SLIDE 2 through SLIDE ${data.slideCount + 1}), for ${data.slideCount + 1} slides in total...
 
@@ -3480,7 +3584,7 @@ CRITICAL REMINDERS:
 - Tier 2 (Perplexity, citations) is for tone/context only, NEVER facts
 - If Tier 1A and 1B don't have a fact, the article doesn't have that fact
 - Shorter true slides beat longer half-true slides
-- WORD CAPS ARE HARD: intro 40-60 words, every content slide ${data.userWordCountOverride ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}` : '35-50'} words. Count silently before finishing each slide and rewrite if over. These caps override any other length guidance, including writer notes.
+- WORD CAPS ARE HARD: intro ${INTRO_WC_RANGE} words, every content slide ${data.userWordCountOverride ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}` : SLIDE_WC_RANGE} words. Count silently before finishing each slide and rewrite if over. These caps override any other length guidance, including writer notes.
 - Output the complete slideshow no matter what — never refuse, never ask for clarification
 ${wordCountOverrideBlock}
 
@@ -3596,7 +3700,7 @@ export async function buildBatchUserPrompt(data: PromptData, spec: BatchSpec, pr
   const rangeEnd = spec.contentStart + spec.contentCount - 1;
   const wcRange = data.userWordCountOverride
     ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}`
-    : '35-50';
+    : SLIDE_WC_RANGE;
 
   // ── Explicit rank mapping for ranked countdowns ──────────────────────────
   // Rankings are presented LOWEST-to-HIGHEST: content presentation position 1 is
@@ -3629,7 +3733,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters]
-3. SLIDE 1 — the intro (40-60 words, flowing polished prose — substantial and intriguing, no choppy fragments)
+3. SLIDE 1 — the intro (${INTRO_WC_RANGE} words, flowing polished prose — substantial and intriguing, no choppy fragments)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -3675,6 +3779,7 @@ CRITICAL REMINDERS:
 - Content slides must be ${wcRange} words. Count silently — never print the count.
 - ${isRankCountdown ? 'Use the exact rank numbers listed above for this batch. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : ta.isRanking ? 'Follow the ranking order exactly. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : 'Keep slide order consistent with the source. Never repeat an item already written in an earlier batch.'}
 - VARY THE BUILD: never construct two consecutive slides the same way — rotate leads (moment / number / person / contrast / aftermath / claim) and sentence counts, including across the batch boundary.
+- NO ROLL-CALL: do not open every slide with the subject's name or recite the same fields (number, sponsor, team, place) in the same order — including continuing a pattern from earlier batches. Open with the subject's name on at most half the slides; lead the rest with a different facet.
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
 Write this batch now.`;
@@ -4048,11 +4153,11 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   // Word count
   slides.forEach(slide => {
     if (slide.slideNum === 1) {
-      if (slide.wordCount > 60) errors.push(`Slide 1 (Intro): ${slide.wordCount} words – MAX is 60`);
-      else if (slide.wordCount < 40) warnings.push(`Slide 1 (Intro): ${slide.wordCount} words – too thin, expand the setup (aim 40-60)`);
+      if (slide.wordCount > DEFAULT_INTRO_WC.max) errors.push(`Slide 1 (Intro): ${slide.wordCount} words – MAX is ${DEFAULT_INTRO_WC.max}`);
+      else if (slide.wordCount < DEFAULT_INTRO_WC.min) warnings.push(`Slide 1 (Intro): ${slide.wordCount} words – too thin, expand the setup (aim ${INTRO_WC_RANGE})`);
     } else {
-      const minWc = data.userWordCountOverride?.min ?? 35;
-      const maxWc = data.userWordCountOverride?.max ?? 50;
+      const minWc = data.userWordCountOverride?.min ?? DEFAULT_SLIDE_WC.min;
+      const maxWc = data.userWordCountOverride?.max ?? DEFAULT_SLIDE_WC.max;
       if (slide.wordCount < minWc) warnings.push(`Slide ${slide.slideNum}: ${slide.wordCount} words – min ${minWc}`);
       if (slide.wordCount > maxWc) warnings.push(`Slide ${slide.slideNum}: ${slide.wordCount} words – max ${maxWc}`);
     }
@@ -4116,6 +4221,13 @@ export async function validateStructure(data: GeneratedData): Promise<ValidatedD
   if (overused.length) warnings.push(`Repetitive openings: ${overused.join(', ')}`);
   const consecutiveOpen = [...new Set(openingWords.filter((w, i) => i > 0 && w === openingWords[i - 1]))];
   if (consecutiveOpen.length) warnings.push(`Consecutive slides open with the same word: ${consecutiveOpen.join(', ')}`);
+
+  // Templated "roster" structure: when most slides open with the subject's name,
+  // the deck reads as fill-in-the-blank (the prompt allows the name-lead on at most
+  // half the slides). Warning-level — surfaced in flagsForReview for the editor.
+  const nameLed = countNameLedOpenings(contentSlideArr.map(s => s.body));
+  if (contentSlideArr.length >= 6 && nameLed > contentSlideArr.length * 0.6)
+    warnings.push(`Templated structure: ${nameLed}/${contentSlideArr.length} content slides open with the subject's name — vary the lead`);
 
   // AI-tell: trailing-participle constructions (", cementing his legacy") read
   // machine-made when they recur — the writing prompt allows at most one.
@@ -4637,8 +4749,8 @@ PART A — AUDIT CHECKLIST (evaluate each rule)
 1. STRUCTURE
    - META present + max 120 characters
    - META not a CTA, not a title paraphrase
-   - Intro (Slide 1): 40-60 words
-   - Content slides: 35-50 words
+   - Intro (Slide 1): ${INTRO_WC_RANGE} words
+   - Content slides: ${SLIDE_WC_RANGE} words
    - Correct total number of content slides. IMPORTANT: Slide 1 is the INTRO and is NOT a content slide. Content slides are numbered Slide 2 onward, so N content slides means the article runs through Slide N+1 (e.g. 15 content slides = Slides 2–16). Do NOT count the intro toward the content-slide total.
    - Ranking articles: slide titles start with the rank number
 
@@ -5437,6 +5549,23 @@ Never build two consecutive slides the same way, and never start two consecutive
 - THE CLAIM: a flat, confident take you immediately back up
 Vary sentence count too: some slides run two long sentences, others four short ones, others one of each. If slides 2 through ${data.slideCount + 1} could be produced by filling blanks in one template, the article has FAILED — rewrite.
 
+NO ATTRIBUTE ROLL-CALL — THE ROSTER TRAP
+When every item is the same kind of subject (a player, a film, a song, a moment), the path of least resistance is to recite the SAME beats in the SAME order on every slide — "[Name] did X, and it mattered because Y." A deck built that way is an automatic REWRITE, however true.
+- Open with the subject's name on AT MOST HALF the slides. On the others, lead with the moment, the image, the line, the feeling, the contradiction.
+- Pick the SINGLE most resonant facet of THIS item and build the slide around it, then let the rest go. Not every slide needs the same beats in the same order.
+- Never repeat a fixed sentence shape. Move the subject and the turn into different positions so no two slides share a skeleton.
+
+ROSTER EXAMPLE — craft reference ONLY; facts illustrative, must NEVER appear in your article.
+Weak (roll-call template — interchangeable):
+"[Name] was a defining voice of the era. The work changed everything. Fans still remember it today."
+"[Name] was a defining voice of the era. The work changed everything. Fans still remember it today."
+Why it fails: same shape every slide, interchangeable, and the feeling is announced instead of made.
+Strong — three different leads (memory / image / line):
+"The hallway smelled like floor wax and nerves the morning that tape leaked. Nobody in the building was ready for what it would become."
+"A single spotlight, a borrowed jacket two sizes too big, and a room that went dead quiet before the first note landed."
+"\"I almost quit twice that year.\" Said plainly, decades later, like it cost nothing — though everyone listening knew exactly what it had cost."
+Notice: none opens with the subject's name, each leads with a different facet, and the emotion is created, never labeled.
+
 ENDINGS
 End on an image, a fact, a consequence, or a pointed observation — and vary which. Never close two consecutive slides with a 'wider meaning' line.
 
@@ -5525,11 +5654,11 @@ META: [Max 120 characters — intriguing hook, not a CTA, not a title paraphrase
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[40-60 words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; NO stats or numbers at all; end on a graceful thesis line; no generic openers, no items named]
+[${INTRO_WC_RANGE} words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; NO stats or numbers at all; end on a graceful thesis line; no generic openers, no items named]
 
 SLIDE 2
 [Creative title]
-[35-50 words]
+[${SLIDE_WC_RANGE} words]
 
 ...continue numbering through SLIDE ${data.slideCount + 1}. The intro is SLIDE 1 and does NOT count toward the content total — produce EXACTLY ${data.slideCount} CONTENT slides (SLIDE 2 through SLIDE ${data.slideCount + 1}), for ${data.slideCount + 1} slides in total...
 
@@ -5537,7 +5666,7 @@ SOURCES:
 [URL]: [what facts came from this source]
 
 ═══════════════════════════════════════════════════════════════
-INTRO SLIDE (Slide 1) — 40-60 WORDS
+INTRO SLIDE (Slide 1) — ${INTRO_WC_RANGE} WORDS
 ═══════════════════════════════════════════════════════════════
 
 The intro is the reader's reason to open the slideshow. It must be SUBSTANTIAL and INTRIGUING — set the scene with sweep and atmosphere, frame what's at stake, and make the reader crave the breakdown that follows, WITHOUT handing over any data. The stats are the payoff that lives INSIDE the slides. A thin, vague, or hedged intro fails.
@@ -5595,8 +5724,8 @@ WORD COUNTS — STRICT
 ═══════════════════════════════════════════════════════════════
 
 META: max 120 characters
-Slide 1 (Intro): 40-60 words HARD CAP. That is 3 sentences — 4 short ones at most. A 5-sentence intro is ALWAYS over the cap. (Substantial and intriguing — no stats.)
-All content slides: 35-50 words HARD CAP (aim for 40-45), 2-4 sentences — and VARY the sentence count from slide to slide.
+Slide 1 (Intro): ${INTRO_WC_RANGE} words HARD CAP. That is 3 sentences — 4 short ones at most. A 5-sentence intro is ALWAYS over the cap. (Substantial and intriguing — no stats.)
+All content slides: ${SLIDE_WC_RANGE} words HARD CAP (aim for ${DEFAULT_SLIDE_AIM}), 2-4 sentences — and VARY the sentence count from slide to slide.
 These caps are validated by an automated counter after you finish — slides over the cap are flagged as ERRORS, not suggestions. When in doubt, write SHORTER.
 
 ═══════════════════════════════════════════════════════════════
@@ -5652,7 +5781,7 @@ Always produce the full slideshow. No exceptions. Never write 'I cannot' or any 
 ═══════════════════════════════════════════════════════════════
 
 The writer EXPLICITLY requested ${data.userWordCountOverride.min}-${data.userWordCountOverride.max} words per content slide.
-This OVERRIDES the default 35-50 range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
+This OVERRIDES the default ${SLIDE_WC_RANGE} range. ANY slide exceeding ${data.userWordCountOverride.max} words is a FAILURE.
 Count every word silently before outputting each slide (the count must NEVER appear in the output). Rewrite if out of range.`
       : ''}`;
 
@@ -5662,7 +5791,7 @@ Count every word silently before outputting each slide (the count must NEVER app
 
   const factContextBlock = `SOURCE DATA — write from this:\n\n## STRUCTURED FACT DATABASE\n${injectStatmuseTier(data.combinedFactRepresentation, statmuse)}\n\n## RAW SOURCE EXCERPT (narrative voice reference — facts from FACT DATABASE take priority)\n${data.rawSourceExcerpt || '(no raw source available)'}`;
 
-  const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n8. Which LEAD does each slide get (quote / moment / person / contrast / aftermath / claim)? No two consecutive slides may share one.\n9. WORD CAPS ARE HARD: intro 40-60 words, every content slide ${data.userWordCountOverride ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}` : '35-50'} words. Count silently before finishing each slide and rewrite if over. These caps override any other length guidance, including writer notes.\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
+  const claudeUserPrompt = `${factContextBlock}\n\n---\n\nSLIDESHOW ASSIGNMENT:\nTitle: "${data.title}"\nCategory: ${data.category}\nArticle Type: ${data.articleType}\nTone Dial: ${data.toneDial}${data.writingStyle ? '\nStyle Influence: ' + data.writingStyle : ''}\nSlides needed: 1 intro + ${data.slideCount} content slides (MANDATORY — you MUST produce exactly ${data.slideCount} content slides labelled "SLIDE 2" through "SLIDE ${data.slideCount + 1}". No more, no fewer. If the source covers fewer than ${data.slideCount} items, add honorable mentions, related entries, or sister-topic items to reach exactly ${data.slideCount}.)\nSource quality: ${data.sourceQuality}\nPrimary source URL: ${data.primarySourceUrl}${mandatoryBlock}\n\nBEFORE WRITING — checklist:\n1. What is the EXACT promise of the title? (number, emotion, main angle, secondary angle)\n2. Will I produce exactly ${data.slideCount} content slides? (count them before you finish)\n3. What one specific detail from TIER 1A/1B anchors Slide 1?\n4. For ranking articles: am I listing in REVERSE ORDER?\n5. Have I reserved a dedicated slide for every MANDATORY ITEM?\n6. For each slide: what does the source say, and what am I ADDING beyond that?\n7. For any specific date, event, or quote origin: is it confirmed in TIER 1A/1B or am I certain?\n8. Which LEAD does each slide get (quote / moment / person / contrast / aftermath / claim)? No two consecutive slides may share one.\n9. WORD CAPS ARE HARD: intro ${INTRO_WC_RANGE} words, every content slide ${data.userWordCountOverride ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}` : SLIDE_WC_RANGE} words. Count silently before finishing each slide and rewrite if over. These caps override any other length guidance, including writer notes.\n\nWrite the complete slideshow now. Every slide must be labelled "SLIDE N" on its own line — do NOT skip the marker for any slide.`;
 
   return { ...data, claudeSystemPrompt, claudeUserPrompt, factContextBlock };
 }
@@ -5675,7 +5804,7 @@ export async function buildSubjectiveBatchUserPrompt(data: SubjectivePromptData,
   const rangeEnd = spec.contentStart + spec.contentCount - 1;
   const wcRange = data.userWordCountOverride
     ? `${data.userWordCountOverride.min}-${data.userWordCountOverride.max}`
-    : '35-50';
+    : SLIDE_WC_RANGE;
 
   // Explicit rank mapping for ranked countdowns (see buildBatchUserPrompt for rationale).
   // Subjective rankings are also presented LOWEST-to-HIGHEST (#1 is the final slide).
@@ -5701,7 +5830,7 @@ The slides in THIS batch are ranks ${startRank} down to ${endRank}. Title them i
 Produce, in this exact order and nothing else:
 1. The article TITLE line
 2. META: [max 120 characters — intriguing hook, not a CTA, not a title paraphrase]
-3. SLIDE 1 — the intro (40-60 words, flowing polished prose — substantial and intriguing, no choppy fragments)
+3. SLIDE 1 — the intro (${INTRO_WC_RANGE} words, flowing polished prose — substantial and intriguing, no choppy fragments)
 4. The FIRST ${spec.contentCount} content slides (presentation positions 1 to ${spec.contentCount} of ${spec.totalContent} total).
 STOP after content slide ${spec.contentCount}. Do NOT write the remaining ${spec.totalContent - spec.contentCount} items. Do NOT write a SOURCES section.`;
   } else {
@@ -5744,6 +5873,7 @@ CRITICAL REMINDERS:
 - ${isRankCountdown ? 'Use the exact rank numbers listed above for this batch. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : ta.isRanking ? 'List in REVERSE ranking order. Each content slide title starts with its rank number. Never repeat a person/item already written in an earlier batch.' : 'Keep slide order consistent with the source. Never repeat an item already written in an earlier batch.'}
 - Keep the ${data.toneDial} tone and the subjective voice throughout.
 - VARY THE BUILD: never construct two consecutive slides the same way — rotate leads (quote / moment / person / contrast / aftermath / claim) and sentence counts, including across the batch boundary.
+- NO ROLL-CALL: do not open every slide with the subject's name or recite the same beats in the same order — including continuing a pattern from earlier batches. Open with the subject's name on at most half the slides; lead the rest with a different facet.
 - No tier/section label slides. No annotations like "(45 words)". No meta-commentary.
 
 Write this batch now.`;
@@ -5901,16 +6031,16 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
       const wc = slideBody.trim().split(/\s+/).filter(Boolean).length;
       slideResults.push({ slide: slideNum, words: wc });
       if (slideNum === 1) {
-        if (wc > 60) warnings.push(`Intro: ${wc} words (max 60)`);
-        else if (wc < 40) warnings.push(`Intro: ${wc} words – too thin, expand the setup (aim 40-60)`);
+        if (wc > DEFAULT_INTRO_WC.max) warnings.push(`Intro: ${wc} words (max ${DEFAULT_INTRO_WC.max})`);
+        else if (wc < DEFAULT_INTRO_WC.min) warnings.push(`Intro: ${wc} words – too thin, expand the setup (aim ${INTRO_WC_RANGE})`);
         // Subjective intros carry NO stats — every number is a payoff that lives
         // inside the slides. Flag any specific figure (bare years excepted).
         const introNums = [...new Set((slideBody.replace(/,/g, '').match(/\d+(?:\.\d+)?/g) || [])
           .filter(n => !/^(?:19|20)\d{2}$/.test(n)))];
         if (introNums.length > 0) warnings.push(`Intro contains stats (${introNums.slice(0, 4).join(', ')}) — subjective intros must be stat-free`);
       } else if (slideNum > 1) {
-        const minWc = data.userWordCountOverride?.min ?? 35;
-        const maxWc = data.userWordCountOverride?.max ?? 50;
+        const minWc = data.userWordCountOverride?.min ?? DEFAULT_SLIDE_WC.min;
+        const maxWc = data.userWordCountOverride?.max ?? DEFAULT_SLIDE_WC.max;
         if (wc < minWc || wc > maxWc + 5) warnings.push(`Slide ${slideNum}: ${wc} words (expected ${minWc}-${maxWc})`);
       }
     }
@@ -5963,6 +6093,16 @@ export async function validateSubjective(data: SubjectiveGeneratedData): Promise
   if (overused.length) warnings.push(`Repetitive openings: ${overused.join(', ')}`);
   const consecutiveOpen = [...new Set(openingWords.filter((w, i) => i > 0 && w === openingWords[i - 1]))];
   if (consecutiveOpen.length) warnings.push(`Consecutive slides open with the same word: ${consecutiveOpen.join(', ')}`);
+
+  // Templated "roster" structure: most slides opening with the subject's name reads
+  // as fill-in-the-blank (the prompt allows the name-lead on at most half the slides).
+  // Body = block lines after the "SLIDE N" marker and the title line. Warning-level.
+  const contentBodies = slideBlocks.slice(1)
+    .map(block => block.split('\n').map(l => l.trim()).filter(Boolean).slice(2).join(' '))
+    .filter(Boolean);
+  const nameLed = countNameLedOpenings(contentBodies);
+  if (contentBodies.length >= 6 && nameLed > contentBodies.length * 0.6)
+    warnings.push(`Templated structure: ${nameLed}/${contentBodies.length} content slides open with the subject's name — vary the lead`);
 
   // AI-tell: trailing-participle constructions (", cementing his legacy") read
   // machine-made when they recur — the writing prompt allows at most one.
@@ -6018,7 +6158,7 @@ WHAT TO PATCH (in priority order)
 
 4. META TOO LONG (>120 chars): emit a patch with the full META line as FIND and a ≤120-char rewrite as REPLACE.
 
-5. SLIDE WORD COUNT VIOLATIONS (intro >60 words, body slide outside 35-50): only patch if you can tighten without losing meaning. Use the full slide body as FIND.
+5. SLIDE WORD COUNT VIOLATIONS (intro >${DEFAULT_INTRO_WC.max} words, body slide outside ${SLIDE_WC_RANGE}): only patch if you can tighten without losing meaning. Use the full slide body as FIND.
 
 6. FABRICATED SPECIFICS (a year/event/quote-origin that has no support in source data): patch the specific span to soften or remove the invented precision. Keep the rest of the slide.
 
