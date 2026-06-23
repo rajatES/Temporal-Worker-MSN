@@ -810,7 +810,13 @@ export function looksLikeInstructionProse(raw: string): boolean {
   const sentences = (text.match(/[.!?](\s|$)/g) ?? []).length;
   if (sentences < 2) return false;                                  // list items rarely form sentences
   if (text.split(/\s+/).length / lines.length < 12) return false;   // short lines = items
-  return /\b(should|must|make sure|make (a|the|this)|avoid|ensure|keep (the|it|in)|mention|focus on|do not|don['']t|please)\b/i.test(text);
+  // A directive keyword appearing ONCE is not enough — a long sentence-item can
+  // carry one incidentally ("lets fans make a run at the prize"). Genuine
+  // instruction prose is directive THROUGHOUT, so require the keyword in a
+  // MAJORITY of lines; that keeps a parallel list of descriptive sentence-items
+  // (each line a distinct subject) as items instead of nuking it to [].
+  const directive = /\b(should|must|make sure|make (a|the|this)|avoid|ensure|keep (the|it|in)|mention|focus on|do not|don['']t|please)\b/i;
+  return lines.filter(l => directive.test(l)).length > lines.length / 2;
 }
 
 export function parseMustIncludeItems(raw: string): string[] {
@@ -1035,8 +1041,22 @@ export function parseMustIncludeItems(raw: string): string[] {
     // per-line list, a comma inside a line is part of the title ("More Than a
     // Married Couple, but Not Lovers"); splitting it corrupts the item count,
     // and the SLOT COUNT reconciliation then tells the model to drop an item.
-    const commaLineCount = allLines.filter(l => l.includes(',')).length;
-    const commaSplitAllowed = allLines.length === 1 || commaLineCount > allLines.length / 2;
+    const COMMA_SPLIT = /,(?!\d{3}(?:\D|$))(?![^(]*\))/;
+    // A comma-bearing line is a SHORT name list ("Tiger Woods, Rory McIlroy")
+    // only when every comma-part is a few words. A long-sentence item with
+    // incidental internal commas ("Cisco powers an interactive map, making
+    // navigation easy") has at least one long part — comma-splitting it shatters
+    // one item into junk fragments ("giveaways", "and clear"). Single-line input
+    // has no other separator, so commas split it regardless; multi-line input
+    // uses the newline as the separator and only treats commas as a SECONDARY
+    // separator when the lines actually look like short name lists.
+    const isShortListLine = (l: string): boolean => {
+      const parts = l.split(COMMA_SPLIT).map(s => s.trim()).filter(Boolean);
+      return parts.length >= 2 && parts.every(p => p.split(/\s+/).length <= 4);
+    };
+    const commaSplitAllowed = allLines.length === 1
+      ? true
+      : allLines.filter(isShortListLine).length > allLines.length / 2;
     for (const line of allLines) {
       let cleaned = line.replace(LIST_MARKER_RE, '').trim();
       if (!cleaned) continue;
@@ -1057,7 +1077,7 @@ export function parseMustIncludeItems(raw: string): string[] {
       }
 
       // Comma-separated items (but not commas inside parentheses).
-      const commaParts = cleaned.split(/,(?!\d{3}(?:\D|$))(?![^(]*\))/).map(s => s.trim()).filter(Boolean);
+      const commaParts = cleaned.split(COMMA_SPLIT).map(s => s.trim()).filter(Boolean);
       if (commaSplitAllowed && (commaParts.length >= 3 ||
         (commaParts.length === 2 && commaParts.every(p => p.split(/\s+/).length >= 2)))) {
         for (const part of commaParts) {
@@ -3340,13 +3360,13 @@ Your intro MUST:
 - Create real intrigue — the reader must feel they have to open the slideshow to get the payoff
 - End with a graceful thesis-style line that frames what the slideshow delivers (like the example's last sentence), WITHOUT giving away the ranking, the #1, or the key numbers
 
-ON STATS (objective flow — stats are allowed, but handle with care):
-- You MAY use a stat ONLY to establish scale or context (a broad, scene-setting figure). Prefer framing magnitude in words over exact figures.
-- NEVER reveal a payoff stat — the specific number that is a content slide's main point. If knowing that figure would make a reader feel they no longer need to open the slideshow, leave it out.
-- When unsure whether a number is "context" or "payoff," treat it as payoff and keep it out.
+ON STATS & FACTS (the slideshow's own facts are the payoff — keep them out):
+- The specific stats, numbers, records, dates, and facts you researched (TIER 1A/1B) are the PAYOFF and live INSIDE the content slides. Do NOT surface ANY of them in the intro — not even one, and not even reframed as "scale" or "context."
+- Set scale and stakes in WORDS, not figures ("decades of dominance," "a rare club of franchises"), or lean on broad TIER 2 framing and common-knowledge context about the topic. A bare era-framing year ("since 2000") is the only numeric exception.
+- If a number or fact would make a reader feel they already know the answer and no longer need to open the slideshow, it does not belong in the intro. When unsure, leave it out.
 
 Your intro must NOT:
-- Reveal a payoff/key stat — the exact distances, velocities, totals, scores, records, or dates that individual slides deliver
+- Reveal ANY researched stat or fact (TIER 1A/1B) — the exact distances, velocities, totals, scores, records, or dates that individual slides deliver
 - Name any items from the list — not even as scene-setting in the opening lines (naming the headline teams/players up front is the most common failure)
 - Reveal the #1 pick or any rankings
 - Be built from stacked short fragments — the staccato rhythm belongs to content slides, never the intro
@@ -3525,7 +3545,7 @@ META: [Max 120 characters]
 
 SLIDE 1
 [Intro title — write the EXACT slideshow title, verbatim]
-[${INTRO_WC_RANGE} words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; contextual/scale stats only, NEVER a payoff/key stat; end on a graceful thesis line; no items named, no #1/rankings revealed]
+[${INTRO_WC_RANGE} words — flowing, polished prose (no choppy fragments); substantial, intriguing setup; NO researched stats/facts (TIER 1A/1B) — scale in words or broad outside context only; end on a graceful thesis line; no items named, no #1/rankings revealed]
 
 SLIDE 2
 [Creative title${ta.isRanking ? ' — start with rank number from Tier 1A' : ''}]
@@ -4761,7 +4781,7 @@ PART A — AUDIT CHECKLIST (evaluate each rule)
    - Negative keywords from title appear in body
 
 3. INTRO QUALITY
-   - One specific anchor fact
+   - Hooks via atmosphere/stakes, NOT a researched payoff stat or fact (TIER 1A/1B numbers, records, dates belong inside the slides)
    - No list items named, no rankings revealed
    - No generic openers ("Since the dawn of", "In today's world")
    - No "let's dive in" / "here are" / "we'll explore"
